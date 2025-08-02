@@ -248,11 +248,21 @@ fn run_session(
 #[instrument(err)]
 fn list_sessions(namespace: Option<String>) -> Result<(), JarvisError> {
     if let Some(ns) = namespace {
+        // If the namespace doesn't exist, this will still fail, so we keep the error
         let out = capture_tmux(&["list-windows", "-t", &ns])?;
         println!("Windows in '{}':\n{}", ns, out);
     } else {
-        // Filter only sessions that are marked with @jarvisctl=1
-        let all_sessions_output = capture_tmux(&["list-sessions", "-F", "#{session_name}"])?;
+        // Try to capture all sessions; if it fails, treat as empty
+        let all_sessions_output = match capture_tmux(&["list-sessions", "-F", "#{session_name}"]) {
+            Ok(output) => output,
+            Err(JarvisError::NonZero(1)) => {
+                println!("NAMESPACES:\n(none)");
+                println!("AGENTS:\n(none)");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+
         let mut valid_sessions = vec![];
         for line in all_sessions_output.lines() {
             let session_name = line.trim();

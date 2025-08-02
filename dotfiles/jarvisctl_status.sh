@@ -10,12 +10,12 @@ namespaces=$(awk '
     /NAMESPACES:/       {in_ns=1; next}
     /AGENTS:/           {in_ns=0}
     in_ns && NF         {print}
-' <<<"$output")
+' <<<"$output" | grep -v '^(none)$')
 
 agents=$(awk '
     /AGENTS:/           {in_ag=1; next}
     in_ag && NF         {print}
-' <<<"$output")
+' <<<"$output" | grep -v '^(none)$')
 
 ########################
 # line counts          #
@@ -40,7 +40,9 @@ else
   tooltip+="(none)\n"
 fi
 
+########################
 # escape for JSON
+########################
 escaped_tooltip=$(echo "$tooltip" | sed ':a;N;$!ba;s/"/\\"/g;s/\n/\\n/g')
 
 ########################
