@@ -276,15 +276,16 @@ fn exec_agent(namespace: &str, agent: &str) -> Result<(), JarvisError> {
 #[instrument(err)]
 fn tell(namespace: &str, agent: &str, file: &str) -> Result<(), JarvisError> {
     let contents = std::fs::read_to_string(file)?;
+    let session_target = format!("{}:{}", namespace, agent);
+
+    // Send each line followed by Ctrl+J (line feed)
     for line in contents.lines() {
-        run_tmux(&[
-            "send-keys",
-            "-t",
-            &format!("{}:{}", namespace, agent),
-            line,
-            "Enter",
-        ])?;
+        run_tmux(&["send-keys", "-t", &session_target, line, "C-j"])?;
     }
+
+    // After sending all lines, press Enter to submit
+    run_tmux(&["send-keys", "-t", &session_target, "Enter"])?;
+
     println!("✅ Sent '{}' to '{}':'{}'", file, namespace, agent);
     Ok(())
 }
