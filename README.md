@@ -32,9 +32,6 @@
 
    ```sh
    sudo pacman -S tmux   # or: sudo apt install tmux
-   cargo install shell-words
-   cargo install sysinfo
-   cargo install clap
    ```
 2. Build the project:
 
