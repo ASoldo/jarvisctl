@@ -1,4 +1,5 @@
-<img width="135" height="25" alt="image" src="https://github.com/user-attachments/assets/53d4fea9-319d-48a3-a7aa-975e59a02855" />
+<img width="73" height="25" alt="image" src="https://github.com/user-attachments/assets/7a880a0a-7ad9-4e8f-a8ac-08931f53089d" />
+
 
 # jarvisctl
 
