@@ -48,7 +48,7 @@
 ### Start a namespace with N agents
 
 ```sh
-jarvisctl run --namespace codexbots --agents 4 codex - --full-auto
+jarvisctl run --namespace codexbots --agents 4 -- codex --full-auto
 ```
 
 This starts 4 agent windows in the namespace `codexbots`.
