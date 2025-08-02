@@ -291,7 +291,6 @@ fn tell(namespace: &str, agent: &str, file: &str) -> Result<(), JarvisError> {
 }
 
 // Helpers
-
 fn run_tmux(args: &[&str]) -> Result<(), JarvisError> {
     let status = std::process::Command::new("tmux").args(args).status()?;
     let code = status.code().unwrap_or(-1);
