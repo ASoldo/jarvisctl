@@ -35,7 +35,7 @@ cargo install --path .
 ### Launch a new namespace with multiple agents
 
 ```bash
-jarvisctl run --namespace botfarm --agents 3 -- codex-cli --full-auto
+jarvisctl run --namespace botfarm --agents 2 --working-directory /home/rootster/Pictures -- codex --full-auto
 ```
 
 ### Attach to the full namespace

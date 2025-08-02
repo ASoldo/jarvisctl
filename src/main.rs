@@ -68,6 +68,10 @@ enum Command {
         #[arg(long, default_value_t = 1)]
         agents: usize,
 
+        /// Working directory for each agent
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        working_directory: Option<String>,
+
         /// Command and args to run per agent
         #[arg(required = true, last = true, value_hint = ValueHint::CommandString)]
         command: Vec<String>,
@@ -137,11 +141,14 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             pid,
             exec_shell,
         } => inspect(name, pid, exec_shell),
+
         Command::Run {
             namespace,
             agents,
+            working_directory,
             command,
-        } => run_session(&namespace, agents, &command),
+        } => run_session(&namespace, agents, &working_directory, &command),
+
         Command::Attach { namespace } => run_tmux(&["attach", "-t", &namespace]),
         Command::Delete { namespace } => run_tmux(&["kill-session", "-t", &namespace]),
         Command::List { namespace } => list_sessions(namespace),
@@ -191,21 +198,38 @@ fn inspect(name: Option<String>, pid: Option<u32>, exec_shell: bool) -> Result<(
 }
 
 #[instrument(err)]
-fn run_session(namespace: &str, agents: usize, cmd: &[String]) -> Result<(), JarvisError> {
+fn run_session(
+    namespace: &str,
+    agents: usize,
+    working_dir: &Option<String>,
+    cmd: &[String],
+) -> Result<(), JarvisError> {
     let joined = shell_words::join(cmd);
+
     for i in 0..agents {
         let window = format!("agent{}", i);
-        let full = format!("bash -lc '{}'", joined);
+        let full_command = if let Some(dir) = working_dir {
+            format!("bash -lc 'cd {} && {}'", dir, joined)
+        } else {
+            format!("bash -lc '{}'", joined)
+        };
 
         let args = if i == 0 {
-            vec!["new-session", "-d", "-s", namespace, "-n", &window, &full]
+            vec![
+                "new-session",
+                "-d",
+                "-s",
+                namespace,
+                "-n",
+                &window,
+                &full_command,
+            ]
         } else {
-            vec!["new-window", "-t", namespace, "-n", &window, &full]
+            vec!["new-window", "-t", namespace, "-n", &window, &full_command]
         };
 
         run_tmux(&args)?;
 
-        // Mark this session as created by jarvisctl
         if i == 0 {
             run_tmux(&["set-option", "-t", namespace, "@jarvisctl", "1"])?;
         }
