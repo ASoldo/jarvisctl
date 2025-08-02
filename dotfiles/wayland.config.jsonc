@@ -1,0 +1,13 @@
+{
+
+  "custom/jarvisctl": {
+    "interval": 1,
+    "exec": "~/.jarvis/scripts/jarvisctl_status.sh",
+    "return-type": "json",
+    "format": "{}",
+    "tooltip": true,
+    "on-click": "alacritty --class=JarvisCtl -t JarvisCtl -e bash -c '/home/rootster/.local/bin/jarvisctl list; exec zsh'",
+    "escape": true
+  }
+
+}
