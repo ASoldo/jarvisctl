@@ -1,32 +1,57 @@
-//! jarvisctl: Enterprise-grade orchestrator for CLI/TUI worker apps using tmux
+//! jarvisctl: Enterprise-grade orchestrator for CLI/TUI worker apps using a native PTY runtime
 //!
 //! Features:
-//! - Namespaces (tmux sessions) for isolating agent groups
-//! - Agents (tmux windows) running your CLI worker
+//! - Namespaces for isolating agent groups
+//! - Agents running your CLI worker inside a native PTY runtime
 //! - Inspect: detailed process info (with optional nsenter shell)
-//! - Run: spawn new tmux session with N agents
-//! - Attach/Exec: connect to sessions/windows
-//! - Tell: paste file/text into a running agent
-//! - Delete/List: manage tmux sessions/windows
+//! - Run: spawn new native session with N agents
+//! - Attach/Exec: connect to live sessions
+//! - Tell: send text into a running agent
+//! - Delete/List: manage native sessions
 
-use clap::{Parser, Subcommand, ValueHint};
-use std::{ffi::OsStr, process::ExitCode};
+use clap::{Parser, Subcommand, ValueEnum, ValueHint};
+use std::{ffi::OsStr, path::PathBuf, process::ExitCode};
 use sysinfo::{Pid, System};
 use thiserror::Error;
 use tracing::{error, info, instrument};
 
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
+mod agent;
+mod board;
+mod codex;
+mod dispatch;
+mod native;
+mod ticket;
+mod tui;
+
+use agent::spawn_agent;
+use codex::{CodexLaunchOptions, launch_codex_ticket};
+use dispatch::{DispatchOptions, run_dispatch_loop};
+use native::{
+    attach_native, delete_native_session, interrupt_native, list_native_sessions,
+    serve_native_session, spawn_native_session, tell_native,
+};
+use tui::{run_dashboard, view_agent};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SessionBackend {
+    Native,
+}
+
 #[derive(Error, Debug)]
 pub enum JarvisError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("TMUX returned non-zero exit status: {0}")]
+    #[error("session runtime returned non-zero exit status: {0}")]
     NonZero(i32),
 
     #[error("Process {0} not found")]
     ProcessNotFound(u32),
+
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
 
 /// CLI tool to inspect and control worker sessions
@@ -34,15 +59,25 @@ pub enum JarvisError {
 #[command(
     name = "jarvisctl",
     version,
-    about = "Orchestrate CLI/TUI workers with tmux"
+    about = "Orchestrate CLI/TUI workers with a native PTY runtime"
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// Run a single agent in a new TUI window
+    Single {
+        /// Agent name
+        #[arg(long)]
+        name: String,
+
+        /// Command and arguments to run
+        #[arg(required = true, last = true)]
+        command: Vec<String>,
+    },
     /// Inspect running processes by name or PID
     Inspect {
         /// Filter by process name
@@ -58,13 +93,17 @@ enum Command {
         exec_shell: bool,
     },
 
-    /// Run a worker in a new tmux namespace
+    /// Run a worker in a new namespace
     Run {
-        /// Namespace (tmux session) name
+        /// Deprecated compatibility flag; native is the only backend
+        #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
+        backend: SessionBackend,
+
+        /// Namespace name
         #[arg(long)]
         namespace: String,
 
-        /// Number of agents (windows)
+        /// Number of agents
         #[arg(long, default_value_t = 1)]
         agents: usize,
 
@@ -77,26 +116,133 @@ enum Command {
         command: Vec<String>,
     },
 
+    /// Launch an interactive Codex session from a ticket note
+    Codex {
+        /// Deprecated compatibility flag; native is the only backend
+        #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
+        backend: SessionBackend,
+
+        /// Ticket or task note with YAML frontmatter
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        task_note: PathBuf,
+
+        /// Override the runtime namespace
+        #[arg(long)]
+        namespace: Option<String>,
+
+        /// Number of Codex agents to create
+        #[arg(long, default_value_t = 1)]
+        agents: usize,
+
+        /// Agent to inject the prompt into
+        #[arg(long, default_value = "agent0")]
+        agent: String,
+
+        /// Override the working directory instead of repo_path from the note
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        working_directory: Option<PathBuf>,
+
+        /// Use an explicit prompt file instead of rendering from the task note
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        prompt_file: Option<PathBuf>,
+
+        /// Wait this long before injecting the prompt
+        #[arg(long, default_value_t = 1500)]
+        startup_delay_ms: u64,
+
+        /// Codex command override, defaults to `codex`
+        #[arg(last = true, value_hint = ValueHint::CommandString)]
+        command: Vec<String>,
+    },
+
+    /// Watch Obsidian boards and dispatch Codex runs from ticket transitions
+    Dispatch {
+        /// Deprecated compatibility flag; native is the only backend
+        #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
+        backend: SessionBackend,
+
+        /// Vault root used to resolve board links and default boards
+        #[arg(long, value_hint = ValueHint::DirPath, default_value = "/home/rootster/documents/codex")]
+        vault_path: PathBuf,
+
+        /// Board file to scan; may be repeated. Defaults to the dispatch board and project boards in the vault.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        board: Vec<PathBuf>,
+
+        /// Scan once and exit instead of looping as a daemon
+        #[arg(long, default_value_t = false)]
+        once: bool,
+
+        /// Evaluate transitions without launching Codex or writing board/ticket changes
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        /// Polling interval in seconds when not using --once
+        #[arg(long, default_value_t = 3)]
+        interval_seconds: u64,
+
+        /// Override the dispatch state file
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        state_file: Option<PathBuf>,
+
+        /// Agent to inject the prompt into
+        #[arg(long, default_value = "agent0")]
+        agent: String,
+
+        /// Number of Codex agents to create
+        #[arg(long, default_value_t = 1)]
+        agents: usize,
+
+        /// Wait this long before injecting the prompt
+        #[arg(long, default_value_t = 1500)]
+        startup_delay_ms: u64,
+
+        /// Codex command override, defaults to `codex`
+        #[arg(last = true, value_hint = ValueHint::CommandString)]
+        command: Vec<String>,
+    },
+
+    /// Open a ratatui session dashboard
+    Dashboard {
+        #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
+        backend: SessionBackend,
+
+        #[arg(long, default_value_t = 1000)]
+        refresh_ms: u64,
+    },
+
     /// Attach to a running namespace
     Attach {
+        #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
+        backend: SessionBackend,
+
         #[arg(long)]
         namespace: String,
     },
 
-    /// Kill a tmux namespace
+    /// Kill a namespace
     Delete {
+        #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
+        backend: SessionBackend,
+
         #[arg(long)]
         namespace: String,
     },
 
-    /// List tmux sessions and windows
+    /// List namespaces and agents
     List {
+        #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
+        backend: SessionBackend,
+
         #[arg(long)]
         namespace: Option<String>,
     },
 
     /// Attach to a specific agent in a namespace
     Exec {
+        #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
+        backend: SessionBackend,
+
         #[arg(long)]
         namespace: String,
 
@@ -106,12 +252,33 @@ enum Command {
 
     /// Send file or text to a running agent's TUI
     Tell {
+        #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
+        backend: SessionBackend,
+
         #[arg(long)]
         namespace: String,
         #[arg(long)]
         agent: String,
         #[arg(long, value_hint = ValueHint::FilePath)]
         file: String,
+    },
+
+    /// Send Ctrl+C to a running agent
+    Interrupt {
+        #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
+        backend: SessionBackend,
+
+        #[arg(long)]
+        namespace: String,
+
+        #[arg(long, default_value = "agent0")]
+        agent: String,
+    },
+
+    #[command(hide = true)]
+    NativeSessionServe {
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        manifest: PathBuf,
     },
 }
 
@@ -135,7 +302,28 @@ fn main() -> ExitCode {
 }
 
 fn dispatch(cli: Cli) -> Result<(), JarvisError> {
-    match cli.command {
+    match cli.command.unwrap_or(Command::Dashboard {
+        backend: SessionBackend::Native,
+        refresh_ms: 1000,
+    }) {
+        Command::Single { name, command } => {
+            let agent = spawn_agent(&name, &command).map_err(|e| {
+                error!("❌ Failed to spawn agent: {e}");
+                JarvisError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })?;
+
+            view_agent(&agent.name, agent.output.clone()).map_err(|e| {
+                error!("❌ Failed to render TUI: {e}");
+                JarvisError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })
+        }
+
         Command::Inspect {
             name,
             pid,
@@ -143,21 +331,87 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         } => inspect(name, pid, exec_shell),
 
         Command::Run {
+            backend,
             namespace,
             agents,
             working_directory,
             command,
-        } => run_session(&namespace, agents, &working_directory, &command),
+        } => run_session(backend, &namespace, agents, &working_directory, &command),
+        Command::Codex {
+            backend,
+            task_note,
+            namespace,
+            agents,
+            agent,
+            working_directory,
+            prompt_file,
+            startup_delay_ms,
+            command,
+        } => launch_and_print_codex(CodexLaunchOptions {
+            backend,
+            task_note,
+            namespace,
+            agents,
+            agent,
+            resume_session_id: None,
+            working_directory,
+            prompt_file,
+            startup_delay_ms,
+            command,
+        }),
+        Command::Dispatch {
+            backend,
+            vault_path,
+            board,
+            once,
+            dry_run,
+            interval_seconds,
+            state_file,
+            agent,
+            agents,
+            startup_delay_ms,
+            command,
+        } => run_dispatch_loop(DispatchOptions {
+            backend,
+            vault_path,
+            boards: board,
+            interval_seconds,
+            once,
+            dry_run,
+            state_file,
+            agent,
+            agents,
+            startup_delay_ms,
+            command,
+        })
+        .map_err(JarvisError::from),
+        Command::Dashboard {
+            backend,
+            refresh_ms,
+        } => run_dashboard(backend, refresh_ms).map_err(JarvisError::from),
 
-        Command::Attach { namespace } => run_tmux(&["attach", "-t", &namespace]),
-        Command::Delete { namespace } => run_tmux(&["kill-session", "-t", &namespace]),
-        Command::List { namespace } => list_sessions(namespace),
-        Command::Exec { namespace, agent } => exec_agent(&namespace, &agent),
+        Command::Attach { backend, namespace } => attach_session(backend, &namespace),
+        Command::Delete { backend, namespace } => delete_session(backend, &namespace),
+        Command::List { backend, namespace } => list_sessions(backend, namespace),
+        Command::Exec {
+            backend,
+            namespace,
+            agent,
+        } => exec_agent(backend, &namespace, &agent),
         Command::Tell {
+            backend,
             namespace,
             agent,
             file,
-        } => tell(&namespace, &agent, &file),
+        } => tell(backend, &namespace, &agent, &file),
+        Command::Interrupt {
+            backend,
+            namespace,
+            agent,
+        } => interrupt_agent(backend, &namespace, &agent),
+        Command::NativeSessionServe { manifest } => {
+            serve_native_session(manifest).map_err(JarvisError::from)
+        }
     }
 }
 
@@ -199,148 +453,119 @@ fn inspect(name: Option<String>, pid: Option<u32>, exec_shell: bool) -> Result<(
 
 #[instrument(err)]
 fn run_session(
+    backend: SessionBackend,
     namespace: &str,
     agents: usize,
     working_dir: &Option<String>,
     cmd: &[String],
 ) -> Result<(), JarvisError> {
     let joined = shell_words::join(cmd);
+    run_session_shell(backend, namespace, agents, working_dir, &joined)
+}
 
-    for i in 0..agents {
-        let window = format!("agent{}", i);
-        let full_command = if let Some(dir) = working_dir {
-            format!("bash -lc 'cd {} && {}'", dir, joined)
-        } else {
-            format!("bash -lc '{}'", joined)
-        };
+pub(crate) fn run_session_shell(
+    backend: SessionBackend,
+    namespace: &str,
+    agents: usize,
+    working_dir: &Option<String>,
+    joined: &str,
+) -> Result<(), JarvisError> {
+    let _ = backend;
+    spawn_native_session(namespace, agents, working_dir.as_deref(), joined)
+        .map_err(JarvisError::from)?;
 
-        let args = if i == 0 {
-            vec![
-                "new-session",
-                "-d",
-                "-s",
-                namespace,
-                "-n",
-                &window,
-                &full_command,
-            ]
-        } else {
-            vec!["new-window", "-t", namespace, "-n", &window, &full_command]
-        };
+    println!(
+        "✅ Started {} agent(s) in '{}' using the native runtime. Attach: jarvisctl attach --namespace {}",
+        agents, namespace, namespace
+    );
+    info!(
+        "Started native session '{}' with {} agent(s)",
+        namespace, agents
+    );
+    Ok(())
+}
 
-        run_tmux(&args)?;
+#[instrument(err)]
+fn list_sessions(backend: SessionBackend, namespace: Option<String>) -> Result<(), JarvisError> {
+    let _ = backend;
+    list_native_sessions(namespace.as_deref()).map_err(JarvisError::from)
+}
 
-        if i == 0 {
-            run_tmux(&["set-option", "-t", namespace, "@jarvisctl", "1"])?;
+#[instrument(err)]
+fn exec_agent(backend: SessionBackend, namespace: &str, agent: &str) -> Result<(), JarvisError> {
+    let _ = backend;
+    attach_native(namespace, agent).map_err(JarvisError::from)
+}
+
+#[instrument(err)]
+fn tell(
+    backend: SessionBackend,
+    namespace: &str,
+    agent: &str,
+    file: &str,
+) -> Result<(), JarvisError> {
+    let contents = std::fs::read_to_string(file)?;
+    let _ = backend;
+    tell_native(namespace, agent, &contents).map_err(JarvisError::from)?;
+
+    println!(
+        "✅ Sent '{}' to '{}':'{}' via the native runtime",
+        file, namespace, agent
+    );
+    Ok(())
+}
+
+fn launch_and_print_codex(options: CodexLaunchOptions) -> Result<(), JarvisError> {
+    let record = launch_codex_ticket(options)?;
+
+    println!("✅ Codex session launched.");
+    println!("   Namespace:   {}", record.namespace);
+    println!("   Agent:       {}", record.agent);
+    println!("   Runtime:     native");
+    println!("   Repo:        {}", record.repo_path);
+    println!("   Task note:   {}", record.task_note);
+    println!("   Launch mode: {}", record.launch_mode);
+    if let Some(codex_session_id) = &record.codex_session_id {
+        println!("   Session ID:  {}", codex_session_id);
+    }
+    println!("   Finish:      {}", record.finish_mode);
+    println!("   Prompt:      {}", record.prompt_file);
+    println!("   Record:      {}", record.record_file);
+
+    if !record.readiness_warnings.is_empty() {
+        println!("\nWarnings:");
+        for warning in &record.readiness_warnings {
+            println!(" - {}", warning);
         }
-
-        info!("Started window {} in {}", window, namespace);
     }
 
     println!(
-        "✅ Started {} agent(s) in '{}'. Attach: jarvisctl attach --namespace {}",
-        agents, namespace, namespace
+        "\nAttach with: jarvisctl attach --namespace {}",
+        record.namespace
     );
-
     Ok(())
 }
 
 #[instrument(err)]
-fn list_sessions(namespace: Option<String>) -> Result<(), JarvisError> {
-    if let Some(ns) = namespace {
-        // If the namespace doesn't exist, this will still fail, so we keep the error
-        let out = capture_tmux(&["list-windows", "-t", &ns])?;
-        println!("Windows in '{}':\n{}", ns, out);
-    } else {
-        // Try to capture all sessions; if it fails, treat as empty
-        let all_sessions_output = match capture_tmux(&["list-sessions", "-F", "#{session_name}"]) {
-            Ok(output) => output,
-            Err(JarvisError::NonZero(1)) => {
-                println!("NAMESPACES:\n(none)");
-                println!("AGENTS:\n(none)");
-                return Ok(());
-            }
-            Err(e) => return Err(e),
-        };
-
-        let mut valid_sessions = vec![];
-        for line in all_sessions_output.lines() {
-            let session_name = line.trim();
-            let marker = capture_tmux(&["show-option", "-qv", "-t", session_name, "@jarvisctl"])?;
-            if marker.trim() == "1" {
-                valid_sessions.push(session_name.to_string());
-            }
-        }
-
-        if valid_sessions.is_empty() {
-            println!("NAMESPACES:\n(none)");
-            println!("AGENTS:\n(none)");
-            return Ok(());
-        }
-
-        println!("NAMESPACES:");
-        for session in &valid_sessions {
-            let info = capture_tmux(&[
-                "display-message",
-                "-p",
-                "-t",
-                session,
-                "#{session_name}: #{session_windows} windows (created #{session_created})",
-            ])?;
-            println!("{}", info.trim());
-        }
-
-        println!("\nAGENTS:");
-        for session in &valid_sessions {
-            let windows = capture_tmux(&["list-windows", "-t", session])?;
-            print!("{}", windows);
-        }
-    }
-
-    Ok(())
+fn attach_session(backend: SessionBackend, namespace: &str) -> Result<(), JarvisError> {
+    let _ = backend;
+    attach_native(namespace, "agent0").map_err(JarvisError::from)
 }
 
 #[instrument(err)]
-fn exec_agent(namespace: &str, agent: &str) -> Result<(), JarvisError> {
-    run_tmux(&["select-window", "-t", &format!("{}:{}", namespace, agent)])?;
-    run_tmux(&["attach", "-t", namespace])?;
-    Ok(())
+fn delete_session(backend: SessionBackend, namespace: &str) -> Result<(), JarvisError> {
+    let _ = backend;
+    delete_native_session(namespace).map_err(JarvisError::from)
 }
 
 #[instrument(err)]
-fn tell(namespace: &str, agent: &str, file: &str) -> Result<(), JarvisError> {
-    let contents = std::fs::read_to_string(file)?;
-    let session_target = format!("{}:{}", namespace, agent);
-
-    // Send each line followed by Ctrl+J (line feed)
-    for line in contents.lines() {
-        run_tmux(&["send-keys", "-t", &session_target, line, "C-j"])?;
-    }
-
-    // After sending all lines, press Enter to submit
-    run_tmux(&["send-keys", "-t", &session_target, "Enter"])?;
-
-    println!("✅ Sent '{}' to '{}':'{}'", file, namespace, agent);
-    Ok(())
-}
-
-// Helpers
-fn run_tmux(args: &[&str]) -> Result<(), JarvisError> {
-    let status = std::process::Command::new("tmux").args(args).status()?;
-    let code = status.code().unwrap_or(-1);
-    if code != 0 {
-        return Err(JarvisError::NonZero(code));
-    }
-    Ok(())
-}
-
-fn capture_tmux(args: &[&str]) -> Result<String, JarvisError> {
-    let out = std::process::Command::new("tmux").args(args).output()?;
-    let code = out.status.code().unwrap_or(-1);
-    if code != 0 {
-        return Err(JarvisError::NonZero(code));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+fn interrupt_agent(
+    backend: SessionBackend,
+    namespace: &str,
+    agent: &str,
+) -> Result<(), JarvisError> {
+    let _ = backend;
+    interrupt_native(namespace, agent).map_err(JarvisError::from)
 }
 
 fn enter_shell(target_pid: u32) -> Result<(), JarvisError> {

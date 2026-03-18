@@ -1,0 +1,421 @@
+use crate::SessionBackend;
+use crate::ticket::{TicketNote, slugify};
+use anyhow::{Context, ensure};
+use serde::{Deserialize, Serialize};
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+
+#[derive(Debug, Clone)]
+pub struct CodexLaunchOptions {
+    pub backend: SessionBackend,
+    pub task_note: PathBuf,
+    pub namespace: Option<String>,
+    pub agents: usize,
+    pub agent: String,
+    pub resume_session_id: Option<String>,
+    pub working_directory: Option<PathBuf>,
+    pub prompt_file: Option<PathBuf>,
+    pub startup_delay_ms: u64,
+    pub command: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexLaunchRecord {
+    pub version: u32,
+    pub launched_at_epoch_ms: u128,
+    pub task_id: String,
+    pub title: String,
+    pub task_note: String,
+    pub repo_path: String,
+    pub namespace: String,
+    pub agent: String,
+    pub agents: usize,
+    pub command: Vec<String>,
+    pub launch_mode: String,
+    pub codex_session_id: Option<String>,
+    pub finish_mode: String,
+    pub prompt_file: String,
+    pub record_file: String,
+    pub readiness_warnings: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionMetaEnvelope {
+    #[serde(rename = "type")]
+    entry_type: String,
+    payload: SessionMetaPayload,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionMetaPayload {
+    id: String,
+    cwd: String,
+    timestamp: String,
+}
+
+pub fn default_namespace_for_ticket(ticket: &TicketNote) -> String {
+    format!("codex-{}", default_namespace_suffix(ticket))
+}
+
+pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexLaunchRecord> {
+    let ticket = TicketNote::load(&options.task_note)?;
+    ticket.validate_codex_minimum()?;
+
+    let repo_path = options
+        .working_directory
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(ticket.repo_path().expect("validated repo_path")));
+    ensure!(
+        repo_path.exists(),
+        "working directory '{}' does not exist",
+        repo_path.display()
+    );
+
+    let namespace = options
+        .namespace
+        .clone()
+        .unwrap_or_else(|| default_namespace_for_ticket(&ticket));
+    let runtime_args = ticket.codex_cli_args()?;
+    let finish_mode = ticket.finish_session_policy()?.to_string();
+    let base_command = build_base_command(&options.command, options.resume_session_id.as_deref());
+    let command = with_codex_runtime_args(base_command, &runtime_args);
+    let prompt = if let Some(prompt_file) = &options.prompt_file {
+        fs::read_to_string(prompt_file)
+            .with_context(|| format!("failed to read prompt file '{}'", prompt_file.display()))?
+    } else {
+        ticket.render_codex_prompt()
+    };
+
+    let jarvis_home = jarvis_home()?;
+    let prompts_dir = jarvis_home.join("codex").join("prompts");
+    let runs_dir = jarvis_home.join("codex").join("runs");
+    fs::create_dir_all(&prompts_dir)
+        .with_context(|| format!("failed to create '{}'", prompts_dir.display()))?;
+    fs::create_dir_all(&runs_dir)
+        .with_context(|| format!("failed to create '{}'", runs_dir.display()))?;
+
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before UNIX_EPOCH")?
+        .as_millis();
+    let prompt_path = prompts_dir.join(format!(
+        "{}-{}-{}.md",
+        namespace,
+        slugify(&ticket.title),
+        timestamp_ms
+    ));
+    fs::write(&prompt_path, &prompt)
+        .with_context(|| format!("failed to write prompt bundle '{}'", prompt_path.display()))?;
+
+    ensure_project_trusted(&repo_path)?;
+
+    let mut launch_command = if launches_codex(&command) {
+        let mut wrapped = vec!["env".to_string(), "NO_UPDATE_NOTIFIER=1".to_string()];
+        wrapped.extend(command.clone());
+        wrapped
+    } else {
+        command.clone()
+    };
+    launch_command.push(prompt.clone());
+
+    let wrapped_command = wrap_launch_command(&finish_mode, &launch_command);
+    super::run_session_shell(
+        options.backend,
+        &namespace,
+        options.agents,
+        &Some(repo_path.display().to_string()),
+        &wrapped_command,
+    )?;
+
+    if options.startup_delay_ms > 0 {
+        thread::sleep(Duration::from_millis(options.startup_delay_ms));
+    }
+
+    let readiness_warnings = ticket.readiness_warnings();
+    let record_path = runs_dir.join(format!("{}-{}.json", namespace, timestamp_ms));
+    let codex_session_id = match options.resume_session_id.clone() {
+        Some(session_id) => Some(session_id),
+        None => discover_codex_session_id(&ticket.path, &repo_path, timestamp_ms)?,
+    };
+    let record = CodexLaunchRecord {
+        version: 2,
+        launched_at_epoch_ms: timestamp_ms,
+        task_id: ticket.effective_id(),
+        title: ticket.title.clone(),
+        task_note: ticket.path.display().to_string(),
+        repo_path: repo_path.display().to_string(),
+        namespace: namespace.clone(),
+        agent: options.agent.clone(),
+        agents: options.agents,
+        command,
+        launch_mode: if options.resume_session_id.is_some() {
+            "resume".to_string()
+        } else {
+            "fresh".to_string()
+        },
+        codex_session_id,
+        finish_mode,
+        prompt_file: prompt_path.display().to_string(),
+        record_file: record_path.display().to_string(),
+        readiness_warnings,
+    };
+
+    let record_json =
+        serde_json::to_string_pretty(&record).context("failed to serialize launch record")?;
+    fs::write(&record_path, record_json)
+        .with_context(|| format!("failed to write launch record '{}'", record_path.display()))?;
+
+    Ok(record)
+}
+
+fn jarvis_home() -> anyhow::Result<PathBuf> {
+    let home = env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".jarvis"))
+}
+
+fn default_namespace_suffix(ticket: &TicketNote) -> String {
+    let stem = ticket
+        .path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| ticket.effective_id());
+    slugify(&stem)
+}
+
+fn wrap_launch_command(finish_policy: &str, launch_command: &[String]) -> String {
+    let joined = shell_words::join(launch_command);
+    match finish_policy {
+        "keep" => format!(
+            "{}; status=$?; echo; echo \"[jarvisctl] Codex exited with status $status. Leaving an interactive shell open.\"; exec bash -li",
+            joined
+        ),
+        _ => joined,
+    }
+}
+
+fn build_base_command(command: &[String], resume_session_id: Option<&str>) -> Vec<String> {
+    let mut base_command = if command.is_empty() {
+        vec!["codex".to_string()]
+    } else {
+        command.to_vec()
+    };
+
+    let Some(session_id) = resume_session_id else {
+        return base_command;
+    };
+
+    let Some(codex_index) = base_command.iter().position(|part| part == "codex") else {
+        return base_command;
+    };
+    let subcommand_index = codex_index + 1;
+
+    match base_command.get(subcommand_index).map(String::as_str) {
+        Some("resume") => {
+            if base_command.get(subcommand_index + 1).is_none() {
+                base_command.insert(subcommand_index + 1, session_id.to_string());
+            }
+        }
+        _ => {
+            base_command.insert(subcommand_index, "resume".to_string());
+            base_command.insert(subcommand_index + 1, session_id.to_string());
+        }
+    }
+
+    base_command
+}
+
+fn with_codex_runtime_args(command: Vec<String>, runtime_args: &[String]) -> Vec<String> {
+    if runtime_args.is_empty() {
+        return command;
+    }
+
+    let Some(insert_index) = codex_insert_index(&command) else {
+        return command;
+    };
+
+    let mut combined = command;
+    combined.splice(insert_index..insert_index, runtime_args.iter().cloned());
+    combined
+}
+
+fn launches_codex(command: &[String]) -> bool {
+    codex_insert_index(command).is_some()
+}
+
+fn codex_insert_index(command: &[String]) -> Option<usize> {
+    let codex_index = match command.first().map(String::as_str) {
+        Some("codex") => Some(0),
+        Some("env") => command.iter().position(|part| part == "codex"),
+        _ => None,
+    }?;
+    let after_codex = codex_index + 1;
+    if command.get(after_codex).map(String::as_str) == Some("resume") {
+        Some(after_codex + 1)
+    } else {
+        Some(after_codex)
+    }
+}
+
+fn ensure_project_trusted(repo_path: &Path) -> anyhow::Result<()> {
+    let home = env::var_os("HOME").context("HOME is not set")?;
+    let config_path = PathBuf::from(home).join(".codex").join("config.toml");
+    if !config_path.exists() {
+        return Ok(());
+    }
+
+    let raw = fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read '{}'", config_path.display()))?;
+    let project_key = repo_path.to_string_lossy().to_string();
+    let section_header = format!("[projects.\"{}\"]", project_key);
+
+    let original = raw.clone();
+    let updated = if let Some(section_start) = raw.find(&section_header) {
+        let section_body_start = raw[section_start..]
+            .find('\n')
+            .map(|offset| section_start + offset + 1)
+            .unwrap_or(raw.len());
+        let section_end = raw[section_body_start..]
+            .find("\n[")
+            .map(|offset| section_body_start + offset)
+            .unwrap_or(raw.len());
+        let section_body = &raw[section_body_start..section_end];
+
+        if section_body.contains("trust_level = \"trusted\"") {
+            raw
+        } else if section_body.contains("trust_level = ") {
+            let replaced = section_body
+                .lines()
+                .map(|line| {
+                    if line.trim_start().starts_with("trust_level = ") {
+                        "trust_level = \"trusted\"".to_string()
+                    } else {
+                        line.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "{}{}{}",
+                &raw[..section_body_start],
+                replaced,
+                &raw[section_end..]
+            )
+        } else {
+            format!(
+                "{}trust_level = \"trusted\"\n{}",
+                &raw[..section_body_start],
+                &raw[section_body_start..]
+            )
+        }
+    } else {
+        let mut appended = raw;
+        if !appended.ends_with('\n') {
+            appended.push('\n');
+        }
+        appended.push('\n');
+        appended.push_str(&section_header);
+        appended.push('\n');
+        appended.push_str("trust_level = \"trusted\"\n");
+        appended
+    };
+
+    if updated != original {
+        fs::write(&config_path, updated)
+            .with_context(|| format!("failed to write '{}'", config_path.display()))?;
+    }
+
+    Ok(())
+}
+
+pub(crate) fn discover_codex_session_id(
+    ticket_path: &Path,
+    repo_path: &Path,
+    launched_at_epoch_ms: u128,
+) -> anyhow::Result<Option<String>> {
+    let home = env::var_os("HOME").context("HOME is not set")?;
+    let sessions_dir = PathBuf::from(home).join(".codex").join("sessions");
+    if !sessions_dir.exists() {
+        return Ok(None);
+    }
+
+    let mut files = Vec::new();
+    collect_session_files(&sessions_dir, &mut files)?;
+    files.sort();
+
+    let ticket_marker = ticket_path.display().to_string();
+    let repo_marker = repo_path.display().to_string();
+    let mut best_match: Option<(bool, u128, String)> = None;
+
+    for file in files {
+        let raw = match fs::read_to_string(&file) {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+
+        let Some(first_line) = raw.lines().next() else {
+            continue;
+        };
+        let envelope: SessionMetaEnvelope = match serde_json::from_str(first_line) {
+            Ok(envelope) => envelope,
+            Err(_) => continue,
+        };
+        if envelope.entry_type != "session_meta" || envelope.payload.cwd != repo_marker {
+            continue;
+        }
+
+        let session_started_at_epoch_ms = match parse_rfc3339_epoch_ms(&envelope.payload.timestamp)
+        {
+            Some(epoch_ms) => epoch_ms,
+            None => continue,
+        };
+        let delta = session_started_at_epoch_ms.abs_diff(launched_at_epoch_ms);
+        if delta > 300_000 {
+            continue;
+        }
+
+        let has_ticket_marker = raw.contains(&ticket_marker);
+        let replace = match best_match.as_ref() {
+            Some((best_has_ticket_marker, best_delta, _)) => {
+                (has_ticket_marker && !best_has_ticket_marker)
+                    || (has_ticket_marker == *best_has_ticket_marker && delta <= *best_delta)
+            }
+            None => true,
+        };
+        if replace {
+            best_match = Some((has_ticket_marker, delta, envelope.payload.id));
+        }
+    }
+
+    Ok(best_match.map(|(_, _, session_id)| session_id))
+}
+
+fn collect_session_files(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read '{}'", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_session_files(&path, out)?;
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) == Some("jsonl") {
+            out.push(path);
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_rfc3339_epoch_ms(raw: &str) -> Option<u128> {
+    let datetime = OffsetDateTime::parse(raw, &Rfc3339).ok()?;
+    let seconds = i128::from(datetime.unix_timestamp());
+    let milliseconds = i128::from(datetime.millisecond());
+    let epoch_ms = seconds.checked_mul(1_000)?.checked_add(milliseconds)?;
+    u128::try_from(epoch_ms).ok()
+}

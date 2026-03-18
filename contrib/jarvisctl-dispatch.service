@@ -1,0 +1,14 @@
+[Unit]
+Description=jarvisctl Codex dispatch watcher
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/jarvisctl dispatch --vault-path %h/documents/codex
+Restart=always
+RestartSec=2
+Environment=RUST_LOG=info
+WorkingDirectory=%h/documents/jarvisctl
+
+[Install]
+WantedBy=default.target
