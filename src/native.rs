@@ -87,6 +87,8 @@ pub struct NativeSessionMetadata {
     pub namespace: String,
     pub backend: String,
     pub created_at_epoch_ms: u128,
+    pub working_directory: Option<String>,
+    pub shell_command: String,
     pub agents: Vec<NativeAgentMetadata>,
 }
 
@@ -140,6 +142,8 @@ enum ServerMessage {
 struct NativeSession {
     namespace: String,
     created_at_epoch_ms: u128,
+    working_directory: Option<String>,
+    shell_command: String,
     session_dir: PathBuf,
     agents: BTreeMap<String, Arc<ManagedAgent>>,
     shutdown_requested: AtomicBool,
@@ -162,6 +166,8 @@ impl NativeSession {
             namespace: self.namespace.clone(),
             backend: "native".to_string(),
             created_at_epoch_ms: self.created_at_epoch_ms,
+            working_directory: self.working_directory.clone(),
+            shell_command: self.shell_command.clone(),
             agents: self
                 .agents
                 .values()
@@ -412,6 +418,8 @@ pub fn serve_native_session(manifest_path: PathBuf) -> anyhow::Result<()> {
     let session = Arc::new(NativeSession {
         namespace: manifest.namespace,
         created_at_epoch_ms: manifest.created_at_epoch_ms,
+        working_directory: manifest.working_directory,
+        shell_command: manifest.shell_command,
         session_dir: session_dir.clone(),
         agents,
         shutdown_requested: AtomicBool::new(false),
@@ -499,6 +507,27 @@ pub fn list_native_sessions(namespace: Option<&str>) -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+pub fn print_native_sessions_json(namespace: Option<&str>) -> anyhow::Result<()> {
+    if let Some(namespace) = namespace {
+        let metadata = native_session_metadata(namespace)?
+            .ok_or_else(|| anyhow!("native session '{}' does not exist", namespace))?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&metadata)
+                .context("failed to encode native session metadata as JSON")?
+        );
+        return Ok(());
+    }
+
+    let sessions = collect_native_sessions()?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&sessions)
+            .context("failed to encode native sessions as JSON")?
+    );
     Ok(())
 }
 

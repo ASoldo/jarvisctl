@@ -30,7 +30,7 @@ use codex::{CodexLaunchOptions, launch_codex_ticket};
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use native::{
     attach_native, delete_native_session, interrupt_native, list_native_sessions,
-    serve_native_session, spawn_native_session, tell_native,
+    print_native_sessions_json, serve_native_session, spawn_native_session, tell_native,
 };
 use tui::{run_dashboard, view_agent};
 
@@ -236,6 +236,9 @@ enum Command {
 
         #[arg(long)]
         namespace: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
 
     /// Attach to a specific agent in a namespace
@@ -392,7 +395,11 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
 
         Command::Attach { backend, namespace } => attach_session(backend, &namespace),
         Command::Delete { backend, namespace } => delete_session(backend, &namespace),
-        Command::List { backend, namespace } => list_sessions(backend, namespace),
+        Command::List {
+            backend,
+            namespace,
+            json,
+        } => list_sessions(backend, namespace, json),
         Command::Exec {
             backend,
             namespace,
@@ -486,9 +493,17 @@ pub(crate) fn run_session_shell(
 }
 
 #[instrument(err)]
-fn list_sessions(backend: SessionBackend, namespace: Option<String>) -> Result<(), JarvisError> {
+fn list_sessions(
+    backend: SessionBackend,
+    namespace: Option<String>,
+    json: bool,
+) -> Result<(), JarvisError> {
     let _ = backend;
-    list_native_sessions(namespace.as_deref()).map_err(JarvisError::from)
+    if json {
+        print_native_sessions_json(namespace.as_deref()).map_err(JarvisError::from)
+    } else {
+        list_native_sessions(namespace.as_deref()).map_err(JarvisError::from)
+    }
 }
 
 #[instrument(err)]
