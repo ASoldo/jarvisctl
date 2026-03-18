@@ -21,14 +21,16 @@ use ratatui::{
 use crate::native::{NativeSessionMetadata, collect_native_sessions};
 use crate::{SessionBackend, delete_session, exec_agent, interrupt_agent};
 
-const BG: Color = Color::Rgb(42, 44, 48);
+const BG: Color = Color::Rgb(31, 29, 31);
 const PL_A: Color = Color::Rgb(17, 94, 89);
 const PL_B: Color = Color::Rgb(30, 64, 175);
 const PL_C: Color = Color::Rgb(55, 48, 163);
 const PL_D: Color = Color::Rgb(82, 24, 124);
-const PANEL: Color = Color::Rgb(42, 44, 48);
-const BORDER: Color = Color::Rgb(86, 91, 99);
-const ROW_HIGHLIGHT: Color = Color::Rgb(58, 62, 68);
+const PANEL: Color = Color::Rgb(34, 32, 34);
+const BORDER: Color = Color::Rgb(70, 67, 72);
+const ROW_HIGHLIGHT: Color = Color::Rgb(48, 45, 50);
+const TEXT: Color = Color::Rgb(214, 211, 216);
+const SUBTLE_TEXT: Color = Color::Rgb(149, 145, 153);
 
 pub fn view_agent(name: &str, output: Arc<Mutex<Vec<String>>>) -> anyhow::Result<()> {
     let mut stdout = stdout();
@@ -75,7 +77,7 @@ pub fn view_agent(name: &str, output: Arc<Mutex<Vec<String>>>) -> anyhow::Result
                         .border_style(Style::default().fg(BORDER)),
                 )
                 .wrap(Wrap { trim: false })
-                .style(Style::default().bg(PANEL).fg(Color::White));
+                .style(Style::default().bg(PANEL).fg(TEXT));
 
             f.render_widget(paragraph, area[0]);
         })?;
@@ -333,7 +335,7 @@ fn render_dashboard_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &D
                     .style(Style::default().bg(PANEL))
                     .border_style(Style::default().fg(BORDER)),
             )
-            .style(Style::default().fg(Color::Gray).bg(PANEL));
+            .style(Style::default().fg(SUBTLE_TEXT).bg(PANEL));
         frame.render_widget(empty, area);
         return;
     }
@@ -379,7 +381,7 @@ fn render_dashboard_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &D
     .row_highlight_style(
         Style::default()
             .bg(ROW_HIGHLIGHT)
-            .fg(Color::White)
+            .fg(TEXT)
             .add_modifier(Modifier::BOLD),
     )
     .highlight_symbol("▌ ");
