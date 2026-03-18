@@ -21,13 +21,14 @@ use ratatui::{
 use crate::native::{NativeSessionMetadata, collect_native_sessions};
 use crate::{SessionBackend, delete_session, exec_agent, interrupt_agent};
 
-const BG: Color = Color::Rgb(9, 15, 25);
+const BG: Color = Color::Rgb(36, 38, 41);
 const PL_A: Color = Color::Rgb(17, 94, 89);
 const PL_B: Color = Color::Rgb(30, 64, 175);
 const PL_C: Color = Color::Rgb(55, 48, 163);
 const PL_D: Color = Color::Rgb(82, 24, 124);
-const PANEL: Color = Color::Rgb(15, 23, 42);
-const BORDER: Color = Color::Rgb(51, 65, 85);
+const PANEL: Color = Color::Rgb(44, 46, 51);
+const BORDER: Color = Color::Rgb(96, 102, 112);
+const ROW_HIGHLIGHT: Color = Color::Rgb(64, 68, 76);
 
 pub fn view_agent(name: &str, output: Arc<Mutex<Vec<String>>>) -> anyhow::Result<()> {
     let mut stdout = stdout();
@@ -45,6 +46,7 @@ pub fn view_agent(name: &str, output: Arc<Mutex<Vec<String>>>) -> anyhow::Result
 
     loop {
         terminal.draw(|f| {
+            f.render_widget(Block::default().style(Style::default().bg(BG)), f.area());
             let area = Layout::default()
                 .direction(Direction::Vertical)
                 .margin(1)
@@ -65,9 +67,15 @@ pub fn view_agent(name: &str, output: Arc<Mutex<Vec<String>>>) -> anyhow::Result
             };
 
             let paragraph = Paragraph::new(log_content)
-                .block(Block::default().title(name).borders(Borders::ALL))
+                .block(
+                    Block::default()
+                        .title(name)
+                        .borders(Borders::ALL)
+                        .style(Style::default().bg(PANEL))
+                        .border_style(Style::default().fg(BORDER)),
+                )
                 .wrap(Wrap { trim: false })
-                .style(Style::default());
+                .style(Style::default().bg(PANEL).fg(Color::White));
 
             f.render_widget(paragraph, area[0]);
         })?;
@@ -267,6 +275,11 @@ fn flatten_native_rows(sessions: &[NativeSessionMetadata]) -> Vec<DashboardRow> 
 }
 
 fn render_dashboard(frame: &mut Frame, app: &DashboardApp) {
+    frame.render_widget(
+        Block::default().style(Style::default().bg(BG)),
+        frame.area(),
+    );
+
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -365,7 +378,7 @@ fn render_dashboard_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &D
     )
     .row_highlight_style(
         Style::default()
-            .bg(Color::Rgb(20, 60, 110))
+            .bg(ROW_HIGHLIGHT)
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
     )
