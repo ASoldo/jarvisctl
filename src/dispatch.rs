@@ -2,7 +2,7 @@ use crate::SessionBackend;
 use crate::board::{BoardFile, discover_default_boards, normalize_column, resolve_wiki_link};
 use crate::codex::{
     CodexLaunchOptions, default_namespace_for_ticket, discover_codex_session_id,
-    launch_codex_ticket,
+    discover_latest_launch_session_id, launch_codex_ticket,
 };
 use crate::native::{
     delete_native_session, interrupt_native, native_session_metadata, tell_native,
@@ -303,9 +303,12 @@ fn handle_ready_transition(
         namespace: None,
         agents: options.agents,
         agent: options.agent.clone(),
+        fresh_session: false,
         resume_session_id: last_codex_session_id.clone(),
         working_directory: None,
         prompt_file: None,
+        operator_message: None,
+        images: Vec::new(),
         startup_delay_ms: options.startup_delay_ms,
         command: options.command.clone(),
     })?;
@@ -732,7 +735,7 @@ fn cancel_run_namespace(
 ) -> anyhow::Result<()> {
     let _ = backend;
     if probe_namespace_run_state(backend, namespace)? == NamespaceRunState::ActiveCodex {
-        let _ = tell_native(namespace, agent, "/clear");
+        let _ = tell_native(namespace, agent, "/clear", true);
         thread::sleep(Duration::from_millis(200));
         let _ = interrupt_native(namespace, agent);
         thread::sleep(Duration::from_millis(100));
@@ -756,6 +759,14 @@ fn resolve_ticket_session_id(
 ) -> anyhow::Result<Option<String>> {
     if existing_session_id.is_some() {
         return Ok(existing_session_id);
+    }
+
+    let historical = discover_latest_launch_session_id(
+        &ticket.path,
+        &default_namespace_for_ticket(ticket),
+    )?;
+    if historical.is_some() {
+        return Ok(historical);
     }
 
     let Some(repo_path) = ticket.repo_path() else {

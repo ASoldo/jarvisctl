@@ -138,6 +138,14 @@ enum Command {
         #[arg(long, default_value = "agent0")]
         agent: String,
 
+        /// Force a new Codex conversation instead of reusing the latest session for this ticket
+        #[arg(long, default_value_t = false, conflicts_with = "resume_session_id")]
+        fresh: bool,
+
+        /// Explicit Codex session id to resume instead of reusing the latest ticket session
+        #[arg(long)]
+        resume_session_id: Option<String>,
+
         /// Override the working directory instead of repo_path from the note
         #[arg(long, value_hint = ValueHint::DirPath)]
         working_directory: Option<PathBuf>,
@@ -145,6 +153,14 @@ enum Command {
         /// Use an explicit prompt file instead of rendering from the task note
         #[arg(long, value_hint = ValueHint::FilePath)]
         prompt_file: Option<PathBuf>,
+
+        /// Additional operator message to send with the launch or resume prompt
+        #[arg(long)]
+        message: Option<String>,
+
+        /// Image(s) to attach to the initial or resumed Codex prompt
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        image: Vec<PathBuf>,
 
         /// Wait this long before injecting the prompt
         #[arg(long, default_value_t = 1500)]
@@ -262,8 +278,12 @@ enum Command {
         namespace: String,
         #[arg(long)]
         agent: String,
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        file: String,
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "text")]
+        file: Option<String>,
+        #[arg(long, conflicts_with = "file")]
+        text: Option<String>,
+        #[arg(long, default_value_t = false)]
+        no_enter: bool,
     },
 
     /// Send Ctrl+C to a running agent
@@ -346,8 +366,12 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             namespace,
             agents,
             agent,
+            fresh,
+            resume_session_id,
             working_directory,
             prompt_file,
+            message,
+            image,
             startup_delay_ms,
             command,
         } => launch_and_print_codex(CodexLaunchOptions {
@@ -356,9 +380,12 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             namespace,
             agents,
             agent,
-            resume_session_id: None,
+            fresh_session: fresh,
+            resume_session_id,
             working_directory,
             prompt_file,
+            operator_message: message,
+            images: image,
             startup_delay_ms,
             command,
         }),
@@ -410,7 +437,9 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             namespace,
             agent,
             file,
-        } => tell(backend, &namespace, &agent, &file),
+            text,
+            no_enter,
+        } => tell(backend, &namespace, &agent, file.as_deref(), text.as_deref(), !no_enter),
         Command::Interrupt {
             backend,
             namespace,
@@ -517,16 +546,35 @@ fn tell(
     backend: SessionBackend,
     namespace: &str,
     agent: &str,
-    file: &str,
+    file: Option<&str>,
+    text: Option<&str>,
+    press_enter: bool,
 ) -> Result<(), JarvisError> {
-    let contents = std::fs::read_to_string(file)?;
+    let contents = match (file, text.map(str::trim).filter(|value| !value.is_empty())) {
+        (Some(file), None) => std::fs::read_to_string(file)?,
+        (None, Some(text)) => text.to_string(),
+        (Some(_), Some(_)) => {
+            return Err(JarvisError::Other(anyhow::anyhow!(
+                "--file and --text cannot be used together"
+            )));
+        }
+        (None, None) => {
+            return Err(JarvisError::Other(anyhow::anyhow!(
+                "provide either --file or --text to tell"
+            )));
+        }
+    };
     let _ = backend;
-    tell_native(namespace, agent, &contents).map_err(JarvisError::from)?;
+    tell_native(namespace, agent, &contents, press_enter).map_err(JarvisError::from)?;
 
-    println!(
-        "✅ Sent '{}' to '{}':'{}' via the native runtime",
-        file, namespace, agent
-    );
+    if let Some(file) = file {
+        println!(
+            "✅ Sent '{}' to '{}':'{}' via the native runtime",
+            file, namespace, agent
+        );
+    } else {
+        println!("✅ Sent text to '{}':'{}' via the native runtime", namespace, agent);
+    }
     Ok(())
 }
 

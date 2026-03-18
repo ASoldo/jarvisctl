@@ -618,13 +618,18 @@ pub fn delete_native_session(namespace: &str) -> anyhow::Result<()> {
     }
 }
 
-pub fn tell_native(namespace: &str, agent: &str, contents: &str) -> anyhow::Result<()> {
+pub fn tell_native(
+    namespace: &str,
+    agent: &str,
+    contents: &str,
+    press_enter: bool,
+) -> anyhow::Result<()> {
     let response = request(
         namespace,
         &ClientMessage::SendText {
             agent: agent.to_string(),
             text: contents.to_string(),
-            press_enter: true,
+            press_enter,
         },
     )?;
     match response {

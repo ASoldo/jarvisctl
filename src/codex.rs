@@ -17,9 +17,12 @@ pub struct CodexLaunchOptions {
     pub namespace: Option<String>,
     pub agents: usize,
     pub agent: String,
+    pub fresh_session: bool,
     pub resume_session_id: Option<String>,
     pub working_directory: Option<PathBuf>,
     pub prompt_file: Option<PathBuf>,
+    pub operator_message: Option<String>,
+    pub images: Vec<PathBuf>,
     pub startup_delay_ms: u64,
     pub command: Vec<String>,
 }
@@ -58,6 +61,14 @@ struct SessionMetaPayload {
     timestamp: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct HistoricalLaunchRecord {
+    task_note: String,
+    namespace: String,
+    launched_at_epoch_ms: u128,
+    codex_session_id: Option<String>,
+}
+
 pub fn default_namespace_for_ticket(ticket: &TicketNote) -> String {
     format!("codex-{}", default_namespace_suffix(ticket))
 }
@@ -80,16 +91,18 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
         .namespace
         .clone()
         .unwrap_or_else(|| default_namespace_for_ticket(&ticket));
-    let runtime_args = ticket.codex_cli_args()?;
+    let resume_session_id = resolve_resume_session_id(&ticket, &namespace, &options)?;
+    let mut runtime_args = ticket.codex_cli_args()?;
+    runtime_args.extend(codex_image_args(&options.images)?);
     let finish_mode = ticket.finish_session_policy()?.to_string();
-    let base_command = build_base_command(&options.command, options.resume_session_id.as_deref());
+    let base_command = build_base_command(&options.command, resume_session_id.as_deref());
     let command = with_codex_runtime_args(base_command, &runtime_args);
-    let prompt = if let Some(prompt_file) = &options.prompt_file {
-        fs::read_to_string(prompt_file)
-            .with_context(|| format!("failed to read prompt file '{}'", prompt_file.display()))?
-    } else {
-        ticket.render_codex_prompt()
-    };
+    let prompt = build_codex_prompt(
+        &ticket,
+        options.prompt_file.as_deref(),
+        options.operator_message.as_deref(),
+        resume_session_id.is_some(),
+    )?;
 
     let jarvis_home = jarvis_home()?;
     let prompts_dir = jarvis_home.join("codex").join("prompts");
@@ -138,7 +151,7 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
 
     let readiness_warnings = ticket.readiness_warnings();
     let record_path = runs_dir.join(format!("{}-{}.json", namespace, timestamp_ms));
-    let codex_session_id = match options.resume_session_id.clone() {
+    let codex_session_id = match resume_session_id.clone() {
         Some(session_id) => Some(session_id),
         None => discover_codex_session_id(&ticket.path, &repo_path, timestamp_ms)?,
     };
@@ -153,7 +166,7 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
         agent: options.agent.clone(),
         agents: options.agents,
         command,
-        launch_mode: if options.resume_session_id.is_some() {
+        launch_mode: if resume_session_id.is_some() {
             "resume".to_string()
         } else {
             "fresh".to_string()
@@ -186,6 +199,76 @@ fn default_namespace_suffix(ticket: &TicketNote) -> String {
         .filter(|stem| !stem.is_empty())
         .unwrap_or_else(|| ticket.effective_id());
     slugify(&stem)
+}
+
+fn resolve_resume_session_id(
+    ticket: &TicketNote,
+    namespace: &str,
+    options: &CodexLaunchOptions,
+) -> anyhow::Result<Option<String>> {
+    if options.fresh_session {
+        return Ok(None);
+    }
+    if options.resume_session_id.is_some() {
+        return Ok(options.resume_session_id.clone());
+    }
+
+    discover_latest_launch_session_id(&ticket.path, namespace)
+}
+
+fn build_codex_prompt(
+    ticket: &TicketNote,
+    prompt_file: Option<&Path>,
+    operator_message: Option<&str>,
+    resuming: bool,
+) -> anyhow::Result<String> {
+    let trimmed_message = operator_message
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let mut prompt = if let Some(prompt_file) = prompt_file {
+        fs::read_to_string(prompt_file)
+            .with_context(|| format!("failed to read prompt file '{}'", prompt_file.display()))?
+    } else if resuming {
+        if let Some(message) = trimmed_message {
+            format!(
+                "Continue work for '{}' at '{}'.\n\nOperator update:\n{}",
+                ticket.title,
+                ticket.path.display(),
+                message
+            )
+        } else {
+            ticket.render_codex_prompt()
+        }
+    } else {
+        ticket.render_codex_prompt()
+    };
+
+    if let Some(message) = trimmed_message {
+        if prompt_file.is_some() || !resuming {
+            if !prompt.ends_with('\n') {
+                prompt.push('\n');
+            }
+            prompt.push_str("\nOperator update:\n");
+            prompt.push_str(message);
+        }
+    }
+
+    Ok(prompt)
+}
+
+fn codex_image_args(images: &[PathBuf]) -> anyhow::Result<Vec<String>> {
+    let mut args = Vec::new();
+    for image in images {
+        ensure!(
+            image.exists(),
+            "image '{}' does not exist",
+            image.display()
+        );
+        args.push("--image".to_string());
+        args.push(image.display().to_string());
+    }
+    Ok(args)
 }
 
 fn wrap_launch_command(finish_policy: &str, launch_command: &[String]) -> String {
@@ -418,4 +501,164 @@ fn parse_rfc3339_epoch_ms(raw: &str) -> Option<u128> {
     let milliseconds = i128::from(datetime.millisecond());
     let epoch_ms = seconds.checked_mul(1_000)?.checked_add(milliseconds)?;
     u128::try_from(epoch_ms).ok()
+}
+
+pub(crate) fn discover_latest_launch_session_id(
+    ticket_path: &Path,
+    namespace: &str,
+) -> anyhow::Result<Option<String>> {
+    let runs_dir = jarvis_home()?.join("codex").join("runs");
+    discover_latest_launch_session_id_in_dir(&runs_dir, ticket_path, namespace)
+}
+
+fn discover_latest_launch_session_id_in_dir(
+    runs_dir: &Path,
+    ticket_path: &Path,
+    namespace: &str,
+) -> anyhow::Result<Option<String>> {
+    if !runs_dir.exists() {
+        return Ok(None);
+    }
+
+    let ticket_marker = canonical_path_string(ticket_path);
+    let mut best_match: Option<(u128, String)> = None;
+
+    for entry in fs::read_dir(runs_dir)
+        .with_context(|| format!("failed to read '{}'", runs_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        let record: HistoricalLaunchRecord = match serde_json::from_str(&raw) {
+            Ok(record) => record,
+            Err(_) => continue,
+        };
+        let Some(session_id) = record.codex_session_id else {
+            continue;
+        };
+
+        let task_matches = canonical_path_string(Path::new(&record.task_note)) == ticket_marker;
+        let namespace_matches = record.namespace == namespace;
+        if !task_matches && !namespace_matches {
+            continue;
+        }
+
+        let replace = match best_match.as_ref() {
+            Some((best_epoch_ms, _)) => record.launched_at_epoch_ms >= *best_epoch_ms,
+            None => true,
+        };
+        if replace {
+            best_match = Some((record.launched_at_epoch_ms, session_id));
+        }
+    }
+
+    Ok(best_match.map(|(_, session_id)| session_id))
+}
+
+fn canonical_path_string(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        HistoricalLaunchRecord, build_base_command, build_codex_prompt, canonical_path_string,
+        discover_latest_launch_session_id_in_dir,
+    };
+    use crate::ticket::TicketNote;
+    use std::fs;
+    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn build_base_command_inserts_resume_id_when_missing() {
+        let command = build_base_command(&["codex".to_string()], Some("session-123"));
+        assert_eq!(command, vec!["codex", "resume", "session-123"]);
+    }
+
+    #[test]
+    fn build_codex_prompt_uses_operator_update_for_resume() {
+        let root = unique_temp_dir("jarvisctl-codex-prompt");
+        fs::create_dir_all(&root).unwrap();
+        let ticket_path = root.join("ticket.md");
+        fs::write(
+            &ticket_path,
+            r#"---
+title: Demo Ticket
+type: ticket
+repo_path: /tmp/repo
+---
+
+# Demo Ticket
+"#,
+        )
+        .unwrap();
+
+        let ticket = TicketNote::load(&ticket_path).unwrap();
+        let prompt = build_codex_prompt(&ticket, None, Some("Need one more validation pass."), true)
+            .unwrap();
+
+        assert!(prompt.contains("Continue work for 'Demo Ticket'"));
+        assert!(prompt.contains("Operator update:\nNeed one more validation pass."));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discover_latest_launch_session_id_prefers_latest_matching_record() {
+        let root = unique_temp_dir("jarvisctl-codex-runs");
+        let runs_dir = root.join("runs");
+        fs::create_dir_all(&runs_dir).unwrap();
+        let ticket_path = root.join("ticket.md");
+        fs::write(&ticket_path, "# Ticket\n").unwrap();
+
+        let older = HistoricalLaunchRecord {
+            task_note: canonical_path_string(&ticket_path),
+            namespace: "codex-ticket".to_string(),
+            launched_at_epoch_ms: 10,
+            codex_session_id: Some("session-old".to_string()),
+        };
+        let newer = HistoricalLaunchRecord {
+            task_note: canonical_path_string(&ticket_path),
+            namespace: "codex-ticket".to_string(),
+            launched_at_epoch_ms: 20,
+            codex_session_id: Some("session-new".to_string()),
+        };
+        fs::write(
+            runs_dir.join("older.json"),
+            serde_json::to_string(&older).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            runs_dir.join("newer.json"),
+            serde_json::to_string(&newer).unwrap(),
+        )
+        .unwrap();
+
+        let resolved = discover_latest_launch_session_id_in_dir(
+            &runs_dir,
+            Path::new(&ticket_path),
+            "codex-ticket",
+        )
+        .unwrap();
+        assert_eq!(resolved.as_deref(), Some("session-new"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{}-{}", prefix, nanos))
+    }
 }
