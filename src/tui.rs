@@ -21,12 +21,11 @@ use ratatui::{
 use crate::native::{NativeSessionMetadata, collect_native_sessions};
 use crate::{SessionBackend, delete_session, exec_agent, interrupt_agent};
 
-const BG: Color = Color::Rgb(31, 29, 31);
+const BG: Color = Color::Reset;
 const PL_A: Color = Color::Rgb(17, 94, 89);
 const PL_B: Color = Color::Rgb(30, 64, 175);
 const PL_C: Color = Color::Rgb(55, 48, 163);
 const PL_D: Color = Color::Rgb(82, 24, 124);
-const PANEL: Color = Color::Rgb(34, 32, 34);
 const BORDER: Color = Color::Rgb(70, 67, 72);
 const ROW_HIGHLIGHT: Color = Color::Rgb(48, 45, 50);
 const TEXT: Color = Color::Rgb(214, 211, 216);
@@ -48,7 +47,6 @@ pub fn view_agent(name: &str, output: Arc<Mutex<Vec<String>>>) -> anyhow::Result
 
     loop {
         terminal.draw(|f| {
-            f.render_widget(Block::default().style(Style::default().bg(BG)), f.area());
             let area = Layout::default()
                 .direction(Direction::Vertical)
                 .margin(1)
@@ -73,11 +71,10 @@ pub fn view_agent(name: &str, output: Arc<Mutex<Vec<String>>>) -> anyhow::Result
                     Block::default()
                         .title(name)
                         .borders(Borders::ALL)
-                        .style(Style::default().bg(PANEL))
                         .border_style(Style::default().fg(BORDER)),
                 )
                 .wrap(Wrap { trim: false })
-                .style(Style::default().bg(PANEL).fg(TEXT));
+                .style(Style::default().fg(TEXT));
 
             f.render_widget(paragraph, area[0]);
         })?;
@@ -277,11 +274,6 @@ fn flatten_native_rows(sessions: &[NativeSessionMetadata]) -> Vec<DashboardRow> 
 }
 
 fn render_dashboard(frame: &mut Frame, app: &DashboardApp) {
-    frame.render_widget(
-        Block::default().style(Style::default().bg(BG)),
-        frame.area(),
-    );
-
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -332,10 +324,9 @@ fn render_dashboard_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &D
                 Block::default()
                     .borders(Borders::ALL)
                     .title("Sessions")
-                    .style(Style::default().bg(PANEL))
                     .border_style(Style::default().fg(BORDER)),
             )
-            .style(Style::default().fg(SUBTLE_TEXT).bg(PANEL));
+            .style(Style::default().fg(SUBTLE_TEXT));
         frame.render_widget(empty, area);
         return;
     }
@@ -375,7 +366,6 @@ fn render_dashboard_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &D
         Block::default()
             .borders(Borders::ALL)
             .title("Sessions")
-            .style(Style::default().bg(PANEL))
             .border_style(Style::default().fg(BORDER)),
     )
     .row_highlight_style(
