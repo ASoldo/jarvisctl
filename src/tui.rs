@@ -21,14 +21,14 @@ use ratatui::{
 use crate::native::{NativeSessionMetadata, collect_native_sessions};
 use crate::{SessionBackend, delete_session, exec_agent, interrupt_agent};
 
-const BG: Color = Color::Rgb(36, 38, 41);
+const BG: Color = Color::Rgb(42, 44, 48);
 const PL_A: Color = Color::Rgb(17, 94, 89);
 const PL_B: Color = Color::Rgb(30, 64, 175);
 const PL_C: Color = Color::Rgb(55, 48, 163);
 const PL_D: Color = Color::Rgb(82, 24, 124);
-const PANEL: Color = Color::Rgb(44, 46, 51);
-const BORDER: Color = Color::Rgb(96, 102, 112);
-const ROW_HIGHLIGHT: Color = Color::Rgb(64, 68, 76);
+const PANEL: Color = Color::Rgb(42, 44, 48);
+const BORDER: Color = Color::Rgb(86, 91, 99);
+const ROW_HIGHLIGHT: Color = Color::Rgb(58, 62, 68);
 
 pub fn view_agent(name: &str, output: Arc<Mutex<Vec<String>>>) -> anyhow::Result<()> {
     let mut stdout = stdout();
