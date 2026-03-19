@@ -1,6 +1,6 @@
 use crate::native::{
     NativeAgentMetadata, NativeSessionMetadata, RuntimeContextMetadata, RuntimeFeedEntry,
-    RuntimeSubagentMetadata,
+    RuntimeSubagentAction, RuntimeSubagentMetadata,
 };
 use crate::tui::view_agent;
 use anyhow::{Context, anyhow, bail, ensure};
@@ -28,6 +28,7 @@ const EVENTS_FILE_NAME: &str = "events.log";
 const LOG_LIMIT_BYTES: usize = 512 * 1024;
 const FEED_LIMIT: usize = 18;
 const SUBAGENT_LIMIT: usize = 24;
+const SUBAGENT_ACTION_LIMIT: usize = 6;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexAppLaunchManifest {
@@ -471,6 +472,7 @@ impl CodexAppSession {
                     );
                     context.last_activity = Some(describe_subagent_activity(item));
                 })?;
+                self.append_text_line(format!("[branch] {}", subagent_console_line(item)))?;
             }
             _ => {}
         }
@@ -633,6 +635,7 @@ impl CodexAppSession {
                     );
                     context.last_activity = Some(describe_subagent_activity(item));
                 })?;
+                self.append_text_line(format!("[branch] {}", subagent_console_line(item)))?;
             }
             _ => {}
         }
@@ -1623,7 +1626,7 @@ fn apply_subagent_item(context: &mut RuntimeContextMetadata, item: &Value) {
     let prompt_preview = item
         .get("prompt")
         .and_then(Value::as_str)
-        .map(|value| truncate_line(value, 200));
+        .map(ToOwned::to_owned);
     let receiver_ids = item
         .get("receiverThreadIds")
         .and_then(Value::as_array)
@@ -1638,6 +1641,7 @@ fn apply_subagent_item(context: &mut RuntimeContextMetadata, item: &Value) {
     let agent_states = item.get("agentsStates").and_then(Value::as_object);
 
     for receiver_thread_id in receiver_ids {
+        let action_timestamp = now_epoch_ms();
         let (status, latest_message) =
             match agent_states.and_then(|states| states.get(&receiver_thread_id)) {
                 Some(Value::Object(state)) => (
@@ -1649,25 +1653,34 @@ fn apply_subagent_item(context: &mut RuntimeContextMetadata, item: &Value) {
                     state
                         .get("message")
                         .and_then(Value::as_str)
-                        .map(|value| truncate_line(value, 180)),
+                        .map(ToOwned::to_owned),
                 ),
                 _ => (
                     map_tool_call_status_to_subagent_status(&call_status).to_string(),
                     None,
                 ),
             };
+        let action = build_subagent_action(
+            &receiver_thread_id,
+            &tool,
+            &status,
+            action_timestamp,
+            prompt_preview.as_deref(),
+            latest_message.as_deref(),
+        );
         upsert_subagent(
             &mut context.subagents,
             RuntimeSubagentMetadata {
                 thread_id: receiver_thread_id,
                 tool: tool.clone(),
                 status,
-                updated_at_epoch_ms: now_epoch_ms(),
+                updated_at_epoch_ms: action_timestamp,
                 parent_thread_id: sender_thread_id.clone(),
                 model: model.clone(),
                 reasoning_effort: reasoning_effort.clone(),
                 prompt_preview: prompt_preview.clone(),
                 latest_message,
+                recent_actions: vec![action],
             },
         );
     }
@@ -1681,9 +1694,16 @@ fn upsert_subagent(
         .iter()
         .position(|existing| existing.thread_id == subagent.thread_id)
     {
-        subagents.remove(index);
+        let existing = subagents.remove(index);
+        let mut merged = existing.recent_actions;
+        merge_subagent_actions(&mut merged, subagent.recent_actions);
+        subagents.push(RuntimeSubagentMetadata {
+            recent_actions: merged,
+            ..subagent
+        });
+    } else {
+        subagents.push(subagent);
     }
-    subagents.push(subagent);
     subagents.sort_by(|left, right| {
         left.updated_at_epoch_ms
             .cmp(&right.updated_at_epoch_ms)
@@ -1692,6 +1712,58 @@ fn upsert_subagent(
     let overflow = subagents.len().saturating_sub(SUBAGENT_LIMIT);
     if overflow > 0 {
         subagents.drain(0..overflow);
+    }
+}
+
+fn merge_subagent_actions(
+    existing: &mut Vec<RuntimeSubagentAction>,
+    incoming: Vec<RuntimeSubagentAction>,
+) {
+    for action in incoming {
+        if let Some(index) = existing.iter().position(|entry| entry.id == action.id) {
+            existing.remove(index);
+        }
+        existing.push(action);
+    }
+    existing.sort_by(|left, right| {
+        left.timestamp_epoch_ms
+            .cmp(&right.timestamp_epoch_ms)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let overflow = existing.len().saturating_sub(SUBAGENT_ACTION_LIMIT);
+    if overflow > 0 {
+        existing.drain(0..overflow);
+    }
+}
+
+fn build_subagent_action(
+    thread_id: &str,
+    tool: &str,
+    status: &str,
+    timestamp_epoch_ms: u128,
+    prompt_preview: Option<&str>,
+    latest_message: Option<&str>,
+) -> RuntimeSubagentAction {
+    RuntimeSubagentAction {
+        id: format!("{thread_id}:{tool}:{timestamp_epoch_ms}"),
+        kind: tool.to_string(),
+        title: subagent_action_title(tool),
+        timestamp_epoch_ms,
+        detail: latest_message
+            .map(ToOwned::to_owned)
+            .or_else(|| prompt_preview.map(|value| truncate_line(value, 220))),
+        status: Some(status.to_string()),
+    }
+}
+
+fn subagent_action_title(tool: &str) -> String {
+    match tool {
+        "spawnAgent" => "Spawned branch".to_string(),
+        "sendInput" => "Delivered follow-up".to_string(),
+        "resumeAgent" => "Resumed branch".to_string(),
+        "wait" => "Waiting on branch".to_string(),
+        "closeAgent" => "Closed branch".to_string(),
+        _ => tool.to_string(),
     }
 }
 
@@ -1710,11 +1782,11 @@ fn build_subagent_event(item: &Value, default_title: &str) -> RuntimeFeedEntry {
         .and_then(Value::as_array)
         .map(|values| values.len())
         .unwrap_or(0);
-    let detail = item
-        .get("prompt")
-        .and_then(Value::as_str)
-        .map(|value| truncate_line(value, 220))
-        .or_else(|| build_subagent_state_summary(item));
+    let detail = build_subagent_state_summary(item).or_else(|| {
+        item.get("prompt")
+            .and_then(Value::as_str)
+            .map(|value| truncate_line(value, 220))
+    });
     RuntimeFeedEntry {
         id: format!(
             "item:{}",
@@ -1729,6 +1801,36 @@ fn build_subagent_event(item: &Value, default_title: &str) -> RuntimeFeedEntry {
             .map(short_thread_id),
         detail,
         status: Some(status),
+    }
+}
+
+fn subagent_console_line(item: &Value) -> String {
+    let tool = item
+        .get("tool")
+        .and_then(Value::as_str)
+        .unwrap_or("spawnAgent");
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("inProgress");
+    let receiver_count = item
+        .get("receiverThreadIds")
+        .and_then(Value::as_array)
+        .map(|values| values.len())
+        .unwrap_or(0);
+    let summary = build_subagent_state_summary(item).or_else(|| {
+        item.get("prompt")
+            .and_then(Value::as_str)
+            .map(|value| truncate_line(value, 140))
+    });
+    let headline = format!(
+        "{} [{}]",
+        subagent_title(tool, receiver_count, "Subagent activity"),
+        status
+    );
+    match summary {
+        Some(summary) => truncate_line(&format!("{headline} {summary}"), 220),
+        None => headline,
     }
 }
 
@@ -1772,15 +1874,7 @@ fn subagent_title(tool: &str, receiver_count: usize, default_title: &str) -> Str
 }
 
 fn describe_subagent_activity(item: &Value) -> String {
-    let tool = item
-        .get("tool")
-        .and_then(Value::as_str)
-        .unwrap_or("subagent");
-    let status = item
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("inProgress");
-    format!("{tool} {status}")
+    truncate_line(&subagent_console_line(item), 120)
 }
 
 fn map_tool_call_status_to_subagent_status(status: &str) -> &str {

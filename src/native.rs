@@ -99,6 +99,18 @@ pub struct RuntimeFeedEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuntimeSubagentAction {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub timestamp_epoch_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimeSubagentMetadata {
     pub thread_id: String,
     pub tool: String,
@@ -114,6 +126,8 @@ pub struct RuntimeSubagentMetadata {
     pub prompt_preview: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_actions: Vec<RuntimeSubagentAction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

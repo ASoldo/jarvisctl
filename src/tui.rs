@@ -22,7 +22,10 @@ use ratatui::{
 
 use crate::codex::enrich_native_sessions;
 use crate::codex_app::collect_codex_app_sessions;
-use crate::native::{NativeSessionMetadata, RuntimeContextMetadata, collect_native_sessions};
+use crate::native::{
+    NativeSessionMetadata, RuntimeContextMetadata, RuntimeFeedEntry, RuntimeSubagentMetadata,
+    collect_native_sessions,
+};
 use crate::{SessionBackend, delete_session, exec_agent, interrupt_agent};
 
 const BG: Color = Color::Reset;
@@ -570,88 +573,191 @@ fn render_dashboard_detail(
         return;
     };
 
+    let summary_height = if area.width >= 78 {
+        9
+    } else {
+        area.height.saturating_sub(8).clamp(7, 11)
+    };
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(summary_height), Constraint::Min(8)])
+        .split(area);
+
+    let summary_sections = if sections[0].width >= 78 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(sections[0])
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
+            .split(sections[0])
+    };
+
+    render_runtime_overview_card(frame, summary_sections[0], row);
+    render_runtime_paths_card(frame, summary_sections[1], row);
+
+    let lower_sections = if sections[1].width >= 110 && sections[1].height >= 16 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(54), Constraint::Percentage(46)])
+            .split(sections[1])
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(56), Constraint::Percentage(44)])
+            .split(sections[1])
+    };
+
+    render_subagent_cards(frame, lower_sections[0], row.context.as_ref());
+    render_runtime_feed_card(frame, lower_sections[1], row.context.as_ref());
+}
+
+fn render_runtime_overview_card(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    row: &DashboardRow,
+) {
+    let context = row.context.as_ref();
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled("Namespace: ", Style::default().fg(SUBTLE_TEXT)),
-        Span::styled(&row.namespace, Style::default().fg(TEXT)),
+        Span::styled("Task: ", Style::default().fg(SUBTLE_TEXT)),
+        Span::styled(
+            context
+                .and_then(|ctx| ctx.task_title.as_deref())
+                .unwrap_or(&row.namespace),
+            Style::default().fg(TEXT),
+        ),
     ]));
     lines.push(Line::from(vec![
-        Span::styled("Agent: ", Style::default().fg(SUBTLE_TEXT)),
+        Span::styled("Runtime: ", Style::default().fg(SUBTLE_TEXT)),
+        Span::styled(
+            if row.running { "running" } else { "idle" },
+            status_style(if row.running { "running" } else { "idle" }),
+        ),
+        Span::styled("  agent ", Style::default().fg(SUBTLE_TEXT)),
         Span::styled(&row.agent, Style::default().fg(TEXT)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("PID: ", Style::default().fg(SUBTLE_TEXT)),
+        Span::styled("  pid ", Style::default().fg(SUBTLE_TEXT)),
         Span::styled(row.pid.to_string(), Style::default().fg(TEXT)),
     ]));
 
-    if let Some(context) = row.context.as_ref() {
+    if let Some(context) = context {
+        let mut state_spans = Vec::new();
+        let mut has_state = false;
         if let Some(workload) = context.workload.as_deref() {
-            lines.push(Line::from(vec![
-                Span::styled("Workload: ", Style::default().fg(SUBTLE_TEXT)),
-                Span::styled(workload, Style::default().fg(TEXT)),
-            ]));
+            state_spans.push(Span::styled("Workload: ", Style::default().fg(SUBTLE_TEXT)));
+            state_spans.push(Span::styled(workload, Style::default().fg(TEXT)));
+            has_state = true;
         }
-        if let Some(task_title) = context.task_title.as_deref() {
-            lines.push(Line::from(vec![
-                Span::styled("Task: ", Style::default().fg(SUBTLE_TEXT)),
-                Span::styled(task_title, Style::default().fg(TEXT)),
-            ]));
+        if let Some(thread_status) = context.thread_status.as_deref() {
+            if has_state {
+                state_spans.push(Span::styled("  ", Style::default().fg(SUBTLE_TEXT)));
+            }
+            state_spans.push(Span::styled("Thread ", Style::default().fg(SUBTLE_TEXT)));
+            state_spans.push(Span::styled(thread_status, status_style(thread_status)));
+            has_state = true;
         }
-        if let Some(task_note) = context.task_note.as_deref() {
-            lines.push(Line::from(vec![
-                Span::styled("Ticket: ", Style::default().fg(SUBTLE_TEXT)),
-                Span::styled(short_path(task_note), Style::default().fg(TEXT)),
-            ]));
+        if let Some(turn_status) = context.turn_status.as_deref() {
+            if has_state {
+                state_spans.push(Span::styled("  ", Style::default().fg(SUBTLE_TEXT)));
+            }
+            state_spans.push(Span::styled("Turn ", Style::default().fg(SUBTLE_TEXT)));
+            state_spans.push(Span::styled(turn_status, status_style(turn_status)));
+            has_state = true;
         }
-        if let Some(session_id) = context.codex_session_id.as_deref() {
+        if has_state {
+            lines.push(Line::from(state_spans));
+        }
+        if let Some(session_id) = context
+            .thread_id
+            .as_deref()
+            .or(context.codex_session_id.as_deref())
+        {
             lines.push(Line::from(vec![
                 Span::styled("Session: ", Style::default().fg(SUBTLE_TEXT)),
                 Span::styled(session_id, Style::default().fg(TEXT)),
             ]));
         }
-        if let Some(thread_status) = context.thread_status.as_deref() {
+        if let Some(last_activity) = context.last_activity.as_deref() {
             lines.push(Line::from(vec![
-                Span::styled("Thread: ", Style::default().fg(SUBTLE_TEXT)),
-                Span::styled(thread_status, Style::default().fg(TEXT)),
-            ]));
-        }
-        if let Some(turn_status) = context.turn_status.as_deref() {
-            lines.push(Line::from(vec![
-                Span::styled("Turn: ", Style::default().fg(SUBTLE_TEXT)),
-                Span::styled(turn_status, Style::default().fg(TEXT)),
-            ]));
-        }
-        if let Some(transcript_path) = context.transcript_path.as_deref() {
-            lines.push(Line::from(vec![
-                Span::styled("Transcript: ", Style::default().fg(SUBTLE_TEXT)),
-                Span::styled(short_path(transcript_path), Style::default().fg(TEXT)),
+                Span::styled("Activity: ", Style::default().fg(SUBTLE_TEXT)),
+                Span::styled(last_activity, Style::default().fg(TEXT)),
             ]));
         }
         if let Some(live_message) = context.live_message.as_deref() {
             lines.push(Line::from(vec![
                 Span::styled("Live: ", Style::default().fg(SUBTLE_TEXT)),
-                Span::styled(live_message, Style::default().fg(TEXT)),
+                Span::styled(
+                    truncate_for_cell(live_message, 220),
+                    Style::default().fg(TEXT),
+                ),
             ]));
         }
         if let Some(last_error) = context.last_error.as_deref() {
             lines.push(Line::from(vec![
                 Span::styled("Error: ", Style::default().fg(SUBTLE_TEXT)),
-                Span::styled(last_error, Style::default().fg(Color::Red)),
+                Span::styled(
+                    truncate_for_cell(last_error, 220),
+                    Style::default().fg(Color::Red),
+                ),
             ]));
         }
     }
 
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Runtime")
+                    .border_style(Style::default().fg(BORDER)),
+            )
+            .style(Style::default().fg(TEXT))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_runtime_paths_card(frame: &mut Frame, area: ratatui::layout::Rect, row: &DashboardRow) {
+    let context = row.context.as_ref();
+    let mut lines = Vec::new();
     if let Some(working_directory) = row.working_directory.as_deref() {
         lines.push(Line::from(vec![
             Span::styled("Repo: ", Style::default().fg(SUBTLE_TEXT)),
             Span::styled(short_path(working_directory), Style::default().fg(TEXT)),
         ]));
     }
-
-    lines.push(Line::from(""));
+    if let Some(task_note) = context.and_then(|ctx| ctx.task_note.as_deref()) {
+        lines.push(Line::from(vec![
+            Span::styled("Ticket: ", Style::default().fg(SUBTLE_TEXT)),
+            Span::styled(short_path(task_note), Style::default().fg(TEXT)),
+        ]));
+    }
+    if let Some(transcript_path) = context.and_then(|ctx| ctx.transcript_path.as_deref()) {
+        lines.push(Line::from(vec![
+            Span::styled("Transcript: ", Style::default().fg(SUBTLE_TEXT)),
+            Span::styled(short_path(transcript_path), Style::default().fg(TEXT)),
+        ]));
+    }
+    if let Some(event_log_path) = context.and_then(|ctx| ctx.event_log_path.as_deref()) {
+        lines.push(Line::from(vec![
+            Span::styled("Events: ", Style::default().fg(SUBTLE_TEXT)),
+            Span::styled(short_path(event_log_path), Style::default().fg(TEXT)),
+        ]));
+    }
+    if let Some(record_file) = context.and_then(|ctx| ctx.record_file.as_deref()) {
+        lines.push(Line::from(vec![
+            Span::styled("Record: ", Style::default().fg(SUBTLE_TEXT)),
+            Span::styled(short_path(record_file), Style::default().fg(TEXT)),
+        ]));
+    }
     lines.push(Line::from(vec![
         Span::styled("Command: ", Style::default().fg(SUBTLE_TEXT)),
-        Span::styled(&row.shell_command, Style::default().fg(TEXT)),
+        Span::styled(
+            truncate_for_cell(&row.shell_command, 220),
+            Style::default().fg(TEXT),
+        ),
     ]));
 
     frame.render_widget(
@@ -659,13 +765,208 @@ fn render_dashboard_detail(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("Detail")
+                    .title("Resources")
                     .border_style(Style::default().fg(BORDER)),
             )
             .style(Style::default().fg(TEXT))
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn render_subagent_cards(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    context: Option<&RuntimeContextMetadata>,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Branches")
+        .border_style(Style::default().fg(BORDER));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let Some(context) = context else {
+        frame.render_widget(
+            Paragraph::new("No branch metadata yet.")
+                .style(Style::default().fg(SUBTLE_TEXT))
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
+        return;
+    };
+    if context.subagents.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No branch metadata yet.")
+                .style(Style::default().fg(SUBTLE_TEXT))
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
+        return;
+    }
+
+    let card_height = if inner.height >= 12 { 6 } else { 5 };
+    let max_cards = usize::max(1, usize::from(inner.height / card_height));
+    let visible = context
+        .subagents
+        .iter()
+        .rev()
+        .take(max_cards)
+        .cloned()
+        .collect::<Vec<_>>();
+    let constraints = visible
+        .iter()
+        .map(|_| Constraint::Length(card_height))
+        .collect::<Vec<_>>();
+    let card_areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    for (card_area, branch) in card_areas.iter().zip(visible.iter()) {
+        render_subagent_card(frame, *card_area, branch);
+    }
+}
+
+fn render_subagent_card(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    branch: &RuntimeSubagentMetadata,
+) {
+    let title = format!("Branch {}", short_runtime_id(&branch.thread_id));
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("Status ", Style::default().fg(SUBTLE_TEXT)),
+        Span::styled(&branch.status, status_style(&branch.status)),
+        Span::styled("  Tool ", Style::default().fg(SUBTLE_TEXT)),
+        Span::styled(&branch.tool, Style::default().fg(TEXT)),
+    ]));
+
+    if let Some(model) = branch.model.as_deref() {
+        let detail = match branch.reasoning_effort.as_deref() {
+            Some(reasoning) => format!("{model} / {reasoning}"),
+            None => model.to_string(),
+        };
+        lines.push(Line::from(vec![
+            Span::styled("Model: ", Style::default().fg(SUBTLE_TEXT)),
+            Span::styled(detail, Style::default().fg(TEXT)),
+        ]));
+    }
+
+    if let Some(summary) = branch
+        .latest_message
+        .as_deref()
+        .or(branch.prompt_preview.as_deref())
+    {
+        lines.push(Line::from(vec![Span::styled(
+            truncate_for_cell(summary, 220),
+            Style::default().fg(TEXT),
+        )]));
+    }
+
+    let max_actions = if area.height >= 6 { 2 } else { 1 };
+    for action in branch.recent_actions.iter().rev().take(max_actions) {
+        let mut action_spans = vec![
+            Span::styled("• ", Style::default().fg(SUBTLE_TEXT)),
+            Span::styled(&action.title, Style::default().fg(TEXT)),
+        ];
+        if let Some(status) = action.status.as_deref() {
+            action_spans.push(Span::styled(" ", Style::default().fg(SUBTLE_TEXT)));
+            action_spans.push(Span::styled(status, status_style(status)));
+        }
+        lines.push(Line::from(action_spans));
+        if let Some(detail) = action.detail.as_deref() {
+            lines.push(Line::from(vec![Span::styled(
+                truncate_for_cell(detail, 220),
+                Style::default().fg(SUBTLE_TEXT),
+            )]));
+        }
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(title)
+                    .border_style(Style::default().fg(BORDER)),
+            )
+            .style(Style::default().fg(TEXT))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_runtime_feed_card(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    context: Option<&RuntimeContextMetadata>,
+) {
+    let mut lines = Vec::new();
+    if let Some(context) = context {
+        let max_items = usize::max(1, usize::from(area.height.saturating_sub(2) / 2));
+        for event in context.recent_events.iter().rev().take(max_items) {
+            lines.push(render_feed_headline(event));
+            if let Some(detail) = event.detail.as_deref() {
+                lines.push(Line::from(vec![Span::styled(
+                    truncate_for_cell(detail, 220),
+                    Style::default().fg(SUBTLE_TEXT),
+                )]));
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(vec![Span::styled(
+            "No runtime feed yet.",
+            Style::default().fg(SUBTLE_TEXT),
+        )]));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Feed")
+                    .border_style(Style::default().fg(BORDER)),
+            )
+            .style(Style::default().fg(TEXT))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_feed_headline(event: &RuntimeFeedEntry) -> Line<'static> {
+    let status = event.status.as_deref().unwrap_or("unknown").to_string();
+    let actor = event.actor.clone().unwrap_or_default();
+    let mut spans = vec![Span::styled(status.clone(), status_style(&status))];
+    spans.push(Span::styled("  ", Style::default().fg(SUBTLE_TEXT)));
+    spans.push(Span::styled(event.title.clone(), Style::default().fg(TEXT)));
+    if !actor.is_empty() {
+        spans.push(Span::styled("  ", Style::default().fg(SUBTLE_TEXT)));
+        spans.push(Span::styled(actor, Style::default().fg(SUBTLE_TEXT)));
+    }
+    Line::from(spans)
+}
+
+fn short_runtime_id(raw: &str) -> String {
+    let mut pieces = raw.split('-');
+    pieces
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(raw)
+        .to_string()
+}
+
+fn status_style(status: &str) -> Style {
+    match status {
+        "completed" | "ready" | "idle" => Style::default().fg(Color::Green),
+        "running" | "inProgress" | "launching" => Style::default().fg(Color::Cyan),
+        "waiting" | "queued" => Style::default().fg(Color::Yellow),
+        "errored" | "failed" | "cancelled" | "canceled" => Style::default().fg(Color::Red),
+        _ => Style::default().fg(TEXT),
+    }
 }
 
 fn open_transcript_viewer(path: &str) -> anyhow::Result<()> {
