@@ -164,6 +164,7 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
         prompt_file: Some(prompt_path.display().to_string()),
         record_file: Some(record_path.display().to_string()),
         transcript_path: None,
+        event_log_path: None,
         thread_id: None,
         thread_status: None,
         turn_id: None,
@@ -171,6 +172,8 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
         live_message: None,
         last_activity: None,
         last_error: None,
+        recent_events: Vec::new(),
+        subagents: Vec::new(),
     };
     let (runtime_backend, codex_session_id) = match options.driver {
         CodexRuntimeDriver::CliPty => {

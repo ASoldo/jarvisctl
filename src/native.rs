@@ -85,6 +85,38 @@ struct NativeSessionManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuntimeFeedEntry {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub timestamp_epoch_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuntimeSubagentMetadata {
+    pub thread_id: String,
+    pub tool: String,
+    pub status: String,
+    pub updated_at_epoch_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimeContextMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload: Option<String>,
@@ -105,6 +137,8 @@ pub struct RuntimeContextMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_log_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_status: Option<String>,
@@ -118,6 +152,10 @@ pub struct RuntimeContextMetadata {
     pub last_activity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_events: Vec<RuntimeFeedEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subagents: Vec<RuntimeSubagentMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

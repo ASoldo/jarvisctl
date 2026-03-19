@@ -1,4 +1,7 @@
-use crate::native::{NativeAgentMetadata, NativeSessionMetadata, RuntimeContextMetadata};
+use crate::native::{
+    NativeAgentMetadata, NativeSessionMetadata, RuntimeContextMetadata, RuntimeFeedEntry,
+    RuntimeSubagentMetadata,
+};
 use crate::tui::view_agent;
 use anyhow::{Context, anyhow, bail, ensure};
 use base64::Engine;
@@ -15,7 +18,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SESSION_DIR_NAME: &str = "sessions";
 const MANIFEST_DIR_NAME: &str = "manifests";
@@ -23,6 +26,8 @@ const SOCKET_FILE_NAME: &str = "control.sock";
 const METADATA_FILE_NAME: &str = "metadata.json";
 const EVENTS_FILE_NAME: &str = "events.log";
 const LOG_LIMIT_BYTES: usize = 512 * 1024;
+const FEED_LIMIT: usize = 18;
+const SUBAGENT_LIMIT: usize = 24;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexAppLaunchManifest {
@@ -61,6 +66,7 @@ struct AppSessionState {
     metadata: NativeSessionMetadata,
     seen_log_items: HashSet<String>,
     active_agent_messages: BTreeMap<String, String>,
+    active_command_outputs: BTreeMap<String, String>,
 }
 
 struct CodexAppSession {
@@ -223,6 +229,20 @@ impl CodexAppSession {
             "thread/started" => {
                 if let Some(thread) = params.get("thread") {
                     self.apply_thread(thread)?;
+                    self.upsert_runtime_event(
+                        format!(
+                            "thread:{}",
+                            thread_id_from_value(thread).unwrap_or_else(|| "main".to_string())
+                        ),
+                        "thread",
+                        "Thread ready",
+                        thread
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .map(|value| truncate_line(value, 180)),
+                        thread.get("status").and_then(thread_status_from_value),
+                        None,
+                    )?;
                     self.append_text_line(format!(
                         "[thread] started {}",
                         thread_id_from_value(thread).unwrap_or_else(|| "-".to_string())
@@ -239,10 +259,31 @@ impl CodexAppSession {
                     context.thread_status = Some(status.clone());
                     context.last_activity = Some(format!("thread {}", status));
                 })?;
+                self.upsert_runtime_event(
+                    format!("thread-status:{status}"),
+                    "thread",
+                    "Thread status changed",
+                    None,
+                    Some(status),
+                    None,
+                )?;
             }
             "turn/started" => {
                 if let Some(turn) = params.get("turn") {
                     self.apply_turn(turn)?;
+                    self.upsert_runtime_event(
+                        format!(
+                            "turn:{}",
+                            turn.get("id").and_then(Value::as_str).unwrap_or("current")
+                        ),
+                        "turn",
+                        "Turn started",
+                        None,
+                        turn.get("status")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                        None,
+                    )?;
                 }
             }
             "turn/completed" => {
@@ -252,7 +293,23 @@ impl CodexAppSession {
                         .get("status")
                         .and_then(Value::as_str)
                         .unwrap_or("completed");
+                    self.upsert_runtime_event(
+                        format!(
+                            "turn:{}",
+                            turn.get("id").and_then(Value::as_str).unwrap_or("current")
+                        ),
+                        "turn",
+                        "Turn completed",
+                        None,
+                        Some(status.to_string()),
+                        None,
+                    )?;
                     self.append_text_line(format!("[turn] {}", status))?;
+                }
+            }
+            "item/started" => {
+                if let Some(item) = params.get("item") {
+                    self.apply_started_item(item)?;
                 }
             }
             "item/agentMessage/delta" => {
@@ -273,6 +330,7 @@ impl CodexAppSession {
                     self.append_output(b"\n")?;
                 }
                 self.append_output(delta.as_bytes())?;
+                let mut preview = None;
                 self.mutate_state(|state| {
                     let current = state
                         .active_agent_messages
@@ -280,9 +338,19 @@ impl CodexAppSession {
                         .or_default();
                     current.push_str(delta);
                     let context = state.metadata.context.get_or_insert_with(Default::default);
-                    context.live_message = Some(truncate_line(current, 240));
+                    let rendered = truncate_line(current, 240);
+                    context.live_message = Some(rendered.clone());
                     context.last_activity = Some("assistant streaming".to_string());
+                    preview = Some(rendered);
                 })?;
+                self.upsert_runtime_event(
+                    format!("item:{item_id}"),
+                    "assistant",
+                    "Assistant streaming",
+                    preview,
+                    Some("inProgress".to_string()),
+                    Some("agent0".to_string()),
+                )?;
             }
             "item/commandExecution/outputDelta" => {
                 let item_id = params
@@ -300,8 +368,25 @@ impl CodexAppSession {
                 let _ = self.mark_item_started(&item_id, "[command]\n")?;
                 self.append_output(delta.as_bytes())?;
                 self.mutate_state(|state| {
+                    let current = state
+                        .active_command_outputs
+                        .entry(item_id.clone())
+                        .or_default();
+                    current.push_str(delta);
                     let context = state.metadata.context.get_or_insert_with(Default::default);
                     context.last_activity = Some("command output".to_string());
+                    upsert_recent_event(
+                        &mut context.recent_events,
+                        RuntimeFeedEntry {
+                            id: format!("item:{item_id}"),
+                            kind: "command".to_string(),
+                            title: "Command output".to_string(),
+                            timestamp_epoch_ms: now_epoch_ms(),
+                            actor: Some("agent0".to_string()),
+                            detail: Some(truncate_line(current, 220)),
+                            status: Some("inProgress".to_string()),
+                        },
+                    );
                 })?;
             }
             "item/completed" => {
@@ -328,6 +413,68 @@ impl CodexAppSession {
             self.append_text_line(header)?;
         }
         Ok(should_write)
+    }
+
+    fn upsert_runtime_event(
+        &self,
+        id: impl Into<String>,
+        kind: impl Into<String>,
+        title: impl Into<String>,
+        detail: Option<String>,
+        status: Option<String>,
+        actor: Option<String>,
+    ) -> anyhow::Result<()> {
+        let event = RuntimeFeedEntry {
+            id: id.into(),
+            kind: kind.into(),
+            title: title.into(),
+            timestamp_epoch_ms: now_epoch_ms(),
+            actor,
+            detail,
+            status,
+        };
+        self.mutate_state(|state| {
+            let context = state.metadata.context.get_or_insert_with(Default::default);
+            upsert_recent_event(&mut context.recent_events, event.clone());
+        })
+    }
+
+    fn apply_started_item(&self, item: &Value) -> anyhow::Result<()> {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        match item_type {
+            "commandExecution" => {
+                let item_id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let command = item
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("command");
+                self.upsert_runtime_event(
+                    format!("item:{item_id}"),
+                    "command",
+                    "Command started",
+                    Some(truncate_line(command, 160)),
+                    Some("inProgress".to_string()),
+                    Some("agent0".to_string()),
+                )?;
+            }
+            "collabAgentToolCall" => {
+                self.mutate_state(|state| {
+                    let context = state.metadata.context.get_or_insert_with(Default::default);
+                    apply_subagent_item(context, item);
+                    upsert_recent_event(
+                        &mut context.recent_events,
+                        build_subagent_event(item, "Subagent activity"),
+                    );
+                    context.last_activity = Some(describe_subagent_activity(item));
+                })?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn apply_thread(&self, thread: &Value) -> anyhow::Result<()> {
@@ -398,12 +545,29 @@ impl CodexAppSession {
                         context.live_message = Some(truncate_line(text, 240));
                     }
                     context.last_activity = Some("assistant message completed".to_string());
+                    upsert_recent_event(
+                        &mut context.recent_events,
+                        RuntimeFeedEntry {
+                            id: format!("item:{item_id}"),
+                            kind: "assistant".to_string(),
+                            title: "Assistant response".to_string(),
+                            timestamp_epoch_ms: now_epoch_ms(),
+                            actor: Some("agent0".to_string()),
+                            detail: (!text.is_empty()).then(|| truncate_line(text, 260)),
+                            status: Some("completed".to_string()),
+                        },
+                    );
                 })?;
                 if !text.is_empty() {
                     self.append_output(b"\n")?;
                 }
             }
             "commandExecution" => {
+                let item_id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 let command = item
                     .get("command")
                     .and_then(Value::as_str)
@@ -413,34 +577,61 @@ impl CodexAppSession {
                     .and_then(Value::as_str)
                     .unwrap_or("completed");
                 self.mutate_state(|state| {
+                    state.active_command_outputs.remove(&item_id);
                     let context = state.metadata.context.get_or_insert_with(Default::default);
                     context.last_activity =
                         Some(format!("{} ({})", truncate_line(command, 80), status));
+                    upsert_recent_event(
+                        &mut context.recent_events,
+                        RuntimeFeedEntry {
+                            id: format!("item:{item_id}"),
+                            kind: "command".to_string(),
+                            title: "Command completed".to_string(),
+                            timestamp_epoch_ms: now_epoch_ms(),
+                            actor: Some("agent0".to_string()),
+                            detail: Some(truncate_line(command, 200)),
+                            status: Some(status.to_string()),
+                        },
+                    );
                 })?;
                 self.append_text_line(format!("\n[command completed] {} ({})", command, status))?;
             }
             "plan" => {
+                let item_id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("plan")
+                    .to_string();
                 let text = item.get("text").and_then(Value::as_str).unwrap_or_default();
                 self.mutate_state(|state| {
                     let context = state.metadata.context.get_or_insert_with(Default::default);
                     context.last_activity = Some("plan updated".to_string());
+                    upsert_recent_event(
+                        &mut context.recent_events,
+                        RuntimeFeedEntry {
+                            id: format!("item:{item_id}"),
+                            kind: "plan".to_string(),
+                            title: "Plan updated".to_string(),
+                            timestamp_epoch_ms: now_epoch_ms(),
+                            actor: Some("agent0".to_string()),
+                            detail: (!text.is_empty()).then(|| truncate_line(text, 220)),
+                            status: Some("completed".to_string()),
+                        },
+                    );
                 })?;
                 if !text.is_empty() {
                     self.append_text_line(format!("[plan] {}", truncate_line(text, 160)))?;
                 }
             }
             "collabAgentToolCall" => {
-                let tool = item
-                    .get("tool")
-                    .and_then(Value::as_str)
-                    .unwrap_or("subagent");
-                let status = item
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .unwrap_or("completed");
                 self.mutate_state(|state| {
                     let context = state.metadata.context.get_or_insert_with(Default::default);
-                    context.last_activity = Some(format!("{} {}", tool, status));
+                    apply_subagent_item(context, item);
+                    upsert_recent_event(
+                        &mut context.recent_events,
+                        build_subagent_event(item, "Subagent activity"),
+                    );
+                    context.last_activity = Some(describe_subagent_activity(item));
                 })?;
             }
             _ => {}
@@ -453,6 +644,18 @@ impl CodexAppSession {
             let context = state.metadata.context.get_or_insert_with(Default::default);
             context.last_error = Some(message.to_string());
             context.last_activity = Some("error".to_string());
+            upsert_recent_event(
+                &mut context.recent_events,
+                RuntimeFeedEntry {
+                    id: format!("error:{}", now_epoch_ms()),
+                    kind: "error".to_string(),
+                    title: "Runtime error".to_string(),
+                    timestamp_epoch_ms: now_epoch_ms(),
+                    actor: Some("jarvisctl".to_string()),
+                    detail: Some(truncate_line(message, 260)),
+                    status: Some("failed".to_string()),
+                },
+            );
         })?;
         self.append_text_line(format!("[error] {}", message))
     }
@@ -565,6 +768,14 @@ impl CodexAppSession {
                 self.apply_turn(turn)?;
             }
             self.append_text_line(format!("[operator] steer: {}", text.trim()))?;
+            self.upsert_runtime_event(
+                format!("operator:{}", now_epoch_ms()),
+                "operator",
+                "Operator steer",
+                Some(truncate_line(text.trim(), 220)),
+                Some("inProgress".to_string()),
+                Some("operator".to_string()),
+            )?;
         } else {
             let response = self.call(
                 "turn/start",
@@ -577,6 +788,14 @@ impl CodexAppSession {
                 self.apply_turn(turn)?;
             }
             self.append_text_line(format!("[operator] new turn: {}", text.trim()))?;
+            self.upsert_runtime_event(
+                format!("operator:{}", now_epoch_ms()),
+                "operator",
+                "Operator follow-up",
+                Some(truncate_line(text.trim(), 220)),
+                Some("queued".to_string()),
+                Some("operator".to_string()),
+            )?;
         }
         Ok(())
     }
@@ -611,6 +830,14 @@ impl CodexAppSession {
             self.apply_turn(turn)?;
         }
         self.append_text_line("[operator] interrupt requested")?;
+        self.upsert_runtime_event(
+            format!("interrupt:{}", now_epoch_ms()),
+            "operator",
+            "Interrupt requested",
+            None,
+            Some("requested".to_string()),
+            Some("operator".to_string()),
+        )?;
         Ok(())
     }
 
@@ -724,7 +951,19 @@ pub fn serve_codex_app_session(manifest_path: PathBuf) -> anyhow::Result<()> {
         created_at_epoch_ms: manifest.created_at_epoch_ms,
         working_directory: manifest.working_directory.clone(),
         shell_command: manifest.shell_command.clone(),
-        context: Some(manifest.context.clone()),
+        context: Some(RuntimeContextMetadata {
+            event_log_path: Some(events_path.display().to_string()),
+            recent_events: vec![RuntimeFeedEntry {
+                id: format!("session:{}:launch", manifest.namespace),
+                kind: "session".to_string(),
+                title: "Session launching".to_string(),
+                timestamp_epoch_ms: now_epoch_ms(),
+                actor: Some("jarvisctl".to_string()),
+                detail: Some(truncate_line(&manifest.startup_prompt, 220)),
+                status: Some("launching".to_string()),
+            }],
+            ..manifest.context.clone()
+        }),
         agents: vec![NativeAgentMetadata {
             name: "agent0".to_string(),
             pid: child_pid,
@@ -738,6 +977,7 @@ pub fn serve_codex_app_session(manifest_path: PathBuf) -> anyhow::Result<()> {
             metadata,
             seen_log_items: HashSet::new(),
             active_agent_messages: BTreeMap::new(),
+            active_command_outputs: BTreeMap::new(),
         }),
         writer: Mutex::new(stdin),
         child: Mutex::new(child),
@@ -1340,6 +1580,235 @@ fn truncate_line(raw: &str, limit: usize) -> String {
         .collect::<String>();
     rendered.push('…');
     rendered
+}
+
+fn now_epoch_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+fn upsert_recent_event(events: &mut Vec<RuntimeFeedEntry>, event: RuntimeFeedEntry) {
+    if let Some(index) = events.iter().position(|existing| existing.id == event.id) {
+        events.remove(index);
+    }
+    events.push(event);
+    let overflow = events.len().saturating_sub(FEED_LIMIT);
+    if overflow > 0 {
+        events.drain(0..overflow);
+    }
+}
+
+fn apply_subagent_item(context: &mut RuntimeContextMetadata, item: &Value) {
+    let sender_thread_id = item
+        .get("senderThreadId")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let tool = item
+        .get("tool")
+        .and_then(Value::as_str)
+        .unwrap_or("spawnAgent")
+        .to_string();
+    let call_status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("inProgress")
+        .to_string();
+    let model = item
+        .get("model")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let reasoning_effort = item.get("reasoningEffort").and_then(reasoning_effort_value);
+    let prompt_preview = item
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(|value| truncate_line(value, 200));
+    let receiver_ids = item
+        .get("receiverThreadIds")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let agent_states = item.get("agentsStates").and_then(Value::as_object);
+
+    for receiver_thread_id in receiver_ids {
+        let (status, latest_message) =
+            match agent_states.and_then(|states| states.get(&receiver_thread_id)) {
+                Some(Value::Object(state)) => (
+                    state
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or_else(|| map_tool_call_status_to_subagent_status(&call_status))
+                        .to_string(),
+                    state
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(|value| truncate_line(value, 180)),
+                ),
+                _ => (
+                    map_tool_call_status_to_subagent_status(&call_status).to_string(),
+                    None,
+                ),
+            };
+        upsert_subagent(
+            &mut context.subagents,
+            RuntimeSubagentMetadata {
+                thread_id: receiver_thread_id,
+                tool: tool.clone(),
+                status,
+                updated_at_epoch_ms: now_epoch_ms(),
+                parent_thread_id: sender_thread_id.clone(),
+                model: model.clone(),
+                reasoning_effort: reasoning_effort.clone(),
+                prompt_preview: prompt_preview.clone(),
+                latest_message,
+            },
+        );
+    }
+}
+
+fn upsert_subagent(
+    subagents: &mut Vec<RuntimeSubagentMetadata>,
+    subagent: RuntimeSubagentMetadata,
+) {
+    if let Some(index) = subagents
+        .iter()
+        .position(|existing| existing.thread_id == subagent.thread_id)
+    {
+        subagents.remove(index);
+    }
+    subagents.push(subagent);
+    subagents.sort_by(|left, right| {
+        left.updated_at_epoch_ms
+            .cmp(&right.updated_at_epoch_ms)
+            .then_with(|| left.thread_id.cmp(&right.thread_id))
+    });
+    let overflow = subagents.len().saturating_sub(SUBAGENT_LIMIT);
+    if overflow > 0 {
+        subagents.drain(0..overflow);
+    }
+}
+
+fn build_subagent_event(item: &Value, default_title: &str) -> RuntimeFeedEntry {
+    let tool = item
+        .get("tool")
+        .and_then(Value::as_str)
+        .unwrap_or("spawnAgent");
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("inProgress")
+        .to_string();
+    let receiver_count = item
+        .get("receiverThreadIds")
+        .and_then(Value::as_array)
+        .map(|values| values.len())
+        .unwrap_or(0);
+    let detail = item
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(|value| truncate_line(value, 220))
+        .or_else(|| build_subagent_state_summary(item));
+    RuntimeFeedEntry {
+        id: format!(
+            "item:{}",
+            item.get("id").and_then(Value::as_str).unwrap_or("subagent")
+        ),
+        kind: "subagent".to_string(),
+        title: subagent_title(tool, receiver_count, default_title),
+        timestamp_epoch_ms: now_epoch_ms(),
+        actor: item
+            .get("senderThreadId")
+            .and_then(Value::as_str)
+            .map(short_thread_id),
+        detail,
+        status: Some(status),
+    }
+}
+
+fn build_subagent_state_summary(item: &Value) -> Option<String> {
+    let states = item.get("agentsStates").and_then(Value::as_object)?;
+    let mut entries = states
+        .iter()
+        .filter_map(|(thread_id, state)| {
+            let status = state.get("status")?.as_str()?;
+            let message = state
+                .get("message")
+                .and_then(Value::as_str)
+                .map(|value| truncate_line(value, 72));
+            Some(match message {
+                Some(message) => format!("{} {} · {}", short_thread_id(thread_id), status, message),
+                None => format!("{} {}", short_thread_id(thread_id), status),
+            })
+        })
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return None;
+    }
+    entries.sort();
+    Some(entries.join(" | "))
+}
+
+fn subagent_title(tool: &str, receiver_count: usize, default_title: &str) -> String {
+    let count_suffix = if receiver_count > 0 {
+        format!(" ({receiver_count})")
+    } else {
+        String::new()
+    };
+    match tool {
+        "spawnAgent" => format!("Spawned subagent{count_suffix}"),
+        "sendInput" => format!("Updated subagent{count_suffix}"),
+        "resumeAgent" => format!("Resumed subagent{count_suffix}"),
+        "wait" => format!("Waiting on subagent{count_suffix}"),
+        "closeAgent" => format!("Closed subagent{count_suffix}"),
+        _ => default_title.to_string(),
+    }
+}
+
+fn describe_subagent_activity(item: &Value) -> String {
+    let tool = item
+        .get("tool")
+        .and_then(Value::as_str)
+        .unwrap_or("subagent");
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("inProgress");
+    format!("{tool} {status}")
+}
+
+fn map_tool_call_status_to_subagent_status(status: &str) -> &str {
+    match status {
+        "completed" => "completed",
+        "failed" => "errored",
+        _ => "running",
+    }
+}
+
+fn reasoning_effort_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(raw) => Some(raw.clone()),
+        Value::Object(object) => object
+            .get("type")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        _ => None,
+    }
+}
+
+fn short_thread_id(raw: &str) -> String {
+    let mut pieces = raw.split('-');
+    pieces
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(raw)
+        .to_string()
 }
 
 fn cleanup_stale_session(namespace: &str) -> anyhow::Result<()> {
