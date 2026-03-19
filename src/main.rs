@@ -20,13 +20,18 @@ use tracing_subscriber::{EnvFilter, FmtSubscriber};
 mod agent;
 mod board;
 mod codex;
+mod codex_app;
 mod dispatch;
 mod native;
 mod ticket;
 mod tui;
 
 use agent::spawn_agent;
-use codex::{CodexLaunchOptions, enrich_native_sessions, launch_codex_ticket};
+use codex::{CodexLaunchOptions, CodexRuntimeDriver, enrich_native_sessions, launch_codex_ticket};
+use codex_app::{
+    attach_codex_app, codex_app_session_metadata, collect_codex_app_sessions,
+    delete_codex_app_session, interrupt_codex_app, serve_codex_app_session, tell_codex_app,
+};
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use native::{
     NativeSessionMetadata, RuntimeContextMetadata, attach_native, collect_native_sessions,
@@ -123,6 +128,10 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
         backend: SessionBackend,
 
+        /// Codex runtime driver, defaults to the headless app-server backend
+        #[arg(long, value_enum, default_value_t = CodexRuntimeDriver::AppServer)]
+        driver: CodexRuntimeDriver,
+
         /// Ticket or task note with YAML frontmatter
         #[arg(long, value_hint = ValueHint::FilePath)]
         task_note: PathBuf,
@@ -177,6 +186,10 @@ enum Command {
         /// Deprecated compatibility flag; native is the only backend
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
         backend: SessionBackend,
+
+        /// Codex runtime driver used when dispatch launches work
+        #[arg(long, value_enum, default_value_t = CodexRuntimeDriver::AppServer)]
+        driver: CodexRuntimeDriver,
 
         /// Vault root used to resolve board links and default boards
         #[arg(long, value_hint = ValueHint::DirPath, default_value = "/home/rootster/documents/codex")]
@@ -304,6 +317,12 @@ enum Command {
         #[arg(long, value_hint = ValueHint::FilePath)]
         manifest: PathBuf,
     },
+
+    #[command(hide = true)]
+    CodexAppSessionServe {
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        manifest: PathBuf,
+    },
 }
 
 #[instrument]
@@ -363,6 +382,7 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         } => run_session(backend, &namespace, agents, &working_directory, &command),
         Command::Codex {
             backend,
+            driver,
             task_note,
             namespace,
             agents,
@@ -377,6 +397,7 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             command,
         } => launch_and_print_codex(CodexLaunchOptions {
             backend,
+            driver,
             task_note,
             namespace,
             agents,
@@ -392,6 +413,7 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         }),
         Command::Dispatch {
             backend,
+            driver,
             vault_path,
             board,
             once,
@@ -404,6 +426,7 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             command,
         } => run_dispatch_loop(DispatchOptions {
             backend,
+            driver,
             vault_path,
             boards: board,
             interval_seconds,
@@ -455,6 +478,9 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         } => interrupt_agent(backend, &namespace, &agent),
         Command::NativeSessionServe { manifest } => {
             serve_native_session(manifest).map_err(JarvisError::from)
+        }
+        Command::CodexAppSessionServe { manifest } => {
+            serve_codex_app_session(manifest).map_err(JarvisError::from)
         }
     }
 }
@@ -540,6 +566,27 @@ pub(crate) fn run_session_shell_with_context(
     Ok(())
 }
 
+fn collect_runtime_sessions() -> Result<Vec<NativeSessionMetadata>, JarvisError> {
+    let mut sessions = collect_native_sessions().map_err(JarvisError::from)?;
+    sessions.extend(collect_codex_app_sessions().map_err(JarvisError::from)?);
+    enrich_native_sessions(&mut sessions).map_err(JarvisError::from)?;
+    sessions.sort_by(|left, right| left.namespace.cmp(&right.namespace));
+    Ok(sessions)
+}
+
+fn session_metadata_for_namespace(namespace: &str) -> Result<NativeSessionMetadata, JarvisError> {
+    if let Some(session) = codex_app_session_metadata(namespace).map_err(JarvisError::from)? {
+        return Ok(session);
+    }
+    if let Some(session) = native::native_session_metadata(namespace).map_err(JarvisError::from)? {
+        return Ok(session);
+    }
+    Err(JarvisError::Other(anyhow::anyhow!(
+        "runtime session '{}' does not exist",
+        namespace
+    )))
+}
+
 #[instrument(err)]
 fn list_sessions(
     backend: SessionBackend,
@@ -547,14 +594,13 @@ fn list_sessions(
     json: bool,
 ) -> Result<(), JarvisError> {
     let _ = backend;
-    let mut sessions = collect_native_sessions().map_err(JarvisError::from)?;
-    enrich_native_sessions(&mut sessions).map_err(JarvisError::from)?;
+    let mut sessions = collect_runtime_sessions()?;
 
     if let Some(namespace) = namespace.as_deref() {
         sessions.retain(|session| session.namespace == namespace);
         if sessions.is_empty() {
             return Err(JarvisError::Other(anyhow::anyhow!(
-                "native session '{}' does not exist",
+                "runtime session '{}' does not exist",
                 namespace
             )));
         }
@@ -589,10 +635,11 @@ fn print_runtime_sessions(sessions: &[NativeSessionMetadata]) {
     println!("NAMESPACES:");
     for session in sessions {
         let mut summary = format!(
-            "{}: {} agents (created {}) [native]",
+            "{}: {} agents (created {}) [{}]",
             session.namespace,
             session.agents.len(),
-            session.created_at_epoch_ms
+            session.created_at_epoch_ms,
+            session.backend
         );
         if let Some(context) = session.context.as_ref() {
             if let Some(task_title) = context.task_title.as_deref() {
@@ -624,7 +671,11 @@ fn print_runtime_sessions(sessions: &[NativeSessionMetadata]) {
 #[instrument(err)]
 fn exec_agent(backend: SessionBackend, namespace: &str, agent: &str) -> Result<(), JarvisError> {
     let _ = backend;
-    attach_native(namespace, agent).map_err(JarvisError::from)
+    let session = session_metadata_for_namespace(namespace)?;
+    match session.backend.as_str() {
+        "codex-app" => attach_codex_app(namespace).map_err(JarvisError::from),
+        _ => attach_native(namespace, agent).map_err(JarvisError::from),
+    }
 }
 
 #[instrument(err)]
@@ -651,18 +702,30 @@ fn tell(
         }
     };
     let _ = backend;
-    tell_native(namespace, agent, &contents, press_enter).map_err(JarvisError::from)?;
+    let session = session_metadata_for_namespace(namespace)?;
+    match session.backend.as_str() {
+        "codex-app" => {
+            if !press_enter {
+                return Err(JarvisError::Other(anyhow::anyhow!(
+                    "--no-enter is not supported for codex app sessions"
+                )));
+            }
+            if agent != "agent0" {
+                return Err(JarvisError::Other(anyhow::anyhow!(
+                    "codex app sessions expose a single logical agent named agent0"
+                )));
+            }
+            tell_codex_app(namespace, &contents).map_err(JarvisError::from)?;
+        }
+        _ => {
+            tell_native(namespace, agent, &contents, press_enter).map_err(JarvisError::from)?;
+        }
+    }
 
     if let Some(file) = file {
-        println!(
-            "✅ Sent '{}' to '{}':'{}' via the native runtime",
-            file, namespace, agent
-        );
+        println!("✅ Sent '{}' to '{}':'{}'", file, namespace, agent);
     } else {
-        println!(
-            "✅ Sent text to '{}':'{}' via the native runtime",
-            namespace, agent
-        );
+        println!("✅ Sent text to '{}':'{}'", namespace, agent);
     }
     Ok(())
 }
@@ -673,7 +736,7 @@ fn launch_and_print_codex(options: CodexLaunchOptions) -> Result<(), JarvisError
     println!("✅ Codex session launched.");
     println!("   Namespace:   {}", record.namespace);
     println!("   Agent:       {}", record.agent);
-    println!("   Runtime:     native");
+    println!("   Runtime:     {}", record.runtime_backend);
     println!("   Repo:        {}", record.repo_path);
     println!("   Task note:   {}", record.task_note);
     println!("   Launch mode: {}", record.launch_mode);
@@ -701,13 +764,21 @@ fn launch_and_print_codex(options: CodexLaunchOptions) -> Result<(), JarvisError
 #[instrument(err)]
 fn attach_session(backend: SessionBackend, namespace: &str) -> Result<(), JarvisError> {
     let _ = backend;
-    attach_native(namespace, "agent0").map_err(JarvisError::from)
+    let session = session_metadata_for_namespace(namespace)?;
+    match session.backend.as_str() {
+        "codex-app" => attach_codex_app(namespace).map_err(JarvisError::from),
+        _ => attach_native(namespace, "agent0").map_err(JarvisError::from),
+    }
 }
 
 #[instrument(err)]
 fn delete_session(backend: SessionBackend, namespace: &str) -> Result<(), JarvisError> {
     let _ = backend;
-    delete_native_session(namespace).map_err(JarvisError::from)
+    let session = session_metadata_for_namespace(namespace)?;
+    match session.backend.as_str() {
+        "codex-app" => delete_codex_app_session(namespace).map_err(JarvisError::from),
+        _ => delete_native_session(namespace).map_err(JarvisError::from),
+    }
 }
 
 #[instrument(err)]
@@ -717,7 +788,18 @@ fn interrupt_agent(
     agent: &str,
 ) -> Result<(), JarvisError> {
     let _ = backend;
-    interrupt_native(namespace, agent).map_err(JarvisError::from)
+    let session = session_metadata_for_namespace(namespace)?;
+    match session.backend.as_str() {
+        "codex-app" => {
+            if agent != "agent0" {
+                return Err(JarvisError::Other(anyhow::anyhow!(
+                    "codex app sessions expose a single logical agent named agent0"
+                )));
+            }
+            interrupt_codex_app(namespace).map_err(JarvisError::from)
+        }
+        _ => interrupt_native(namespace, agent).map_err(JarvisError::from),
+    }
 }
 
 fn enter_shell(target_pid: u32) -> Result<(), JarvisError> {

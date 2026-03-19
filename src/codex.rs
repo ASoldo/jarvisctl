@@ -1,7 +1,9 @@
 use crate::SessionBackend;
+use crate::codex_app::{CodexAppLaunchManifest, spawn_codex_app_session};
 use crate::native::{NativeSessionMetadata, RuntimeContextMetadata};
 use crate::ticket::{TicketNote, slugify};
 use anyhow::{Context, ensure};
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
@@ -12,9 +14,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+pub enum CodexRuntimeDriver {
+    CliPty,
+    AppServer,
+}
+
 #[derive(Debug, Clone)]
 pub struct CodexLaunchOptions {
     pub backend: SessionBackend,
+    pub driver: CodexRuntimeDriver,
     pub task_note: PathBuf,
     pub namespace: Option<String>,
     pub agents: usize,
@@ -40,6 +49,7 @@ pub struct CodexLaunchRecord {
     pub namespace: String,
     pub agent: String,
     pub agents: usize,
+    pub runtime_backend: String,
     pub command: Vec<String>,
     pub launch_mode: String,
     pub codex_session_id: Option<String>,
@@ -94,11 +104,20 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
         .clone()
         .unwrap_or_else(|| default_namespace_for_ticket(&ticket));
     let resume_session_id = resolve_resume_session_id(&ticket, &namespace, &options)?;
-    let mut runtime_args = ticket.codex_cli_args()?;
-    runtime_args.extend(codex_image_args(&options.images)?);
+    let runtime_args = ticket.codex_cli_args()?;
     let finish_mode = ticket.finish_session_policy()?.to_string();
-    let base_command = build_base_command(&options.command, resume_session_id.as_deref());
-    let command = with_codex_runtime_args(base_command, &runtime_args);
+    let command = match options.driver {
+        CodexRuntimeDriver::CliPty => {
+            let mut runtime_args_with_images = runtime_args.clone();
+            runtime_args_with_images.extend(codex_image_args(&options.images)?);
+            let base_command = build_base_command(&options.command, resume_session_id.as_deref());
+            with_codex_runtime_args(base_command, &runtime_args_with_images)
+        }
+        CodexRuntimeDriver::AppServer => {
+            let base_command = build_app_server_command(&options.command);
+            with_codex_runtime_args(base_command, &runtime_args)
+        }
+    };
     let prompt = build_codex_prompt(
         &ticket,
         options.prompt_file.as_deref(),
@@ -131,20 +150,6 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
 
     ensure_project_trusted(&repo_path)?;
 
-    let mut launch_command = if launches_codex(&command) {
-        let mut wrapped = vec!["env".to_string(), "NO_UPDATE_NOTIFIER=1".to_string()];
-        wrapped.extend(command.clone());
-        wrapped
-    } else {
-        command.clone()
-    };
-    launch_command.push(prompt.clone());
-
-    let wrapped_command = wrap_launch_command(&finish_mode, &launch_command);
-    let resume_transcript_path = match resume_session_id.as_deref() {
-        Some(session_id) => transcript_path_for_session_id(session_id)?,
-        None => None,
-    };
     let runtime_context = RuntimeContextMetadata {
         workload: Some("codex".to_string()),
         task_id: Some(ticket.effective_id()),
@@ -158,29 +163,81 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
         codex_session_id: resume_session_id.clone(),
         prompt_file: Some(prompt_path.display().to_string()),
         record_file: Some(record_path.display().to_string()),
-        transcript_path: resume_transcript_path,
+        transcript_path: None,
+        thread_id: None,
+        thread_status: None,
+        turn_id: None,
+        turn_status: None,
+        live_message: None,
+        last_activity: None,
+        last_error: None,
     };
+    let (runtime_backend, codex_session_id) = match options.driver {
+        CodexRuntimeDriver::CliPty => {
+            let mut launch_command = if launches_codex(&command) {
+                let mut wrapped = vec!["env".to_string(), "NO_UPDATE_NOTIFIER=1".to_string()];
+                wrapped.extend(command.clone());
+                wrapped
+            } else {
+                command.clone()
+            };
+            launch_command.push(prompt.clone());
 
-    super::run_session_shell_with_context(
-        options.backend,
-        &namespace,
-        options.agents,
-        &Some(repo_path.display().to_string()),
-        &wrapped_command,
-        Some(runtime_context),
-    )?;
+            let wrapped_command = wrap_launch_command(&finish_mode, &launch_command);
+            let resume_transcript_path = match resume_session_id.as_deref() {
+                Some(session_id) => transcript_path_for_session_id(session_id)?,
+                None => None,
+            };
+            super::run_session_shell_with_context(
+                options.backend,
+                &namespace,
+                options.agents,
+                &Some(repo_path.display().to_string()),
+                &wrapped_command,
+                Some(RuntimeContextMetadata {
+                    transcript_path: resume_transcript_path,
+                    ..runtime_context.clone()
+                }),
+            )?;
 
-    if options.startup_delay_ms > 0 {
-        thread::sleep(Duration::from_millis(options.startup_delay_ms));
-    }
+            if options.startup_delay_ms > 0 {
+                thread::sleep(Duration::from_millis(options.startup_delay_ms));
+            }
+
+            (
+                "native".to_string(),
+                match resume_session_id.clone() {
+                    Some(session_id) => Some(session_id),
+                    None => discover_codex_session_id(&ticket.path, &repo_path, timestamp_ms)?,
+                },
+            )
+        }
+        CodexRuntimeDriver::AppServer => {
+            let metadata = spawn_codex_app_session(CodexAppLaunchManifest {
+                namespace: namespace.clone(),
+                working_directory: Some(repo_path.display().to_string()),
+                shell_command: shell_words::join(&command),
+                startup_prompt: prompt.clone(),
+                images: options
+                    .images
+                    .iter()
+                    .map(|image| image.display().to_string())
+                    .collect(),
+                resume_session_id: resume_session_id.clone(),
+                created_at_epoch_ms: timestamp_ms,
+                context: runtime_context.clone(),
+            })?;
+            let context = metadata.context.unwrap_or_default();
+            (
+                "codex-app".to_string(),
+                context.codex_session_id.or(context.thread_id),
+            )
+        }
+    };
 
     let readiness_warnings = ticket.readiness_warnings();
-    let codex_session_id = match resume_session_id.clone() {
-        Some(session_id) => Some(session_id),
-        None => discover_codex_session_id(&ticket.path, &repo_path, timestamp_ms)?,
-    };
     let record = CodexLaunchRecord {
-        version: 2,
+        version: 3,
         launched_at_epoch_ms: timestamp_ms,
         task_id: ticket.effective_id(),
         title: ticket.title.clone(),
@@ -189,6 +246,7 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
         namespace: namespace.clone(),
         agent: options.agent.clone(),
         agents: options.agents,
+        runtime_backend,
         command,
         launch_mode: if resume_session_id.is_some() {
             "resume".to_string()
@@ -333,6 +391,24 @@ fn build_base_command(command: &[String], resume_session_id: Option<&str>) -> Ve
     base_command
 }
 
+fn build_app_server_command(command: &[String]) -> Vec<String> {
+    let mut base_command = if command.is_empty() {
+        vec!["codex".to_string()]
+    } else {
+        command.to_vec()
+    };
+
+    let Some(insert_index) = codex_subcommand_insert_index(&base_command) else {
+        return base_command;
+    };
+
+    if base_command.get(insert_index).map(String::as_str) != Some("app-server") {
+        base_command.insert(insert_index, "app-server".to_string());
+    }
+
+    base_command
+}
+
 fn with_codex_runtime_args(command: Vec<String>, runtime_args: &[String]) -> Vec<String> {
     if runtime_args.is_empty() {
         return command;
@@ -363,6 +439,15 @@ fn codex_insert_index(command: &[String]) -> Option<usize> {
     } else {
         Some(after_codex)
     }
+}
+
+fn codex_subcommand_insert_index(command: &[String]) -> Option<usize> {
+    let codex_index = match command.first().map(String::as_str) {
+        Some("codex") => Some(0),
+        Some("env") => command.iter().position(|part| part == "codex"),
+        _ => None,
+    }?;
+    Some(codex_index + 1)
 }
 
 fn ensure_project_trusted(repo_path: &Path) -> anyhow::Result<()> {

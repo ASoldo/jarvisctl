@@ -21,6 +21,7 @@ use ratatui::{
 };
 
 use crate::codex::enrich_native_sessions;
+use crate::codex_app::collect_codex_app_sessions;
 use crate::native::{NativeSessionMetadata, RuntimeContextMetadata, collect_native_sessions};
 use crate::{SessionBackend, delete_session, exec_agent, interrupt_agent};
 
@@ -273,6 +274,7 @@ pub fn run_dashboard(backend: SessionBackend, refresh_ms: u64) -> anyhow::Result
 fn load_dashboard_rows(backend: SessionBackend) -> anyhow::Result<Vec<DashboardRow>> {
     let _ = backend;
     let mut sessions = collect_native_sessions()?;
+    sessions.extend(collect_codex_app_sessions()?);
     enrich_native_sessions(&mut sessions)?;
     Ok(flatten_native_rows(&sessions))
 }
@@ -607,10 +609,34 @@ fn render_dashboard_detail(
                 Span::styled(session_id, Style::default().fg(TEXT)),
             ]));
         }
+        if let Some(thread_status) = context.thread_status.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled("Thread: ", Style::default().fg(SUBTLE_TEXT)),
+                Span::styled(thread_status, Style::default().fg(TEXT)),
+            ]));
+        }
+        if let Some(turn_status) = context.turn_status.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled("Turn: ", Style::default().fg(SUBTLE_TEXT)),
+                Span::styled(turn_status, Style::default().fg(TEXT)),
+            ]));
+        }
         if let Some(transcript_path) = context.transcript_path.as_deref() {
             lines.push(Line::from(vec![
                 Span::styled("Transcript: ", Style::default().fg(SUBTLE_TEXT)),
                 Span::styled(short_path(transcript_path), Style::default().fg(TEXT)),
+            ]));
+        }
+        if let Some(live_message) = context.live_message.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled("Live: ", Style::default().fg(SUBTLE_TEXT)),
+                Span::styled(live_message, Style::default().fg(TEXT)),
+            ]));
+        }
+        if let Some(last_error) = context.last_error.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled("Error: ", Style::default().fg(SUBTLE_TEXT)),
+                Span::styled(last_error, Style::default().fg(Color::Red)),
             ]));
         }
     }

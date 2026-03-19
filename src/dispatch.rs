@@ -1,8 +1,11 @@
 use crate::SessionBackend;
 use crate::board::{BoardFile, discover_default_boards, normalize_column, resolve_wiki_link};
 use crate::codex::{
-    CodexLaunchOptions, default_namespace_for_ticket, discover_codex_session_id,
-    discover_latest_launch_session_id, launch_codex_ticket,
+    CodexLaunchOptions, CodexRuntimeDriver, default_namespace_for_ticket,
+    discover_codex_session_id, discover_latest_launch_session_id, launch_codex_ticket,
+};
+use crate::codex_app::{
+    codex_app_session_metadata, delete_codex_app_session, interrupt_codex_app, tell_codex_app,
 };
 use crate::native::{
     delete_native_session, interrupt_native, native_session_metadata, tell_native,
@@ -26,6 +29,7 @@ const CODEX_WORKING: &str = "codex working";
 #[derive(Debug, Clone)]
 pub struct DispatchOptions {
     pub backend: SessionBackend,
+    pub driver: CodexRuntimeDriver,
     pub vault_path: PathBuf,
     pub boards: Vec<PathBuf>,
     pub interval_seconds: u64,
@@ -299,6 +303,7 @@ fn handle_ready_transition(
 
     let launch = launch_codex_ticket(CodexLaunchOptions {
         backend: options.backend,
+        driver: options.driver,
         task_note: ticket_path.clone(),
         namespace: None,
         agents: options.agents,
@@ -631,9 +636,26 @@ fn probe_namespace_run_state(
     namespace: &str,
 ) -> anyhow::Result<NamespaceRunState> {
     let _ = backend;
-    let Some(metadata) = native_session_metadata(namespace)? else {
+    let metadata = if let Some(metadata) = codex_app_session_metadata(namespace)? {
+        metadata
+    } else if let Some(metadata) = native_session_metadata(namespace)? {
+        metadata
+    } else {
         return Ok(NamespaceRunState::Missing);
     };
+
+    if metadata.backend == "codex-app" {
+        let turn_active = metadata
+            .context
+            .as_ref()
+            .and_then(|context| context.turn_status.as_deref())
+            == Some("inProgress");
+        return Ok(if turn_active {
+            NamespaceRunState::ActiveCodex
+        } else {
+            NamespaceRunState::Idle
+        });
+    }
 
     let mut system = System::new_all();
     system.refresh_all();
@@ -734,6 +756,24 @@ fn cancel_run_namespace(
     agent: &str,
 ) -> anyhow::Result<()> {
     let _ = backend;
+    if let Some(metadata) = codex_app_session_metadata(namespace)? {
+        if metadata
+            .context
+            .as_ref()
+            .and_then(|context| context.turn_status.as_deref())
+            == Some("inProgress")
+        {
+            let _ = tell_codex_app(
+                namespace,
+                "Stop the current turn and wait for operator guidance.",
+            );
+            thread::sleep(Duration::from_millis(200));
+            let _ = interrupt_codex_app(namespace);
+            thread::sleep(Duration::from_millis(100));
+        }
+        return kill_session_if_exists(backend, namespace);
+    }
+
     if probe_namespace_run_state(backend, namespace)? == NamespaceRunState::ActiveCodex {
         let _ = tell_native(namespace, agent, "/clear", true);
         thread::sleep(Duration::from_millis(200));
@@ -746,6 +786,9 @@ fn cancel_run_namespace(
 
 fn kill_session_if_exists(backend: SessionBackend, namespace: &str) -> anyhow::Result<()> {
     let _ = backend;
+    if codex_app_session_metadata(namespace)?.is_some() {
+        return delete_codex_app_session(namespace);
+    }
     if native_session_metadata(namespace)?.is_none() {
         return Ok(());
     }
