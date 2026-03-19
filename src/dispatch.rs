@@ -761,10 +761,8 @@ fn resolve_ticket_session_id(
         return Ok(existing_session_id);
     }
 
-    let historical = discover_latest_launch_session_id(
-        &ticket.path,
-        &default_namespace_for_ticket(ticket),
-    )?;
+    let historical =
+        discover_latest_launch_session_id(&ticket.path, &default_namespace_for_ticket(ticket))?;
     if historical.is_some() {
         return Ok(historical);
     }

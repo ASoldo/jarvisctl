@@ -1,4 +1,6 @@
 use std::io::stdout;
+use std::path::Path;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -18,7 +20,8 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap},
 };
 
-use crate::native::{NativeSessionMetadata, collect_native_sessions};
+use crate::codex::enrich_native_sessions;
+use crate::native::{NativeSessionMetadata, RuntimeContextMetadata, collect_native_sessions};
 use crate::{SessionBackend, delete_session, exec_agent, interrupt_agent};
 
 const BG: Color = Color::Reset;
@@ -106,6 +109,9 @@ struct DashboardRow {
     agent: String,
     pid: u32,
     running: bool,
+    working_directory: Option<String>,
+    shell_command: String,
+    context: Option<RuntimeContextMetadata>,
 }
 
 #[derive(Debug)]
@@ -234,6 +240,23 @@ pub fn run_dashboard(backend: SessionBackend, refresh_ms: u64) -> anyhow::Result
                         app.status = format!("returned from {}:{}", row.namespace, row.agent);
                     }
                 }
+                KeyCode::Char('t') => {
+                    if let Some(row) = app.selected_row().cloned() {
+                        if let Some(transcript_path) = row
+                            .context
+                            .as_ref()
+                            .and_then(|context| context.transcript_path.as_deref())
+                        {
+                            suspend_terminal(&mut terminal)?;
+                            let action = open_transcript_viewer(transcript_path);
+                            resume_terminal(&mut terminal)?;
+                            action.map_err(anyhow::Error::from)?;
+                            app.status = format!("viewed transcript for {}", row.namespace);
+                        } else {
+                            app.status = format!("no transcript recorded for {}", row.namespace);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -249,7 +272,8 @@ pub fn run_dashboard(backend: SessionBackend, refresh_ms: u64) -> anyhow::Result
 
 fn load_dashboard_rows(backend: SessionBackend) -> anyhow::Result<Vec<DashboardRow>> {
     let _ = backend;
-    let sessions = collect_native_sessions()?;
+    let mut sessions = collect_native_sessions()?;
+    enrich_native_sessions(&mut sessions)?;
     Ok(flatten_native_rows(&sessions))
 }
 
@@ -262,6 +286,9 @@ fn flatten_native_rows(sessions: &[NativeSessionMetadata]) -> Vec<DashboardRow> 
                 agent: agent.name.clone(),
                 pid: agent.pid,
                 running: agent.running,
+                working_directory: session.working_directory.clone(),
+                shell_command: session.shell_command.clone(),
+                context: session.context.clone(),
             });
         }
     }
@@ -318,6 +345,18 @@ fn render_dashboard_header(frame: &mut Frame, area: ratatui::layout::Rect, app: 
 }
 
 fn render_dashboard_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &DashboardApp) {
+    let sections = if area.width >= 120 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .split(area)
+    };
+
     if app.rows.is_empty() {
         let empty = Paragraph::new("No active runtime sessions.")
             .block(
@@ -327,7 +366,21 @@ fn render_dashboard_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &D
                     .border_style(Style::default().fg(BORDER)),
             )
             .style(Style::default().fg(SUBTLE_TEXT));
-        frame.render_widget(empty, area);
+        frame.render_widget(empty, sections[0]);
+        frame.render_widget(
+            Paragraph::new(
+                "Select a namespace to inspect ticket, session, and transcript details.",
+            )
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Detail")
+                    .border_style(Style::default().fg(BORDER)),
+            )
+            .style(Style::default().fg(SUBTLE_TEXT))
+            .wrap(Wrap { trim: false }),
+            sections[1],
+        );
         return;
     }
 
@@ -338,12 +391,36 @@ fn render_dashboard_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &D
         } else {
             Style::default().fg(Color::Yellow)
         };
+        let namespace_cell = if let Some(title) = row
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.task_title.as_deref())
+        {
+            Cell::from(format!(
+                "{}\n{}",
+                row.namespace,
+                truncate_for_cell(title, 38)
+            ))
+        } else {
+            Cell::from(row.namespace.clone())
+        };
+        let row_height = if row
+            .context
+            .as_ref()
+            .and_then(|ctx| ctx.task_title.as_deref())
+            .is_some()
+        {
+            2
+        } else {
+            1
+        };
         Row::new(vec![
-            Cell::from(row.namespace.clone()),
+            namespace_cell,
             Cell::from(row.agent.clone()),
             Cell::from(row.pid.to_string()),
             Cell::from(Span::styled(state, state_style)),
         ])
+        .height(row_height)
     });
 
     let table = Table::new(
@@ -378,7 +455,8 @@ fn render_dashboard_body(frame: &mut Frame, area: ratatui::layout::Rect, app: &D
 
     let mut state = TableState::default();
     state.select(Some(app.selected));
-    frame.render_stateful_widget(table, area, &mut state);
+    frame.render_stateful_widget(table, sections[0], &mut state);
+    render_dashboard_detail(frame, sections[1], app.selected_row());
 }
 
 fn render_dashboard_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: &DashboardApp) {
@@ -397,12 +475,13 @@ fn render_dashboard_footer(frame: &mut Frame, area: ratatui::layout::Rect, app: 
     );
     push_powerline_segment(&mut spans, " i interrupt ", Color::White, PL_A, PL_B);
     push_powerline_segment(&mut spans, " x close ", Color::White, PL_B, PL_D);
-    push_powerline_segment(&mut spans, " r refresh ", Color::White, PL_D, PL_C);
+    push_powerline_segment(&mut spans, " t transcript ", Color::White, PL_D, PL_C);
+    push_powerline_segment(&mut spans, " r refresh ", Color::White, PL_C, PL_D);
     push_powerline_segment(
         &mut spans,
         format!(" target {} ", selected),
         Color::White,
-        PL_C,
+        PL_D,
         PL_B,
     );
     push_powerline_segment(
@@ -467,4 +546,136 @@ fn leave_terminal(
         cursor::Show
     )?;
     Ok(())
+}
+
+fn render_dashboard_detail(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    selected: Option<&DashboardRow>,
+) {
+    let Some(row) = selected else {
+        frame.render_widget(
+            Paragraph::new("No runtime selected.")
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Detail")
+                        .border_style(Style::default().fg(BORDER)),
+                )
+                .style(Style::default().fg(SUBTLE_TEXT)),
+            area,
+        );
+        return;
+    };
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("Namespace: ", Style::default().fg(SUBTLE_TEXT)),
+        Span::styled(&row.namespace, Style::default().fg(TEXT)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Agent: ", Style::default().fg(SUBTLE_TEXT)),
+        Span::styled(&row.agent, Style::default().fg(TEXT)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("PID: ", Style::default().fg(SUBTLE_TEXT)),
+        Span::styled(row.pid.to_string(), Style::default().fg(TEXT)),
+    ]));
+
+    if let Some(context) = row.context.as_ref() {
+        if let Some(workload) = context.workload.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled("Workload: ", Style::default().fg(SUBTLE_TEXT)),
+                Span::styled(workload, Style::default().fg(TEXT)),
+            ]));
+        }
+        if let Some(task_title) = context.task_title.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled("Task: ", Style::default().fg(SUBTLE_TEXT)),
+                Span::styled(task_title, Style::default().fg(TEXT)),
+            ]));
+        }
+        if let Some(task_note) = context.task_note.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled("Ticket: ", Style::default().fg(SUBTLE_TEXT)),
+                Span::styled(short_path(task_note), Style::default().fg(TEXT)),
+            ]));
+        }
+        if let Some(session_id) = context.codex_session_id.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled("Session: ", Style::default().fg(SUBTLE_TEXT)),
+                Span::styled(session_id, Style::default().fg(TEXT)),
+            ]));
+        }
+        if let Some(transcript_path) = context.transcript_path.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled("Transcript: ", Style::default().fg(SUBTLE_TEXT)),
+                Span::styled(short_path(transcript_path), Style::default().fg(TEXT)),
+            ]));
+        }
+    }
+
+    if let Some(working_directory) = row.working_directory.as_deref() {
+        lines.push(Line::from(vec![
+            Span::styled("Repo: ", Style::default().fg(SUBTLE_TEXT)),
+            Span::styled(short_path(working_directory), Style::default().fg(TEXT)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("Command: ", Style::default().fg(SUBTLE_TEXT)),
+        Span::styled(&row.shell_command, Style::default().fg(TEXT)),
+    ]));
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Detail")
+                    .border_style(Style::default().fg(BORDER)),
+            )
+            .style(Style::default().fg(TEXT))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn open_transcript_viewer(path: &str) -> anyhow::Result<()> {
+    let quoted = shell_words::join([path]);
+    let command = format!(
+        "if command -v less >/dev/null 2>&1; then less -R +G {quoted}; else tail -n 200 {quoted}; fi"
+    );
+    let status = Command::new("bash").arg("-lc").arg(command).status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(anyhow::anyhow!(
+        "transcript viewer exited with status {}",
+        status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "signal".to_string())
+    ))
+}
+
+fn truncate_for_cell(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut truncated = value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
+fn short_path(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(path)
+        .to_string()
 }

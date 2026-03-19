@@ -26,11 +26,12 @@ mod ticket;
 mod tui;
 
 use agent::spawn_agent;
-use codex::{CodexLaunchOptions, launch_codex_ticket};
+use codex::{CodexLaunchOptions, enrich_native_sessions, launch_codex_ticket};
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use native::{
-    attach_native, delete_native_session, interrupt_native, list_native_sessions,
-    print_native_sessions_json, serve_native_session, spawn_native_session, tell_native,
+    NativeSessionMetadata, RuntimeContextMetadata, attach_native, collect_native_sessions,
+    delete_native_session, interrupt_native, serve_native_session, spawn_native_session,
+    tell_native,
 };
 use tui::{run_dashboard, view_agent};
 
@@ -439,7 +440,14 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             file,
             text,
             no_enter,
-        } => tell(backend, &namespace, &agent, file.as_deref(), text.as_deref(), !no_enter),
+        } => tell(
+            backend,
+            &namespace,
+            &agent,
+            file.as_deref(),
+            text.as_deref(),
+            !no_enter,
+        ),
         Command::Interrupt {
             backend,
             namespace,
@@ -506,8 +514,19 @@ pub(crate) fn run_session_shell(
     working_dir: &Option<String>,
     joined: &str,
 ) -> Result<(), JarvisError> {
+    run_session_shell_with_context(backend, namespace, agents, working_dir, joined, None)
+}
+
+pub(crate) fn run_session_shell_with_context(
+    backend: SessionBackend,
+    namespace: &str,
+    agents: usize,
+    working_dir: &Option<String>,
+    joined: &str,
+    context: Option<RuntimeContextMetadata>,
+) -> Result<(), JarvisError> {
     let _ = backend;
-    spawn_native_session(namespace, agents, working_dir.as_deref(), joined)
+    spawn_native_session(namespace, agents, working_dir.as_deref(), joined, context)
         .map_err(JarvisError::from)?;
 
     println!(
@@ -528,10 +547,77 @@ fn list_sessions(
     json: bool,
 ) -> Result<(), JarvisError> {
     let _ = backend;
+    let mut sessions = collect_native_sessions().map_err(JarvisError::from)?;
+    enrich_native_sessions(&mut sessions).map_err(JarvisError::from)?;
+
+    if let Some(namespace) = namespace.as_deref() {
+        sessions.retain(|session| session.namespace == namespace);
+        if sessions.is_empty() {
+            return Err(JarvisError::Other(anyhow::anyhow!(
+                "native session '{}' does not exist",
+                namespace
+            )));
+        }
+    }
+
     if json {
-        print_native_sessions_json(namespace.as_deref()).map_err(JarvisError::from)
-    } else {
-        list_native_sessions(namespace.as_deref()).map_err(JarvisError::from)
+        if namespace.is_some() {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&sessions[0]).map_err(anyhow::Error::from)?
+            );
+        } else {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&sessions).map_err(anyhow::Error::from)?
+            );
+        }
+        return Ok(());
+    }
+
+    print_runtime_sessions(&sessions);
+    Ok(())
+}
+
+fn print_runtime_sessions(sessions: &[NativeSessionMetadata]) {
+    if sessions.is_empty() {
+        println!("NAMESPACES:\n(none)");
+        println!("AGENTS:\n(none)");
+        return;
+    }
+
+    println!("NAMESPACES:");
+    for session in sessions {
+        let mut summary = format!(
+            "{}: {} agents (created {}) [native]",
+            session.namespace,
+            session.agents.len(),
+            session.created_at_epoch_ms
+        );
+        if let Some(context) = session.context.as_ref() {
+            if let Some(task_title) = context.task_title.as_deref() {
+                summary.push_str(&format!(" -> {}", task_title));
+            } else if let Some(task_note) = context.task_note.as_deref() {
+                summary.push_str(&format!(" -> {}", task_note));
+            }
+        }
+        println!("{}", summary);
+    }
+
+    println!("\nAGENTS:");
+    for session in sessions {
+        for agent in &session.agents {
+            let mut summary = format!(
+                "{} {} pid={} running={}",
+                session.namespace, agent.name, agent.pid, agent.running
+            );
+            if let Some(context) = session.context.as_ref() {
+                if let Some(session_id) = context.codex_session_id.as_deref() {
+                    summary.push_str(&format!(" session={}", session_id));
+                }
+            }
+            println!("{}", summary);
+        }
     }
 }
 
@@ -573,7 +659,10 @@ fn tell(
             file, namespace, agent
         );
     } else {
-        println!("✅ Sent text to '{}':'{}' via the native runtime", namespace, agent);
+        println!(
+            "✅ Sent text to '{}':'{}' via the native runtime",
+            namespace, agent
+        );
     }
     Ok(())
 }

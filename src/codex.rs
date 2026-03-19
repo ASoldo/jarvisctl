@@ -1,7 +1,9 @@
 use crate::SessionBackend;
+use crate::native::{NativeSessionMetadata, RuntimeContextMetadata};
 use crate::ticket::{TicketNote, slugify};
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,7 +29,7 @@ pub struct CodexLaunchOptions {
     pub command: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexLaunchRecord {
     pub version: u32,
     pub launched_at_epoch_ms: u128,
@@ -125,6 +127,8 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
     fs::write(&prompt_path, &prompt)
         .with_context(|| format!("failed to write prompt bundle '{}'", prompt_path.display()))?;
 
+    let record_path = runs_dir.join(format!("{}-{}.json", namespace, timestamp_ms));
+
     ensure_project_trusted(&repo_path)?;
 
     let mut launch_command = if launches_codex(&command) {
@@ -137,12 +141,33 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
     launch_command.push(prompt.clone());
 
     let wrapped_command = wrap_launch_command(&finish_mode, &launch_command);
-    super::run_session_shell(
+    let resume_transcript_path = match resume_session_id.as_deref() {
+        Some(session_id) => transcript_path_for_session_id(session_id)?,
+        None => None,
+    };
+    let runtime_context = RuntimeContextMetadata {
+        workload: Some("codex".to_string()),
+        task_id: Some(ticket.effective_id()),
+        task_title: Some(ticket.title.clone()),
+        task_note: Some(ticket.path.display().to_string()),
+        launch_mode: Some(if resume_session_id.is_some() {
+            "resume".to_string()
+        } else {
+            "fresh".to_string()
+        }),
+        codex_session_id: resume_session_id.clone(),
+        prompt_file: Some(prompt_path.display().to_string()),
+        record_file: Some(record_path.display().to_string()),
+        transcript_path: resume_transcript_path,
+    };
+
+    super::run_session_shell_with_context(
         options.backend,
         &namespace,
         options.agents,
         &Some(repo_path.display().to_string()),
         &wrapped_command,
+        Some(runtime_context),
     )?;
 
     if options.startup_delay_ms > 0 {
@@ -150,7 +175,6 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
     }
 
     let readiness_warnings = ticket.readiness_warnings();
-    let record_path = runs_dir.join(format!("{}-{}.json", namespace, timestamp_ms));
     let codex_session_id = match resume_session_id.clone() {
         Some(session_id) => Some(session_id),
         None => discover_codex_session_id(&ticket.path, &repo_path, timestamp_ms)?,
@@ -260,11 +284,7 @@ fn build_codex_prompt(
 fn codex_image_args(images: &[PathBuf]) -> anyhow::Result<Vec<String>> {
     let mut args = Vec::new();
     for image in images {
-        ensure!(
-            image.exists(),
-            "image '{}' does not exist",
-            image.display()
-        );
+        ensure!(image.exists(), "image '{}' does not exist", image.display());
         args.push("--image".to_string());
         args.push(image.display().to_string());
     }
@@ -569,6 +589,173 @@ fn canonical_path_string(path: &Path) -> String {
         .to_string()
 }
 
+pub fn enrich_native_sessions(sessions: &mut [NativeSessionMetadata]) -> anyhow::Result<()> {
+    let launch_records = latest_launch_records_by_namespace()?;
+    let transcript_paths = transcript_paths_by_session_id()?;
+
+    for session in sessions {
+        let looks_like_codex = session
+            .context
+            .as_ref()
+            .and_then(|context| context.workload.as_deref())
+            == Some("codex")
+            || session.shell_command.contains("codex");
+
+        if !looks_like_codex {
+            continue;
+        }
+
+        let Some(record) = launch_records.get(&session.namespace) else {
+            if let Some(context) = session.context.as_mut() {
+                fill_transcript_path(context, &transcript_paths);
+            }
+            continue;
+        };
+
+        if !launch_record_matches_session(record, session) {
+            continue;
+        }
+
+        let context = session
+            .context
+            .get_or_insert_with(RuntimeContextMetadata::default);
+        if context.workload.is_none() {
+            context.workload = Some("codex".to_string());
+        }
+        if context.task_id.is_none() {
+            context.task_id = Some(record.task_id.clone());
+        }
+        if context.task_title.is_none() {
+            context.task_title = Some(record.title.clone());
+        }
+        if context.task_note.is_none() {
+            context.task_note = Some(record.task_note.clone());
+        }
+        if context.launch_mode.is_none() {
+            context.launch_mode = Some(record.launch_mode.clone());
+        }
+        if context.codex_session_id.is_none() {
+            context.codex_session_id = record.codex_session_id.clone();
+        }
+        if context.prompt_file.is_none() {
+            context.prompt_file = Some(record.prompt_file.clone());
+        }
+        if context.record_file.is_none() {
+            context.record_file = Some(record.record_file.clone());
+        }
+        fill_transcript_path(context, &transcript_paths);
+    }
+
+    Ok(())
+}
+
+pub fn transcript_path_for_session_id(session_id: &str) -> anyhow::Result<Option<String>> {
+    let mut transcripts = transcript_paths_by_session_id()?;
+    Ok(transcripts.remove(session_id))
+}
+
+fn latest_launch_records_by_namespace() -> anyhow::Result<BTreeMap<String, CodexLaunchRecord>> {
+    let runs_dir = jarvis_home()?.join("codex").join("runs");
+    if !runs_dir.exists() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut records: BTreeMap<String, CodexLaunchRecord> = BTreeMap::new();
+    for entry in fs::read_dir(&runs_dir)
+        .with_context(|| format!("failed to read '{}'", runs_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        let record: CodexLaunchRecord = match serde_json::from_str(&raw) {
+            Ok(record) => record,
+            Err(_) => continue,
+        };
+
+        let replace = match records.get(&record.namespace) {
+            Some(existing) => record.launched_at_epoch_ms >= existing.launched_at_epoch_ms,
+            None => true,
+        };
+        if replace {
+            records.insert(record.namespace.clone(), record);
+        }
+    }
+
+    Ok(records)
+}
+
+fn transcript_paths_by_session_id() -> anyhow::Result<BTreeMap<String, String>> {
+    let home = env::var_os("HOME").context("HOME is not set")?;
+    let sessions_dir = PathBuf::from(home).join(".codex").join("sessions");
+    if !sessions_dir.exists() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut files = Vec::new();
+    collect_session_files(&sessions_dir, &mut files)?;
+    files.sort();
+
+    let mut transcripts = BTreeMap::new();
+    for file in files {
+        let Some(envelope) = read_session_meta(&file) else {
+            continue;
+        };
+        if envelope.entry_type != "session_meta" {
+            continue;
+        }
+        transcripts.insert(envelope.payload.id, file.display().to_string());
+    }
+
+    Ok(transcripts)
+}
+
+fn fill_transcript_path(
+    context: &mut RuntimeContextMetadata,
+    transcript_paths: &BTreeMap<String, String>,
+) {
+    if context.transcript_path.is_some() {
+        return;
+    }
+    let Some(session_id) = context.codex_session_id.as_deref() else {
+        return;
+    };
+    if let Some(path) = transcript_paths.get(session_id) {
+        context.transcript_path = Some(path.clone());
+    }
+}
+
+fn launch_record_matches_session(
+    record: &CodexLaunchRecord,
+    session: &NativeSessionMetadata,
+) -> bool {
+    if record
+        .launched_at_epoch_ms
+        .abs_diff(session.created_at_epoch_ms)
+        > 600_000
+    {
+        return false;
+    }
+
+    let Some(working_directory) = session.working_directory.as_deref() else {
+        return true;
+    };
+    canonical_path_string(Path::new(&record.repo_path))
+        == canonical_path_string(Path::new(working_directory))
+}
+
+fn read_session_meta(path: &Path) -> Option<SessionMetaEnvelope> {
+    let raw = fs::read_to_string(path).ok()?;
+    let first_line = raw.lines().next()?;
+    serde_json::from_str(first_line).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -605,8 +792,9 @@ repo_path: /tmp/repo
         .unwrap();
 
         let ticket = TicketNote::load(&ticket_path).unwrap();
-        let prompt = build_codex_prompt(&ticket, None, Some("Need one more validation pass."), true)
-            .unwrap();
+        let prompt =
+            build_codex_prompt(&ticket, None, Some("Need one more validation pass."), true)
+                .unwrap();
 
         assert!(prompt.contains("Continue work for 'Demo Ticket'"));
         assert!(prompt.contains("Operator update:\nNeed one more validation pass."));

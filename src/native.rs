@@ -77,9 +77,33 @@ struct NativeSessionManifest {
     agents: usize,
     working_directory: Option<String>,
     shell_command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context: Option<RuntimeContextMetadata>,
     initial_rows: Option<u16>,
     initial_cols: Option<u16>,
     created_at_epoch_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuntimeContextMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +113,8 @@ pub struct NativeSessionMetadata {
     pub created_at_epoch_ms: u128,
     pub working_directory: Option<String>,
     pub shell_command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<RuntimeContextMetadata>,
     pub agents: Vec<NativeAgentMetadata>,
 }
 
@@ -144,6 +170,7 @@ struct NativeSession {
     created_at_epoch_ms: u128,
     working_directory: Option<String>,
     shell_command: String,
+    context: Option<RuntimeContextMetadata>,
     session_dir: PathBuf,
     agents: BTreeMap<String, Arc<ManagedAgent>>,
     shutdown_requested: AtomicBool,
@@ -168,6 +195,7 @@ impl NativeSession {
             created_at_epoch_ms: self.created_at_epoch_ms,
             working_directory: self.working_directory.clone(),
             shell_command: self.shell_command.clone(),
+            context: self.context.clone(),
             agents: self
                 .agents
                 .values()
@@ -332,6 +360,7 @@ pub fn spawn_native_session(
     agents: usize,
     working_dir: Option<&str>,
     shell_command: &str,
+    context: Option<RuntimeContextMetadata>,
 ) -> anyhow::Result<()> {
     ensure!(
         !namespace.trim().is_empty(),
@@ -344,6 +373,7 @@ pub fn spawn_native_session(
         agents,
         working_directory: working_dir.map(ToOwned::to_owned),
         shell_command: shell_command.to_string(),
+        context,
         initial_rows: current_attach_viewport().map(|viewport| viewport.content_rows),
         initial_cols: current_attach_viewport().map(|viewport| viewport.cols),
         created_at_epoch_ms: now_epoch_ms()?,
@@ -420,6 +450,7 @@ pub fn serve_native_session(manifest_path: PathBuf) -> anyhow::Result<()> {
         created_at_epoch_ms: manifest.created_at_epoch_ms,
         working_directory: manifest.working_directory,
         shell_command: manifest.shell_command,
+        context: manifest.context,
         session_dir: session_dir.clone(),
         agents,
         shutdown_requested: AtomicBool::new(false),
@@ -455,79 +486,6 @@ pub fn serve_native_session(manifest_path: PathBuf) -> anyhow::Result<()> {
     }
 
     session.shutdown();
-    Ok(())
-}
-
-pub fn list_native_sessions(namespace: Option<&str>) -> anyhow::Result<()> {
-    if let Some(namespace) = namespace {
-        let metadata = native_session_metadata(namespace)?
-            .ok_or_else(|| anyhow!("native session '{}' does not exist", namespace))?;
-        println!("Native namespace '{}':", metadata.namespace);
-        for agent in metadata.agents {
-            println!(
-                " - {} pid={} running={}",
-                agent.name, agent.pid, agent.running
-            );
-        }
-        return Ok(());
-    }
-
-    let sessions_dir = native_root()?.join(SESSION_DIR_NAME);
-    if !sessions_dir.exists() {
-        println!("NAMESPACES:\n(none)");
-        println!("AGENTS:\n(none)");
-        return Ok(());
-    }
-
-    let sessions = collect_native_sessions()?;
-
-    if sessions.is_empty() {
-        println!("NAMESPACES:\n(none)");
-        println!("AGENTS:\n(none)");
-        return Ok(());
-    }
-
-    println!("NAMESPACES:");
-    for session in &sessions {
-        println!(
-            "{}: {} agents (created {}) [native]",
-            session.namespace,
-            session.agents.len(),
-            session.created_at_epoch_ms
-        );
-    }
-
-    println!("\nAGENTS:");
-    for session in &sessions {
-        for agent in &session.agents {
-            println!(
-                "{} {} pid={} running={}",
-                session.namespace, agent.name, agent.pid, agent.running
-            );
-        }
-    }
-
-    Ok(())
-}
-
-pub fn print_native_sessions_json(namespace: Option<&str>) -> anyhow::Result<()> {
-    if let Some(namespace) = namespace {
-        let metadata = native_session_metadata(namespace)?
-            .ok_or_else(|| anyhow!("native session '{}' does not exist", namespace))?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&metadata)
-                .context("failed to encode native session metadata as JSON")?
-        );
-        return Ok(());
-    }
-
-    let sessions = collect_native_sessions()?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&sessions)
-            .context("failed to encode native sessions as JSON")?
-    );
     Ok(())
 }
 
