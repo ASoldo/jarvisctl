@@ -339,7 +339,7 @@ impl CodexAppSession {
                         .or_default();
                     current.push_str(delta);
                     let context = state.metadata.context.get_or_insert_with(Default::default);
-                    let rendered = truncate_line(current, 240);
+                    let rendered = truncate_block(current, 640);
                     context.live_message = Some(rendered.clone());
                     context.last_activity = Some("assistant streaming".to_string());
                     preview = Some(rendered);
@@ -384,7 +384,7 @@ impl CodexAppSession {
                             title: "Command output".to_string(),
                             timestamp_epoch_ms: now_epoch_ms(),
                             actor: Some("agent0".to_string()),
-                            detail: Some(truncate_line(current, 220)),
+                            detail: Some(truncate_block(current, 1200)),
                             status: Some("inProgress".to_string()),
                         },
                     );
@@ -544,7 +544,7 @@ impl CodexAppSession {
                     state.active_agent_messages.remove(&item_id);
                     let context = state.metadata.context.get_or_insert_with(Default::default);
                     if !text.is_empty() {
-                        context.live_message = Some(truncate_line(text, 240));
+                        context.live_message = Some(truncate_block(text, 720));
                     }
                     context.last_activity = Some("assistant message completed".to_string());
                     upsert_recent_event(
@@ -555,7 +555,7 @@ impl CodexAppSession {
                             title: "Assistant response".to_string(),
                             timestamp_epoch_ms: now_epoch_ms(),
                             actor: Some("agent0".to_string()),
-                            detail: (!text.is_empty()).then(|| truncate_line(text, 260)),
+                            detail: (!text.is_empty()).then(|| truncate_block(text, 4096)),
                             status: Some("completed".to_string()),
                         },
                     );
@@ -591,7 +591,7 @@ impl CodexAppSession {
                             title: "Command completed".to_string(),
                             timestamp_epoch_ms: now_epoch_ms(),
                             actor: Some("agent0".to_string()),
-                            detail: Some(truncate_line(command, 200)),
+                            detail: Some(truncate_line(command, 420)),
                             status: Some(status.to_string()),
                         },
                     );
@@ -616,7 +616,7 @@ impl CodexAppSession {
                             title: "Plan updated".to_string(),
                             timestamp_epoch_ms: now_epoch_ms(),
                             actor: Some("agent0".to_string()),
-                            detail: (!text.is_empty()).then(|| truncate_line(text, 220)),
+                            detail: (!text.is_empty()).then(|| truncate_block(text, 2400)),
                             status: Some("completed".to_string()),
                         },
                     );
@@ -655,7 +655,7 @@ impl CodexAppSession {
                     title: "Runtime error".to_string(),
                     timestamp_epoch_ms: now_epoch_ms(),
                     actor: Some("jarvisctl".to_string()),
-                    detail: Some(truncate_line(message, 260)),
+                    detail: Some(truncate_block(message, 2400)),
                     status: Some("failed".to_string()),
                 },
             );
@@ -775,7 +775,7 @@ impl CodexAppSession {
                 format!("operator:{}", now_epoch_ms()),
                 "operator",
                 "Operator steer",
-                Some(truncate_line(text.trim(), 220)),
+                Some(truncate_block(text.trim(), 2400)),
                 Some("inProgress".to_string()),
                 Some("operator".to_string()),
             )?;
@@ -795,7 +795,7 @@ impl CodexAppSession {
                 format!("operator:{}", now_epoch_ms()),
                 "operator",
                 "Operator follow-up",
-                Some(truncate_line(text.trim(), 220)),
+                Some(truncate_block(text.trim(), 2400)),
                 Some("queued".to_string()),
                 Some("operator".to_string()),
             )?;
@@ -962,7 +962,7 @@ pub fn serve_codex_app_session(manifest_path: PathBuf) -> anyhow::Result<()> {
                 title: "Session launching".to_string(),
                 timestamp_epoch_ms: now_epoch_ms(),
                 actor: Some("jarvisctl".to_string()),
-                detail: Some(truncate_line(&manifest.startup_prompt, 220)),
+                detail: Some(truncate_block(&manifest.startup_prompt, 2400)),
                 status: Some("launching".to_string()),
             }],
             ..manifest.context.clone()
@@ -1585,6 +1585,19 @@ fn truncate_line(raw: &str, limit: usize) -> String {
     rendered
 }
 
+fn truncate_block(raw: &str, limit: usize) -> String {
+    let normalized = raw.trim().to_string();
+    if normalized.chars().count() <= limit {
+        return normalized;
+    }
+    let mut rendered = normalized
+        .chars()
+        .take(limit.saturating_sub(1))
+        .collect::<String>();
+    rendered.push('…');
+    rendered
+}
+
 fn now_epoch_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1751,7 +1764,7 @@ fn build_subagent_action(
         timestamp_epoch_ms,
         detail: latest_message
             .map(ToOwned::to_owned)
-            .or_else(|| prompt_preview.map(|value| truncate_line(value, 220))),
+            .or_else(|| prompt_preview.map(|value| truncate_block(value, 2400))),
         status: Some(status.to_string()),
     }
 }
@@ -1785,7 +1798,7 @@ fn build_subagent_event(item: &Value, default_title: &str) -> RuntimeFeedEntry {
     let detail = build_subagent_state_summary(item).or_else(|| {
         item.get("prompt")
             .and_then(Value::as_str)
-            .map(|value| truncate_line(value, 220))
+            .map(|value| truncate_block(value, 2400))
     });
     RuntimeFeedEntry {
         id: format!(
