@@ -14,7 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CodexRuntimeDriver {
     CliPty,
     AppServer,
@@ -34,6 +35,9 @@ pub struct CodexLaunchOptions {
     pub prompt_file: Option<PathBuf>,
     pub operator_message: Option<String>,
     pub images: Vec<PathBuf>,
+    pub environment: BTreeMap<String, String>,
+    pub context_overlay: RuntimeContextMetadata,
+    pub extra_runtime_args: Vec<String>,
     pub startup_delay_ms: u64,
     pub command: Vec<String>,
 }
@@ -109,13 +113,18 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
     let command = match options.driver {
         CodexRuntimeDriver::CliPty => {
             let mut runtime_args_with_images = runtime_args.clone();
+            runtime_args_with_images.extend(options.extra_runtime_args.clone());
             runtime_args_with_images.extend(codex_image_args(&options.images)?);
             let base_command = build_base_command(&options.command, resume_session_id.as_deref());
-            with_codex_runtime_args(base_command, &runtime_args_with_images)
+            let command = with_codex_runtime_args(base_command, &runtime_args_with_images);
+            with_environment(command, &options.environment)
         }
         CodexRuntimeDriver::AppServer => {
+            let mut runtime_args_with_extras = runtime_args.clone();
+            runtime_args_with_extras.extend(options.extra_runtime_args.clone());
             let base_command = build_app_server_command(&options.command);
-            with_codex_runtime_args(base_command, &runtime_args)
+            let command = with_codex_runtime_args(base_command, &runtime_args_with_extras);
+            with_environment(command, &options.environment)
         }
     };
     let prompt = build_codex_prompt(
@@ -150,31 +159,40 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
 
     ensure_project_trusted(&repo_path)?;
 
-    let runtime_context = RuntimeContextMetadata {
-        workload: Some("codex".to_string()),
-        task_id: Some(ticket.effective_id()),
-        task_title: Some(ticket.title.clone()),
-        task_note: Some(ticket.path.display().to_string()),
-        launch_mode: Some(if resume_session_id.is_some() {
-            "resume".to_string()
-        } else {
-            "fresh".to_string()
-        }),
-        codex_session_id: resume_session_id.clone(),
-        prompt_file: Some(prompt_path.display().to_string()),
-        record_file: Some(record_path.display().to_string()),
-        transcript_path: None,
-        event_log_path: None,
-        thread_id: None,
-        thread_status: None,
-        turn_id: None,
-        turn_status: None,
-        live_message: None,
-        last_activity: None,
-        last_error: None,
-        recent_events: Vec::new(),
-        subagents: Vec::new(),
-    };
+    let runtime_context = merge_runtime_context(
+        RuntimeContextMetadata {
+            workload: Some("codex".to_string()),
+            task_id: Some(ticket.effective_id()),
+            task_title: Some(ticket.title.clone()),
+            task_note: Some(ticket.path.display().to_string()),
+            launch_mode: Some(if resume_session_id.is_some() {
+                "resume".to_string()
+            } else {
+                "fresh".to_string()
+            }),
+            codex_session_id: resume_session_id.clone(),
+            prompt_file: Some(prompt_path.display().to_string()),
+            record_file: Some(record_path.display().to_string()),
+            transcript_path: None,
+            event_log_path: None,
+            thread_id: None,
+            thread_status: None,
+            turn_id: None,
+            turn_status: None,
+            live_message: None,
+            last_activity: None,
+            last_error: None,
+            control_namespace: None,
+            deployment: None,
+            labels: BTreeMap::new(),
+            config_maps: Vec::new(),
+            secrets: Vec::new(),
+            volumes: Vec::new(),
+            recent_events: Vec::new(),
+            subagents: Vec::new(),
+        },
+        options.context_overlay.clone(),
+    );
     let (runtime_backend, codex_session_id) = match options.driver {
         CodexRuntimeDriver::CliPty => {
             let mut launch_command = if launches_codex(&command) {
@@ -226,6 +244,7 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
                     .iter()
                     .map(|image| image.display().to_string())
                     .collect(),
+                environment: options.environment.clone(),
                 resume_session_id: resume_session_id.clone(),
                 created_at_epoch_ms: timestamp_ms,
                 context: runtime_context.clone(),
@@ -424,6 +443,101 @@ fn with_codex_runtime_args(command: Vec<String>, runtime_args: &[String]) -> Vec
     let mut combined = command;
     combined.splice(insert_index..insert_index, runtime_args.iter().cloned());
     combined
+}
+
+fn with_environment(command: Vec<String>, environment: &BTreeMap<String, String>) -> Vec<String> {
+    if environment.is_empty() {
+        return command;
+    }
+
+    let mut wrapped = vec!["env".to_string()];
+    for (key, value) in environment {
+        wrapped.push(format!("{}={}", key, value));
+    }
+    wrapped.extend(command);
+    wrapped
+}
+
+fn merge_runtime_context(
+    mut base: RuntimeContextMetadata,
+    overlay: RuntimeContextMetadata,
+) -> RuntimeContextMetadata {
+    if overlay.workload.is_some() {
+        base.workload = overlay.workload;
+    }
+    if overlay.task_id.is_some() {
+        base.task_id = overlay.task_id;
+    }
+    if overlay.task_title.is_some() {
+        base.task_title = overlay.task_title;
+    }
+    if overlay.task_note.is_some() {
+        base.task_note = overlay.task_note;
+    }
+    if overlay.launch_mode.is_some() {
+        base.launch_mode = overlay.launch_mode;
+    }
+    if overlay.codex_session_id.is_some() {
+        base.codex_session_id = overlay.codex_session_id;
+    }
+    if overlay.prompt_file.is_some() {
+        base.prompt_file = overlay.prompt_file;
+    }
+    if overlay.record_file.is_some() {
+        base.record_file = overlay.record_file;
+    }
+    if overlay.transcript_path.is_some() {
+        base.transcript_path = overlay.transcript_path;
+    }
+    if overlay.event_log_path.is_some() {
+        base.event_log_path = overlay.event_log_path;
+    }
+    if overlay.thread_id.is_some() {
+        base.thread_id = overlay.thread_id;
+    }
+    if overlay.thread_status.is_some() {
+        base.thread_status = overlay.thread_status;
+    }
+    if overlay.turn_id.is_some() {
+        base.turn_id = overlay.turn_id;
+    }
+    if overlay.turn_status.is_some() {
+        base.turn_status = overlay.turn_status;
+    }
+    if overlay.live_message.is_some() {
+        base.live_message = overlay.live_message;
+    }
+    if overlay.last_activity.is_some() {
+        base.last_activity = overlay.last_activity;
+    }
+    if overlay.last_error.is_some() {
+        base.last_error = overlay.last_error;
+    }
+    if overlay.control_namespace.is_some() {
+        base.control_namespace = overlay.control_namespace;
+    }
+    if overlay.deployment.is_some() {
+        base.deployment = overlay.deployment;
+    }
+    if !overlay.labels.is_empty() {
+        base.labels.extend(overlay.labels);
+    }
+    if !overlay.config_maps.is_empty() {
+        base.config_maps = overlay.config_maps;
+    }
+    if !overlay.secrets.is_empty() {
+        base.secrets = overlay.secrets;
+    }
+    if !overlay.volumes.is_empty() {
+        base.volumes = overlay.volumes;
+    }
+    if !overlay.recent_events.is_empty() {
+        base.recent_events = overlay.recent_events;
+    }
+    if !overlay.subagents.is_empty() {
+        base.subagents = overlay.subagents;
+    }
+    base
 }
 
 fn launches_codex(command: &[String]) -> bool {

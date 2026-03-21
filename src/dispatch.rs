@@ -8,7 +8,8 @@ use crate::codex_app::{
     codex_app_session_metadata, delete_codex_app_session, interrupt_codex_app, tell_codex_app,
 };
 use crate::native::{
-    delete_native_session, interrupt_native, native_session_metadata, tell_native,
+    RuntimeContextMetadata, delete_native_session, interrupt_native, native_session_metadata,
+    tell_native,
 };
 use crate::ticket::TicketNote;
 use anyhow::{Context, anyhow};
@@ -314,6 +315,9 @@ fn handle_ready_transition(
         prompt_file: None,
         operator_message: None,
         images: Vec::new(),
+        environment: Default::default(),
+        context_overlay: RuntimeContextMetadata::default(),
+        extra_runtime_args: Vec::new(),
         startup_delay_ms: options.startup_delay_ms,
         command: options.command.clone(),
     })?;

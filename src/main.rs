@@ -10,7 +10,7 @@
 //! - Delete/List: manage native sessions
 
 use clap::{Parser, Subcommand, ValueEnum, ValueHint};
-use std::{ffi::OsStr, path::PathBuf, process::ExitCode};
+use std::{env, ffi::OsStr, path::PathBuf, process::ExitCode};
 use sysinfo::{Pid, System};
 use thiserror::Error;
 use tracing::{error, info, instrument};
@@ -21,6 +21,7 @@ mod agent;
 mod board;
 mod codex;
 mod codex_app;
+mod control_plane;
 mod dispatch;
 mod native;
 mod ticket;
@@ -29,8 +30,14 @@ mod tui;
 use agent::spawn_agent;
 use codex::{CodexLaunchOptions, CodexRuntimeDriver, enrich_native_sessions, launch_codex_ticket};
 use codex_app::{
-    attach_codex_app, codex_app_session_metadata, collect_codex_app_sessions,
-    delete_codex_app_session, interrupt_codex_app, serve_codex_app_session, tell_codex_app,
+    CodexAppInputMode, attach_codex_app, codex_app_session_metadata, collect_codex_app_sessions,
+    delete_codex_app_session, interrupt_codex_app, serve_codex_app_session,
+    tell_codex_app_with_mode,
+};
+use control_plane::{
+    ControlPlaneOutput, ControlPlaneResourceKindArg, apply_manifests, authorize_runtime_message,
+    render_describe_output, render_get_output, resolve_service_target,
+    resolve_service_target_for_message,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use native::{
@@ -232,6 +239,35 @@ enum Command {
         command: Vec<String>,
     },
 
+    /// Apply declarative control-plane resources from YAML manifests
+    Apply {
+        #[arg(short = 'f', long = "file", required = true, value_hint = ValueHint::FilePath)]
+        file: Vec<PathBuf>,
+    },
+
+    /// Get declarative control-plane resources
+    Get {
+        kind: ControlPlaneResourceKindArg,
+
+        #[arg(short = 'n', long = "resource-namespace")]
+        resource_namespace: Option<String>,
+
+        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Describe a declarative control-plane resource
+    Describe {
+        kind: ControlPlaneResourceKindArg,
+        name: String,
+
+        #[arg(short = 'n', long = "resource-namespace")]
+        resource_namespace: Option<String>,
+
+        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Yaml)]
+        output: ControlPlaneOutput,
+    },
+
     /// Open a ratatui session dashboard
     Dashboard {
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
@@ -246,8 +282,18 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
         backend: SessionBackend,
 
-        #[arg(long)]
-        namespace: String,
+        #[arg(long, required_unless_present = "service", conflicts_with = "service")]
+        namespace: Option<String>,
+
+        #[arg(
+            long,
+            required_unless_present = "namespace",
+            conflicts_with = "namespace"
+        )]
+        service: Option<String>,
+
+        #[arg(short = 'n', long = "resource-namespace", requires = "service")]
+        resource_namespace: Option<String>,
     },
 
     /// Kill a namespace
@@ -276,10 +322,20 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
         backend: SessionBackend,
 
-        #[arg(long)]
-        namespace: String,
+        #[arg(long, required_unless_present = "service", conflicts_with = "service")]
+        namespace: Option<String>,
 
-        #[arg(long)]
+        #[arg(
+            long,
+            required_unless_present = "namespace",
+            conflicts_with = "namespace"
+        )]
+        service: Option<String>,
+
+        #[arg(short = 'n', long = "resource-namespace", requires = "service")]
+        resource_namespace: Option<String>,
+
+        #[arg(long, default_value = "agent0")]
         agent: String,
     },
 
@@ -288,9 +344,17 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
         backend: SessionBackend,
 
-        #[arg(long)]
-        namespace: String,
-        #[arg(long)]
+        #[arg(long, required_unless_present = "service", conflicts_with = "service")]
+        namespace: Option<String>,
+        #[arg(
+            long,
+            required_unless_present = "namespace",
+            conflicts_with = "namespace"
+        )]
+        service: Option<String>,
+        #[arg(short = 'n', long = "resource-namespace", requires = "service")]
+        resource_namespace: Option<String>,
+        #[arg(long, default_value = "agent0")]
         agent: String,
         #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "text")]
         file: Option<String>,
@@ -298,6 +362,8 @@ enum Command {
         text: Option<String>,
         #[arg(long, default_value_t = false)]
         no_enter: bool,
+        #[arg(long, value_enum, default_value_t = CodexAppInputMode::Auto)]
+        mode: CodexAppInputMode,
     },
 
     /// Send Ctrl+C to a running agent
@@ -305,8 +371,18 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
         backend: SessionBackend,
 
-        #[arg(long)]
-        namespace: String,
+        #[arg(long, required_unless_present = "service", conflicts_with = "service")]
+        namespace: Option<String>,
+
+        #[arg(
+            long,
+            required_unless_present = "namespace",
+            conflicts_with = "namespace"
+        )]
+        service: Option<String>,
+
+        #[arg(short = 'n', long = "resource-namespace", requires = "service")]
+        resource_namespace: Option<String>,
 
         #[arg(long, default_value = "agent0")]
         agent: String,
@@ -408,6 +484,9 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             prompt_file,
             operator_message: message,
             images: image,
+            environment: Default::default(),
+            context_overlay: RuntimeContextMetadata::default(),
+            extra_runtime_args: Vec::new(),
             startup_delay_ms,
             command,
         }),
@@ -439,12 +518,37 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             command,
         })
         .map_err(JarvisError::from),
+        Command::Apply { file } => apply_resources(&file),
+        Command::Get {
+            kind,
+            resource_namespace,
+            output,
+        } => get_resources(kind, resource_namespace.as_deref(), output),
+        Command::Describe {
+            kind,
+            name,
+            resource_namespace,
+            output,
+        } => describe_resource(kind, &name, resource_namespace.as_deref(), output),
         Command::Dashboard {
             backend,
             refresh_ms,
         } => run_dashboard(backend, refresh_ms).map_err(JarvisError::from),
 
-        Command::Attach { backend, namespace } => attach_session(backend, &namespace),
+        Command::Attach {
+            backend,
+            namespace,
+            service,
+            resource_namespace,
+        } => attach_session(
+            backend,
+            resolve_runtime_namespace(
+                namespace.as_deref(),
+                service.as_deref(),
+                resource_namespace.as_deref(),
+            )?
+            .as_str(),
+        ),
         Command::Delete { backend, namespace } => delete_session(backend, &namespace),
         Command::List {
             backend,
@@ -454,28 +558,57 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         Command::Exec {
             backend,
             namespace,
+            service,
+            resource_namespace,
             agent,
-        } => exec_agent(backend, &namespace, &agent),
+        } => {
+            let namespace = resolve_runtime_namespace(
+                namespace.as_deref(),
+                service.as_deref(),
+                resource_namespace.as_deref(),
+            )?;
+            exec_agent(backend, &namespace, &agent)
+        }
         Command::Tell {
             backend,
             namespace,
+            service,
+            resource_namespace,
             agent,
             file,
             text,
             no_enter,
-        } => tell(
-            backend,
-            &namespace,
-            &agent,
-            file.as_deref(),
-            text.as_deref(),
-            !no_enter,
-        ),
+            mode,
+        } => {
+            let namespace = resolve_tell_runtime_namespace(
+                namespace.as_deref(),
+                service.as_deref(),
+                resource_namespace.as_deref(),
+            )?;
+            tell(
+                backend,
+                &namespace,
+                &agent,
+                file.as_deref(),
+                text.as_deref(),
+                !no_enter,
+                mode,
+            )
+        }
         Command::Interrupt {
             backend,
             namespace,
+            service,
+            resource_namespace,
             agent,
-        } => interrupt_agent(backend, &namespace, &agent),
+        } => {
+            let namespace = resolve_runtime_namespace(
+                namespace.as_deref(),
+                service.as_deref(),
+                resource_namespace.as_deref(),
+            )?;
+            interrupt_agent(backend, &namespace, &agent)
+        }
         Command::NativeSessionServe { manifest } => {
             serve_native_session(manifest).map_err(JarvisError::from)
         }
@@ -564,6 +697,101 @@ pub(crate) fn run_session_shell_with_context(
         namespace, agents
     );
     Ok(())
+}
+
+fn apply_resources(files: &[PathBuf]) -> Result<(), JarvisError> {
+    for message in apply_manifests(files).map_err(JarvisError::from)? {
+        println!("{}", message);
+    }
+    Ok(())
+}
+
+fn get_resources(
+    kind: ControlPlaneResourceKindArg,
+    resource_namespace: Option<&str>,
+    output: ControlPlaneOutput,
+) -> Result<(), JarvisError> {
+    println!(
+        "{}",
+        render_get_output(kind, resource_namespace, output).map_err(JarvisError::from)?
+    );
+    Ok(())
+}
+
+fn describe_resource(
+    kind: ControlPlaneResourceKindArg,
+    name: &str,
+    resource_namespace: Option<&str>,
+    output: ControlPlaneOutput,
+) -> Result<(), JarvisError> {
+    println!(
+        "{}",
+        render_describe_output(kind, name, resource_namespace, output)
+            .map_err(JarvisError::from)?
+    );
+    Ok(())
+}
+
+fn resolve_runtime_namespace(
+    namespace: Option<&str>,
+    service: Option<&str>,
+    resource_namespace: Option<&str>,
+) -> Result<String, JarvisError> {
+    let effective_resource_namespace = infer_resource_namespace(resource_namespace);
+    match (namespace, service) {
+        (Some(namespace), None) => Ok(namespace.to_string()),
+        (None, Some(service)) => Ok(resolve_service_target(
+            service,
+            effective_resource_namespace.as_deref(),
+        )
+        .map_err(JarvisError::from)?
+        .runtime_namespace),
+        _ => Err(JarvisError::Other(anyhow::anyhow!(
+            "provide either --namespace or --service"
+        ))),
+    }
+}
+
+fn resolve_tell_runtime_namespace(
+    namespace: Option<&str>,
+    service: Option<&str>,
+    resource_namespace: Option<&str>,
+) -> Result<String, JarvisError> {
+    let source_runtime_namespace = current_runtime_namespace_from_env();
+    let effective_resource_namespace = infer_resource_namespace(resource_namespace);
+
+    match (namespace, service) {
+        (Some(namespace), None) => {
+            authorize_runtime_message(source_runtime_namespace.as_deref(), namespace)
+                .map_err(JarvisError::from)?;
+            Ok(namespace.to_string())
+        }
+        (None, Some(service)) => Ok(resolve_service_target_for_message(
+            service,
+            effective_resource_namespace.as_deref(),
+            source_runtime_namespace.as_deref(),
+        )
+        .map_err(JarvisError::from)?
+        .runtime_namespace),
+        _ => Err(JarvisError::Other(anyhow::anyhow!(
+            "provide either --namespace or --service"
+        ))),
+    }
+}
+
+fn infer_resource_namespace(resource_namespace: Option<&str>) -> Option<String> {
+    resource_namespace
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| env::var("JARVIS_CONTROL_NAMESPACE").ok())
+}
+
+fn current_runtime_namespace_from_env() -> Option<String> {
+    env::var("JARVIS_RUNTIME_NAMESPACE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn collect_runtime_sessions() -> Result<Vec<NativeSessionMetadata>, JarvisError> {
@@ -686,6 +914,7 @@ fn tell(
     file: Option<&str>,
     text: Option<&str>,
     press_enter: bool,
+    mode: CodexAppInputMode,
 ) -> Result<(), JarvisError> {
     let contents = match (file, text.map(str::trim).filter(|value| !value.is_empty())) {
         (Some(file), None) => std::fs::read_to_string(file)?,
@@ -715,7 +944,7 @@ fn tell(
                     "codex app sessions expose a single logical agent named agent0"
                 )));
             }
-            tell_codex_app(namespace, &contents).map_err(JarvisError::from)?;
+            tell_codex_app_with_mode(namespace, &contents, mode).map_err(JarvisError::from)?;
         }
         _ => {
             tell_native(namespace, agent, &contents, press_enter).map_err(JarvisError::from)?;

@@ -166,6 +166,18 @@ pub struct RuntimeContextMetadata {
     pub last_activity: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_maps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_events: Vec<RuntimeFeedEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

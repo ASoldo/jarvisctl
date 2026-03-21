@@ -190,6 +190,14 @@ jarvisctl exec --namespace botfarm --agent agent0
 jarvisctl tell --namespace botfarm --agent agent0 --file prompt.md 
 ```
 
+For Codex app-server sessions, `tell` also accepts `--mode auto|steer|queue`.
+`auto` keeps the existing behavior and steers the active turn when one is running.
+`queue` starts a follow-up turn without clobbering the current active turn pointer, which covers the queued follow-up workflow added in newer Codex builds.
+
+```bash
+jarvisctl tell --namespace codex-ticket-123 --agent agent0 --text "After this, audit the tests too." --mode queue
+```
+
 Interrupt a stuck agent:
 
 ```bash

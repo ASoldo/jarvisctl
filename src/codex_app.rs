@@ -6,6 +6,7 @@ use crate::tui::view_agent;
 use anyhow::{Context, anyhow, bail, ensure};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -13,7 +14,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -25,10 +26,14 @@ const MANIFEST_DIR_NAME: &str = "manifests";
 const SOCKET_FILE_NAME: &str = "control.sock";
 const METADATA_FILE_NAME: &str = "metadata.json";
 const EVENTS_FILE_NAME: &str = "events.log";
+const CONTROL_QUEUE_DIR_NAME: &str = ".jarvisctl-control-queue";
+const CONTROL_QUEUE_REQUESTS_DIR_NAME: &str = "requests";
+const CONTROL_QUEUE_RESPONSES_DIR_NAME: &str = "responses";
 const LOG_LIMIT_BYTES: usize = 512 * 1024;
 const FEED_LIMIT: usize = 18;
 const SUBAGENT_LIMIT: usize = 24;
 const SUBAGENT_ACTION_LIMIT: usize = 6;
+static CONTROL_QUEUE_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexAppLaunchManifest {
@@ -37,17 +42,33 @@ pub struct CodexAppLaunchManifest {
     pub shell_command: String,
     pub startup_prompt: String,
     pub images: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
     pub resume_session_id: Option<String>,
     pub created_at_epoch_ms: u128,
     pub context: RuntimeContextMetadata,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAppInputMode {
+    #[default]
+    Auto,
+    Steer,
+    Queue,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 enum ClientMessage {
     Metadata,
-    Attach { agent: String },
-    SendText { text: String },
+    Attach {
+        agent: String,
+    },
+    SendText {
+        text: String,
+        mode: CodexAppInputMode,
+    },
     Interrupt,
     KillSession,
 }
@@ -61,6 +82,18 @@ enum ServerMessage {
     Attached { namespace: String, agent: String },
     Output { data_base64: String },
     Exited { agent: String },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ControlQueueRequestEnvelope {
+    id: String,
+    created_at_epoch_ms: u128,
+    message: ClientMessage,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ControlQueueResponseEnvelope {
+    message: ServerMessage,
 }
 
 struct AppSessionState {
@@ -663,6 +696,14 @@ impl CodexAppSession {
         self.append_text_line(format!("[error] {}", message))
     }
 
+    fn clear_last_error(&self) -> anyhow::Result<()> {
+        self.mutate_state(|state| {
+            if let Some(context) = state.metadata.context.as_mut() {
+                context.last_error = None;
+            }
+        })
+    }
+
     fn initialize_and_start(&self, manifest: &CodexAppLaunchManifest) -> anyhow::Result<()> {
         let _ = self.call(
             "initialize",
@@ -734,10 +775,14 @@ impl CodexAppSession {
             },
             thread_id
         ))?;
+        thread::sleep(Duration::from_millis(750));
+        if let Err(error) = self.record_apps_runtime_status() {
+            let _ = self.record_error(&format!("failed to inspect apps MCP status: {}", error));
+        }
         Ok(())
     }
 
-    fn send_operator_message(&self, text: &str) -> anyhow::Result<()> {
+    fn send_operator_message(&self, text: &str, mode: CodexAppInputMode) -> anyhow::Result<()> {
         let (thread_id, turn_id, active) = {
             let metadata = self.metadata();
             let context = metadata
@@ -756,20 +801,43 @@ impl CodexAppSession {
         };
 
         let input = build_text_input(text);
-        if active {
+        if active && mode != CodexAppInputMode::Queue {
             let expected_turn_id =
                 turn_id.ok_or_else(|| anyhow!("codex app session has no active turn id"))?;
-            let response = self.call(
+            let response = match self.call(
                 "turn/steer",
                 json!({
                     "threadId": thread_id,
                     "expectedTurnId": expected_turn_id,
-                    "input": input,
+                    "input": input.clone(),
                 }),
-            )?;
+            ) {
+                Ok(response) => response,
+                Err(error) => {
+                    let Some(found_turn_id) = extract_found_active_turn_id(&error.to_string())
+                    else {
+                        return Err(error);
+                    };
+                    self.mutate_state(|state| {
+                        let context = state.metadata.context.get_or_insert_with(Default::default);
+                        context.turn_id = Some(found_turn_id.clone());
+                        context.turn_status = Some("inProgress".to_string());
+                        context.last_activity = Some("turn inProgress".to_string());
+                    })?;
+                    self.call(
+                        "turn/steer",
+                        json!({
+                            "threadId": thread_id,
+                            "expectedTurnId": found_turn_id,
+                            "input": input.clone(),
+                        }),
+                    )?
+                }
+            };
             if let Some(turn) = response.get("turn") {
                 self.apply_turn(turn)?;
             }
+            self.clear_last_error()?;
             self.append_text_line(format!("[operator] steer: {}", text.trim()))?;
             self.upsert_runtime_event(
                 format!("operator:{}", now_epoch_ms()),
@@ -787,19 +855,100 @@ impl CodexAppSession {
                     "input": input,
                 }),
             )?;
-            if let Some(turn) = response.get("turn") {
-                self.apply_turn(turn)?;
+            let turn = response.get("turn");
+            if !active {
+                if let Some(turn) = turn {
+                    self.apply_turn(turn)?;
+                }
+                self.clear_last_error()?;
+                let turn_status = turn
+                    .and_then(|value| value.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("inProgress")
+                    .to_string();
+                self.append_text_line(format!("[operator] new turn: {}", text.trim()))?;
+                self.upsert_runtime_event(
+                    format!("operator:{}", now_epoch_ms()),
+                    "operator",
+                    "Operator follow-up",
+                    Some(truncate_block(text.trim(), 2400)),
+                    Some(turn_status),
+                    Some("operator".to_string()),
+                )?;
+                return Ok(());
             }
-            self.append_text_line(format!("[operator] new turn: {}", text.trim()))?;
+
+            let queued_turn_id = turn
+                .and_then(|value| value.get("id"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let detail = match queued_turn_id.as_deref() {
+                Some(turn_id) => format!(
+                    "turn {} · {}",
+                    short_thread_id(turn_id),
+                    truncate_block(text.trim(), 2300)
+                ),
+                None => truncate_block(text.trim(), 2400),
+            };
+            self.append_text_line(format!("[operator] queued: {}", text.trim()))?;
+            self.mutate_state(|state| {
+                let context = state.metadata.context.get_or_insert_with(Default::default);
+                context.last_error = None;
+                context.last_activity = Some(match queued_turn_id.as_deref() {
+                    Some(turn_id) => format!("queued follow-up {}", short_thread_id(turn_id)),
+                    None => "queued follow-up".to_string(),
+                });
+            })?;
             self.upsert_runtime_event(
-                format!("operator:{}", now_epoch_ms()),
+                format!("operator-queued:{}", now_epoch_ms()),
                 "operator",
-                "Operator follow-up",
-                Some(truncate_block(text.trim(), 2400)),
+                "Operator follow-up queued",
+                Some(detail),
                 Some("queued".to_string()),
                 Some("operator".to_string()),
             )?;
         }
+        Ok(())
+    }
+
+    fn record_apps_runtime_status(&self) -> anyhow::Result<()> {
+        if !codex_apps_probe_enabled(&self.metadata().shell_command) {
+            return Ok(());
+        }
+        let response = self.call("mcpServerStatus/list", json!({}))?;
+        let Some(servers) = response.get("data").and_then(Value::as_array) else {
+            return Ok(());
+        };
+        let Some(codex_apps) = servers
+            .iter()
+            .find(|server| server.get("name").and_then(Value::as_str) == Some("codex_apps"))
+        else {
+            self.record_error(
+                "codex_apps is enabled in Codex but was missing from mcpServerStatus/list after startup",
+            )?;
+            self.upsert_runtime_event(
+                format!("mcp:{}", now_epoch_ms()),
+                "mcp",
+                "Apps MCP unavailable",
+                Some(
+                    "The built-in codex_apps server was not available after startup. This matches the intermittent ChatGPT apps handshake failures seen in Codex 0.116.0.".to_string(),
+                ),
+                Some("failed".to_string()),
+                Some("codex_apps".to_string()),
+            )?;
+            return Ok(());
+        };
+
+        let auth_status = codex_apps
+            .get("authStatus")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        self.mutate_state(|state| {
+            let context = state.metadata.context.get_or_insert_with(Default::default);
+            if auth_status == "unauthenticated" {
+                context.last_activity = Some("apps auth unavailable".to_string());
+            }
+        })?;
         Ok(())
     }
 
@@ -905,6 +1054,7 @@ pub fn serve_codex_app_session(manifest_path: PathBuf) -> anyhow::Result<()> {
         .join(sanitize_namespace(&manifest.namespace));
     fs::create_dir_all(&session_dir)
         .with_context(|| format!("failed to create '{}'", session_dir.display()))?;
+    ensure_control_queue_dirs(&manifest.namespace, manifest.working_directory.as_deref())?;
     let socket_path = session_dir.join(SOCKET_FILE_NAME);
     if socket_path.exists() {
         let _ = fs::remove_file(&socket_path);
@@ -921,6 +1071,7 @@ pub fn serve_codex_app_session(manifest_path: PathBuf) -> anyhow::Result<()> {
     command.stdin(Stdio::piped());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+    command.envs(&manifest.environment);
     if let Some(dir) = manifest.working_directory.as_deref() {
         command.current_dir(dir);
     }
@@ -1094,6 +1245,7 @@ pub fn serve_codex_app_session(manifest_path: PathBuf) -> anyhow::Result<()> {
     });
 
     while !session.shutdown_requested.load(Ordering::SeqCst) {
+        let _ = drain_control_queue(&session);
         match listener.accept() {
             Ok((stream, _)) => {
                 let session = Arc::clone(&session);
@@ -1114,6 +1266,11 @@ pub fn serve_codex_app_session(manifest_path: PathBuf) -> anyhow::Result<()> {
     let _ = fs::remove_file(&socket_path);
     let _ = fs::remove_file(session.metadata_path());
     let _ = fs::remove_file(events_path);
+    let working_directory = session.metadata().working_directory;
+    let _ = fs::remove_dir_all(control_queue_root_for_namespace(
+        &session.namespace,
+        working_directory.as_deref(),
+    ));
     let _ = fs::remove_dir(&session_dir);
     Ok(())
 }
@@ -1149,39 +1306,36 @@ pub fn codex_app_session_metadata(
     namespace: &str,
 ) -> anyhow::Result<Option<NativeSessionMetadata>> {
     let socket_path = socket_path_for(namespace)?;
-    if !socket_path.exists() {
-        return read_session_metadata_file(namespace);
-    }
-
-    let stream = match UnixStream::connect(&socket_path) {
-        Ok(stream) => stream,
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-            ) =>
-        {
-            return read_session_metadata_file(namespace);
+    let direct_metadata = (|| -> anyhow::Result<NativeSessionMetadata> {
+        ensure!(
+            socket_path.exists(),
+            "failed to connect '{}'",
+            socket_path.display()
+        );
+        let stream = UnixStream::connect(&socket_path)
+            .with_context(|| format!("failed to connect '{}'", socket_path.display()))?;
+        let mut writer = stream
+            .try_clone()
+            .context("failed to clone codex app metadata stream")?;
+        send_message(&mut writer, &ClientMessage::Metadata)?;
+        let mut reader = BufReader::new(stream);
+        match read_server_message(&mut reader)? {
+            ServerMessage::Metadata(metadata) => Ok(metadata),
+            ServerMessage::Error { message } => Err(anyhow!(message)),
+            other => Err(anyhow!(
+                "unexpected metadata response for codex app session '{}': {:?}",
+                namespace,
+                other
+            )),
         }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to connect '{}'", socket_path.display()));
-        }
-    };
+    })();
 
-    let mut writer = stream
-        .try_clone()
-        .context("failed to clone codex app metadata stream")?;
-    send_message(&mut writer, &ClientMessage::Metadata)?;
-    let mut reader = BufReader::new(stream);
-    match read_server_message(&mut reader)? {
-        ServerMessage::Metadata(metadata) => Ok(Some(metadata)),
-        ServerMessage::Error { message } => Err(anyhow!(message)),
-        other => Err(anyhow!(
-            "unexpected metadata response for codex app session '{}': {:?}",
-            namespace,
-            other
-        )),
+    match direct_metadata {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) => match read_session_metadata_file(namespace)? {
+            Some(metadata) => Ok(Some(metadata)),
+            None => Err(error),
+        },
     }
 }
 
@@ -1206,17 +1360,35 @@ pub fn delete_codex_app_session(namespace: &str) -> anyhow::Result<()> {
             namespace,
             other
         )),
-        Err(error) => wait_for_codex_app_shutdown(namespace)
-            .or(Err(error))
-            .context("failed to delete codex app session cleanly"),
+        Err(error) => {
+            if let Some(metadata) = read_session_metadata_file(namespace)? {
+                let all_stopped = metadata.agents.iter().all(|agent| !agent.running);
+                if all_stopped {
+                    cleanup_stale_session(namespace)?;
+                    return Ok(());
+                }
+            }
+            wait_for_codex_app_shutdown(namespace)
+                .or(Err(error))
+                .context("failed to delete codex app session cleanly")
+        }
     }
 }
 
 pub fn tell_codex_app(namespace: &str, contents: &str) -> anyhow::Result<()> {
+    tell_codex_app_with_mode(namespace, contents, CodexAppInputMode::Auto)
+}
+
+pub fn tell_codex_app_with_mode(
+    namespace: &str,
+    contents: &str,
+    mode: CodexAppInputMode,
+) -> anyhow::Result<()> {
     match request(
         namespace,
         &ClientMessage::SendText {
             text: contents.to_string(),
+            mode,
         },
     )? {
         ServerMessage::Ok => Ok(()),
@@ -1316,9 +1488,6 @@ fn handle_client(stream: UnixStream, session: Arc<CodexAppSession>) -> anyhow::R
     let request = read_client_message(&mut reader)?;
 
     match request {
-        ClientMessage::Metadata => {
-            send_server_message(&mut writer, &ServerMessage::Metadata(session.metadata()))?;
-        }
         ClientMessage::Attach { .. } => {
             let (backlog, rx) = session.subscribe();
             send_server_message(
@@ -1346,27 +1515,53 @@ fn handle_client(stream: UnixStream, session: Arc<CodexAppSession>) -> anyhow::R
                 },
             );
         }
-        ClientMessage::SendText { text } => {
-            session.send_operator_message(&text)?;
-            send_server_message(&mut writer, &ServerMessage::Ok)?;
-        }
-        ClientMessage::Interrupt => {
-            session.interrupt_turn()?;
-            send_server_message(&mut writer, &ServerMessage::Ok)?;
-        }
-        ClientMessage::KillSession => {
-            send_server_message(&mut writer, &ServerMessage::Ok)?;
-            session.shutdown();
+        other => {
+            let response = handle_client_message(&session, other)?;
+            send_server_message(&mut writer, &response)?;
         }
     }
 
     Ok(())
 }
 
+fn handle_client_message(
+    session: &Arc<CodexAppSession>,
+    request: ClientMessage,
+) -> anyhow::Result<ServerMessage> {
+    match request {
+        ClientMessage::Metadata => Ok(ServerMessage::Metadata(session.metadata())),
+        ClientMessage::Attach { .. } => {
+            bail!("attach is not supported over the filesystem control queue")
+        }
+        ClientMessage::SendText { text, mode } => {
+            session.send_operator_message(&text, mode)?;
+            Ok(ServerMessage::Ok)
+        }
+        ClientMessage::Interrupt => {
+            session.interrupt_turn()?;
+            Ok(ServerMessage::Ok)
+        }
+        ClientMessage::KillSession => {
+            session.shutdown();
+            Ok(ServerMessage::Ok)
+        }
+    }
+}
+
 fn request(namespace: &str, message: &ClientMessage) -> anyhow::Result<ServerMessage> {
     let socket_path = socket_path_for(namespace)?;
-    let mut stream = UnixStream::connect(&socket_path)
-        .with_context(|| format!("failed to connect '{}'", socket_path.display()))?;
+    let mut stream = match UnixStream::connect(&socket_path) {
+        Ok(stream) => stream,
+        Err(error) => {
+            if !matches!(message, ClientMessage::Metadata)
+                && let Some(response) = request_via_control_queue(namespace, message)?
+            {
+                return Ok(response);
+            }
+            return Err(error)
+                .with_context(|| format!("failed to connect '{}'", socket_path.display()));
+        }
+    };
     send_message(&mut stream, message)?;
     let mut reader = BufReader::new(stream);
     read_server_message(&mut reader)
@@ -1484,6 +1679,26 @@ fn wait_for_codex_app_session(namespace: &str) -> anyhow::Result<NativeSessionMe
                 continue;
             }
         }
+        if let Some(metadata) = read_session_metadata_file(namespace)? {
+            let startup_failed = metadata.agents.iter().all(|agent| !agent.running)
+                || metadata
+                    .context
+                    .as_ref()
+                    .and_then(|context| context.last_error.as_deref())
+                    .is_some();
+            if startup_failed {
+                let detail = metadata
+                    .context
+                    .as_ref()
+                    .and_then(|context| context.last_error.clone())
+                    .unwrap_or_else(|| "child exited before readiness".to_string());
+                bail!(
+                    "codex app session '{}' failed during startup: {}",
+                    namespace,
+                    detail
+                );
+            }
+        }
         successful_probes = 0;
         if SystemTime::now() >= deadline {
             bail!("codex app session '{}' did not become ready", namespace);
@@ -1570,6 +1785,42 @@ fn build_text_input(text: &str) -> Vec<Value> {
         "text": text,
         "text_elements": [],
     })]
+}
+
+fn codex_apps_probe_enabled(command: &str) -> bool {
+    let Ok(parts) = shell_words::split(command) else {
+        return true;
+    };
+    let mut explicit = None;
+    let mut index = 0usize;
+    while index < parts.len() {
+        match parts[index].as_str() {
+            "--disable" if parts.get(index + 1).map(String::as_str) == Some("apps") => {
+                explicit = Some(false);
+                index += 2;
+                continue;
+            }
+            "--enable" if parts.get(index + 1).map(String::as_str) == Some("apps") => {
+                explicit = Some(true);
+                index += 2;
+                continue;
+            }
+            "-c" => {
+                if let Some(value) = parts.get(index + 1) {
+                    if value.contains("features.apps=false") {
+                        explicit = Some(false);
+                    } else if value.contains("features.apps=true") {
+                        explicit = Some(true);
+                    }
+                }
+                index += 2;
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    explicit.unwrap_or(true)
 }
 
 fn truncate_line(raw: &str, limit: usize) -> String {
@@ -1933,6 +2184,15 @@ fn cleanup_stale_session(namespace: &str) -> anyhow::Result<()> {
     if events_path.exists() {
         let _ = fs::remove_file(&events_path);
     }
+    let working_directory = read_session_metadata_file(namespace)?
+        .as_ref()
+        .and_then(|metadata| metadata.working_directory.as_deref())
+        .map(ToOwned::to_owned);
+    let control_queue_root =
+        control_queue_root_for_namespace(namespace, working_directory.as_deref());
+    if control_queue_root.exists() {
+        let _ = fs::remove_dir_all(&control_queue_root);
+    }
     if session_dir.exists() {
         let _ = fs::remove_dir(&session_dir);
     }
@@ -1952,6 +2212,168 @@ fn session_dir_for(namespace: &str) -> anyhow::Result<PathBuf> {
     Ok(codex_app_root()?
         .join(SESSION_DIR_NAME)
         .join(sanitize_namespace(namespace)))
+}
+
+fn control_queue_base_dir(working_directory: Option<&str>) -> PathBuf {
+    match working_directory.filter(|value| !value.trim().is_empty()) {
+        Some(directory) => PathBuf::from(directory).join(CONTROL_QUEUE_DIR_NAME),
+        None => env::temp_dir().join("jarvisctl-control-queue"),
+    }
+}
+
+fn control_queue_root_for_namespace(namespace: &str, working_directory: Option<&str>) -> PathBuf {
+    control_queue_base_dir(working_directory).join(sanitize_namespace(namespace))
+}
+
+fn control_queue_requests_dir_for_namespace(
+    namespace: &str,
+    working_directory: Option<&str>,
+) -> PathBuf {
+    control_queue_root_for_namespace(namespace, working_directory)
+        .join(CONTROL_QUEUE_REQUESTS_DIR_NAME)
+}
+
+fn control_queue_responses_dir_for_namespace(
+    namespace: &str,
+    working_directory: Option<&str>,
+) -> PathBuf {
+    control_queue_root_for_namespace(namespace, working_directory)
+        .join(CONTROL_QUEUE_RESPONSES_DIR_NAME)
+}
+
+fn ensure_control_queue_dirs(
+    namespace: &str,
+    working_directory: Option<&str>,
+) -> anyhow::Result<()> {
+    let requests_dir = control_queue_requests_dir_for_namespace(namespace, working_directory);
+    let responses_dir = control_queue_responses_dir_for_namespace(namespace, working_directory);
+    fs::create_dir_all(&requests_dir)
+        .with_context(|| format!("failed to create '{}'", requests_dir.display()))?;
+    fs::create_dir_all(&responses_dir)
+        .with_context(|| format!("failed to create '{}'", responses_dir.display()))?;
+    Ok(())
+}
+
+fn drain_control_queue(session: &Arc<CodexAppSession>) -> anyhow::Result<()> {
+    let working_directory = session.metadata().working_directory;
+    let requests_dir =
+        control_queue_requests_dir_for_namespace(&session.namespace, working_directory.as_deref());
+    if !requests_dir.exists() {
+        return Ok(());
+    }
+
+    let mut request_paths = Vec::new();
+    for entry in fs::read_dir(&requests_dir)
+        .with_context(|| format!("failed to read '{}'", requests_dir.display()))?
+    {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            request_paths.push(entry.path());
+        }
+    }
+    request_paths.sort();
+
+    for request_path in request_paths {
+        let _ = process_control_queue_request(session, &request_path);
+        if session.shutdown_requested.load(Ordering::SeqCst) {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn process_control_queue_request(
+    session: &Arc<CodexAppSession>,
+    request_path: &Path,
+) -> anyhow::Result<()> {
+    let raw = fs::read_to_string(request_path)
+        .with_context(|| format!("failed to read '{}'", request_path.display()))?;
+    let envelope: ControlQueueRequestEnvelope = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse '{}'", request_path.display()))?;
+    fs::remove_file(request_path)
+        .with_context(|| format!("failed to remove '{}'", request_path.display()))?;
+
+    let response = match handle_client_message(session, envelope.message) {
+        Ok(message) => message,
+        Err(error) => ServerMessage::Error {
+            message: error.to_string(),
+        },
+    };
+    let working_directory = session.metadata().working_directory;
+    let response_path =
+        control_queue_responses_dir_for_namespace(&session.namespace, working_directory.as_deref())
+            .join(format!("{}.json", envelope.id));
+    write_json_file(
+        &response_path,
+        &ControlQueueResponseEnvelope { message: response },
+    )
+}
+
+fn request_via_control_queue(
+    namespace: &str,
+    message: &ClientMessage,
+) -> anyhow::Result<Option<ServerMessage>> {
+    let Some(metadata) = read_session_metadata_file(namespace)? else {
+        return Ok(None);
+    };
+    if !metadata.agents.iter().any(|agent| agent.running) {
+        return Ok(None);
+    }
+
+    ensure_control_queue_dirs(namespace, metadata.working_directory.as_deref())?;
+    let request_id = format!(
+        "{}-{}-{}",
+        now_epoch_ms(),
+        std::process::id(),
+        CONTROL_QUEUE_REQUEST_SEQUENCE.fetch_add(1, Ordering::SeqCst)
+    );
+    let request_path =
+        control_queue_requests_dir_for_namespace(namespace, metadata.working_directory.as_deref())
+            .join(format!("{}.json", request_id));
+    let response_path =
+        control_queue_responses_dir_for_namespace(namespace, metadata.working_directory.as_deref())
+            .join(format!("{}.json", request_id));
+    write_json_file(
+        &request_path,
+        &ControlQueueRequestEnvelope {
+            id: request_id.clone(),
+            created_at_epoch_ms: now_epoch_ms(),
+            message: message.clone(),
+        },
+    )?;
+
+    let deadline = SystemTime::now() + Duration::from_secs(5);
+    loop {
+        if response_path.exists() {
+            let raw = fs::read_to_string(&response_path)
+                .with_context(|| format!("failed to read '{}'", response_path.display()))?;
+            let envelope: ControlQueueResponseEnvelope = serde_json::from_str(&raw)
+                .with_context(|| format!("failed to parse '{}'", response_path.display()))?;
+            let _ = fs::remove_file(&response_path);
+            return Ok(Some(envelope.message));
+        }
+        if SystemTime::now() >= deadline {
+            bail!(
+                "timed out waiting for filesystem control response for '{}'",
+                namespace
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn write_json_file(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
+    let raw = serde_json::to_vec(value).context("failed to encode control queue payload")?;
+    fs::write(path, raw).map_err(|error| anyhow!("failed to write '{}': {}", path.display(), error))
+}
+
+fn extract_found_active_turn_id(message: &str) -> Option<String> {
+    let marker = "but found `";
+    let start = message.find(marker)? + marker.len();
+    let remaining = &message[start..];
+    let end = remaining.find('`')?;
+    Some(remaining[..end].to_string())
 }
 
 fn sanitize_namespace(namespace: &str) -> String {
