@@ -162,6 +162,15 @@ pub enum WorkerOutputMode {
     Json,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerLocality {
+    #[default]
+    Local,
+    Remote,
+    Cloud,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkerSpec {
     #[serde(default)]
@@ -193,17 +202,38 @@ pub struct WorkerSpec {
     pub num_predict: Option<u32>,
     #[serde(default, rename = "numCtx", skip_serializing_if = "Option::is_none")]
     pub num_ctx: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    #[serde(
+        default,
+        rename = "maxConcurrent",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_concurrent: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locality: Option<WorkerLocality>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkerJobSpec {
-    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(
         default,
         rename = "resourceNamespace",
         skip_serializing_if = "Option::is_none"
     )]
     pub resource_namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<LabelSelector>,
+    #[serde(
+        default,
+        rename = "requiredCapabilities",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub required_capabilities: Vec<String>,
+    #[serde(default, rename = "preferLocal")]
+    pub prefer_local: bool,
     pub prompt: String,
     #[serde(
         default,
@@ -716,6 +746,7 @@ struct ReplicaSetStatus {
 #[derive(Debug, Clone, Serialize)]
 struct JobStatus {
     completions: usize,
+    pending: usize,
     active: usize,
     succeeded: usize,
     failed: usize,
@@ -819,8 +850,15 @@ struct WorkerStatus {
     provider: String,
     model: String,
     endpoint: String,
+    locality: String,
     role: Option<String>,
+    capabilities: Vec<String>,
     output_mode: String,
+    max_concurrent: usize,
+    active_runs: usize,
+    pending_runs: usize,
+    available_slots: usize,
+    admission: String,
     loaded: bool,
 }
 
@@ -831,6 +869,9 @@ struct JobRunDetail {
     backend: String,
     phase: String,
     worker: Option<String>,
+    worker_namespace: Option<String>,
+    admission_state: Option<String>,
+    reason: Option<String>,
     created_at_epoch_ms: u128,
     completed_at_epoch_ms: Option<u128>,
     artifact_path: Option<String>,
@@ -865,6 +906,12 @@ struct JobRunState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     worker_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    admission_state: Option<JobRunAdmissionState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    admission_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     last_active_epoch_ms: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     completed_at_epoch_ms: Option<u128>,
@@ -885,9 +932,18 @@ enum JobRunBackend {
     Worker,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum JobRunAdmissionState {
+    Pending,
+    Granted,
+    Rejected,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum JobRunPhase {
+    Pending,
     #[default]
     Active,
     Succeeded,
@@ -1808,10 +1864,24 @@ fn validate_job(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<()> {
     );
     if let Some(worker) = manifest.spec.worker.as_ref() {
         ensure!(
-            !worker.name.trim().is_empty(),
-            "Job '{}' must set spec.worker.name",
+            worker
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some()
+                || worker.selector.is_some()
+                || !worker.required_capabilities.is_empty(),
+            "Job '{}' must set spec.worker.name, spec.worker.selector, or spec.worker.requiredCapabilities",
             manifest.metadata.name
         );
+        if let Some(name) = worker.name.as_deref() {
+            ensure!(
+                !name.trim().is_empty(),
+                "Job '{}' has an empty spec.worker.name",
+                manifest.metadata.name
+            );
+        }
         ensure!(
             !worker.prompt.trim().is_empty(),
             "Job '{}' must set spec.worker.prompt",
@@ -1913,6 +1983,13 @@ fn validate_worker(manifest: &ResourceEnvelope<WorkerSpec>) -> anyhow::Result<()
             "Worker '{}' has invalid spec.endpoint '{}'",
             manifest.metadata.name,
             endpoint
+        );
+    }
+    if let Some(max_concurrent) = manifest.spec.max_concurrent {
+        ensure!(
+            max_concurrent > 0,
+            "Worker '{}' must set spec.maxConcurrent > 0",
+            manifest.metadata.name
         );
     }
     Ok(())
@@ -2748,6 +2825,7 @@ fn deployment_runtime_environment(
 
 fn reconcile_job(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<String> {
     let mut state = refreshed_job_state(manifest)?;
+    attempt_pending_worker_job_runs(manifest, &mut state)?;
     let mut status = job_status_from_state(manifest, &state);
 
     if !manifest.spec.suspend
@@ -2758,13 +2836,14 @@ fn reconcile_job(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<String>
             .spec
             .parallelism
             .min(manifest.spec.completions.saturating_sub(status.succeeded));
-        while status.active < desired_active && status.failed <= manifest.spec.backoff_limit {
+        while status.active + status.pending < desired_active
+            && status.failed <= manifest.spec.backoff_limit
+        {
             let run_index = state.runs.len();
             let runtime_namespace =
                 job_runtime_namespace(manifest.namespace_key(), &manifest.metadata.name, run_index);
-            launch_job_run(manifest, run_index, &runtime_namespace)?;
             let now = now_epoch_ms();
-            state.runs.push(JobRunState {
+            let mut run = JobRunState {
                 name: format!("run-{}", run_index),
                 runtime_namespace,
                 created_at_epoch_ms: now,
@@ -2777,7 +2856,14 @@ fn reconcile_job(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<String>
                     .spec
                     .worker
                     .as_ref()
-                    .map(|worker| worker.name.clone()),
+                    .and_then(|worker| worker.name.clone()),
+                worker_namespace: None,
+                admission_state: if manifest.spec.worker.is_some() {
+                    Some(JobRunAdmissionState::Pending)
+                } else {
+                    None
+                },
+                admission_reason: None,
                 last_active_epoch_ms: Some(now),
                 completed_at_epoch_ms: None,
                 artifact_path: None,
@@ -2787,8 +2873,18 @@ fn reconcile_job(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<String>
                     .as_ref()
                     .and_then(|worker| worker.output_path.clone()),
                 last_error: None,
-                status: JobRunPhase::Active,
-            });
+                status: if manifest.spec.worker.is_some() {
+                    JobRunPhase::Pending
+                } else {
+                    JobRunPhase::Active
+                },
+            };
+            if manifest.spec.worker.is_some() {
+                admit_worker_job_run(manifest, &state, &mut run)?;
+            } else {
+                launch_job_run(manifest, run_index, &run.runtime_namespace)?;
+            }
+            state.runs.push(run);
             status = job_status_from_state(manifest, &state);
         }
     }
@@ -2796,9 +2892,10 @@ fn reconcile_job(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<String>
     save_job_controller_state(manifest.namespace_key(), &manifest.metadata.name, &state)?;
     let status = job_status_from_state(manifest, &state);
     Ok(format!(
-        "applied job {}/{} (active {}, succeeded {}/{}, failed {})",
+        "applied job {}/{} (pending {}, active {}, succeeded {}/{}, failed {})",
         manifest.namespace_key(),
         manifest.metadata.name,
+        status.pending,
         status.active,
         status.succeeded,
         status.completions,
@@ -2811,9 +2908,6 @@ fn launch_job_run(
     run_index: usize,
     runtime_namespace: &str,
 ) -> anyhow::Result<()> {
-    if let Some(worker) = manifest.spec.worker.as_ref() {
-        return launch_worker_job_run(manifest, worker, runtime_namespace, run_index);
-    }
     let control_namespace = manifest.namespace_key().to_string();
     let namespace_defaults = load_namespace_defaults(&control_namespace)?;
     let driver = manifest
@@ -2902,25 +2996,106 @@ fn launch_job_run(
     Ok(())
 }
 
+fn admit_worker_job_run(
+    manifest: &ResourceEnvelope<JobSpec>,
+    state: &JobControllerState,
+    run: &mut JobRunState,
+) -> anyhow::Result<()> {
+    let Some(worker_request) = manifest.spec.worker.as_ref() else {
+        return Ok(());
+    };
+    let now = now_epoch_ms();
+    let selection = select_worker_for_job_run(manifest, state)?;
+
+    if selection.available_slots == 0 || selection.name.is_none() || selection.namespace.is_none() {
+        run.status = JobRunPhase::Pending;
+        run.worker_name = selection.name;
+        run.worker_namespace = selection.namespace;
+        run.admission_state = Some(JobRunAdmissionState::Pending);
+        run.admission_reason = Some(selection.reason);
+        return Ok(());
+    }
+
+    launch_worker_job_run(
+        manifest,
+        worker_request,
+        selection.name.as_deref().expect("selection name set"),
+        selection
+            .namespace
+            .as_deref()
+            .expect("selection namespace set"),
+        &run.runtime_namespace,
+    )?;
+    run.status = JobRunPhase::Active;
+    run.worker_name = selection.name;
+    run.worker_namespace = selection.namespace;
+    run.admission_state = Some(JobRunAdmissionState::Granted);
+    run.admission_reason = Some(selection.reason);
+    run.last_active_epoch_ms = Some(now);
+    Ok(())
+}
+
+fn attempt_pending_worker_job_runs(
+    manifest: &ResourceEnvelope<JobSpec>,
+    state: &mut JobControllerState,
+) -> anyhow::Result<()> {
+    if manifest.spec.worker.is_none() {
+        return Ok(());
+    }
+    let timeout_seconds = manifest
+        .spec
+        .worker
+        .as_ref()
+        .and_then(|worker| worker.timeout_seconds)
+        .unwrap_or(300);
+    let now = now_epoch_ms();
+    let pending_indexes = state
+        .runs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, run)| {
+            (run.backend == JobRunBackend::Worker && run.status == JobRunPhase::Pending)
+                .then_some(index)
+        })
+        .collect::<Vec<_>>();
+
+    for index in pending_indexes {
+        let age_ms = now.saturating_sub(state.runs[index].created_at_epoch_ms);
+        if age_ms > u128::from(timeout_seconds).saturating_mul(1000) {
+            let run = &mut state.runs[index];
+            run.status = JobRunPhase::Failed;
+            run.completed_at_epoch_ms = Some(now);
+            run.admission_state = Some(JobRunAdmissionState::Rejected);
+            let reason = format!(
+                "worker admission timed out for '{}' after {}s",
+                run.runtime_namespace, timeout_seconds
+            );
+            run.admission_reason = Some(reason.clone());
+            run.last_error = Some(reason);
+            continue;
+        }
+        let snapshot = JobControllerState {
+            runs: state.runs.clone(),
+        };
+        let run = &mut state.runs[index];
+        admit_worker_job_run(manifest, &snapshot, run)?;
+    }
+    Ok(())
+}
+
 fn launch_worker_job_run(
     manifest: &ResourceEnvelope<JobSpec>,
     worker: &WorkerJobSpec,
+    worker_name: &str,
+    worker_namespace: &str,
     execution_id: &str,
-    _run_index: usize,
 ) -> anyhow::Result<()> {
-    let control_namespace = manifest.namespace_key().to_string();
-    let worker_namespace = normalize_namespaced_resource_namespace(
-        worker
-            .resource_namespace
-            .as_deref()
-            .or(Some(control_namespace.as_str())),
-    );
     let launch = WorkerRunLaunchManifest {
-        control_namespace: control_namespace.clone(),
+        control_namespace: manifest.namespace_key().to_string(),
         job_name: manifest.metadata.name.clone(),
         execution_id: execution_id.to_string(),
-        worker_name: worker.name.clone(),
-        worker_namespace,
+        worker_name: worker_name.to_string(),
+        worker_namespace: worker_namespace.to_string(),
         prompt: worker.prompt.clone(),
         timeout_seconds: worker.timeout_seconds,
         output_path: worker.output_path.clone(),
@@ -4705,18 +4880,18 @@ fn resource_summary(manifest: &ResourceManifest) -> anyhow::Result<ResourceSumma
                 namespace: worker.metadata.namespace.clone(),
                 name: worker.metadata.name.clone(),
                 status: format!(
-                    "{}{}",
+                    "{}{} [{}]",
                     status.model,
                     status
                         .role
                         .as_deref()
                         .map(|role| format!(" ({})", role))
-                        .unwrap_or_default()
+                        .unwrap_or_default(),
+                    status.admission
                 ),
                 detail: format!(
-                    "{} {}",
-                    status.provider,
-                    if status.loaded { "loaded" } else { "idle" }
+                    "{} {} {}/{} active",
+                    status.provider, status.locality, status.active_runs, status.max_concurrent
                 ),
             })
         }
@@ -5352,7 +5527,7 @@ fn application_health_status(resources: &[RenderedResourceRef]) -> anyhow::Resul
             ResourceManifest::Job(job) => {
                 let status = job_status(&job)?;
                 if status.succeeded < status.completions {
-                    if status.failed > 0 && status.active == 0 {
+                    if status.failed > 0 && status.active == 0 && status.pending == 0 {
                         degraded = true;
                     } else {
                         progressing = true;
@@ -5386,6 +5561,11 @@ fn job_status_from_state(
     runs.sort();
     JobStatus {
         completions: manifest.spec.completions,
+        pending: state
+            .runs
+            .iter()
+            .filter(|run| run.status == JobRunPhase::Pending)
+            .count(),
         active: state
             .runs
             .iter()
@@ -5414,6 +5594,16 @@ fn job_status_from_state(
                 },
                 phase: job_phase_name(run.status).to_string(),
                 worker: run.worker_name.clone(),
+                worker_namespace: run.worker_namespace.clone(),
+                admission_state: run.admission_state.map(|state| match state {
+                    JobRunAdmissionState::Pending => "pending".to_string(),
+                    JobRunAdmissionState::Granted => "granted".to_string(),
+                    JobRunAdmissionState::Rejected => "rejected".to_string(),
+                }),
+                reason: run
+                    .admission_reason
+                    .clone()
+                    .or_else(|| run.last_error.clone()),
                 created_at_epoch_ms: run.created_at_epoch_ms,
                 completed_at_epoch_ms: run.completed_at_epoch_ms,
                 artifact_path: run.artifact_path.clone(),
@@ -5426,6 +5616,7 @@ fn job_status_from_state(
 
 fn job_phase_name(phase: JobRunPhase) -> &'static str {
     match phase {
+        JobRunPhase::Pending => "pending",
         JobRunPhase::Active => "active",
         JobRunPhase::Succeeded => "succeeded",
         JobRunPhase::Failed => "failed",
@@ -5472,7 +5663,7 @@ fn refreshed_job_state(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<J
                     run.artifact_path = Some(completion.artifact_path);
                     run.output_path = completion.output_path;
                     run.last_error = completion.error;
-                } else if run.status == JobRunPhase::Active {
+                } else if matches!(run.status, JobRunPhase::Active | JobRunPhase::Pending) {
                     let timeout_seconds = manifest
                         .spec
                         .worker
@@ -5484,6 +5675,8 @@ fn refreshed_job_state(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<J
                     if now.saturating_sub(run.created_at_epoch_ms) > max_active_ms {
                         run.status = JobRunPhase::Failed;
                         run.completed_at_epoch_ms = Some(now);
+                        run.admission_state
+                            .get_or_insert(JobRunAdmissionState::Rejected);
                         if run.last_error.is_none() {
                             run.last_error = Some(format!(
                                 "worker run '{}' did not report completion within {}s",
@@ -5595,18 +5788,289 @@ fn network_policy_status(
     })
 }
 
+#[derive(Debug, Clone)]
+struct WorkerSelection {
+    name: Option<String>,
+    namespace: Option<String>,
+    available_slots: usize,
+    reason: String,
+}
+
+fn effective_worker_max_concurrent(manifest: &ResourceEnvelope<WorkerSpec>) -> usize {
+    manifest.spec.max_concurrent.unwrap_or(1)
+}
+
+fn effective_worker_locality(manifest: &ResourceEnvelope<WorkerSpec>) -> WorkerLocality {
+    if let Some(locality) = manifest.spec.locality.clone() {
+        return locality;
+    }
+    let endpoint = worker_endpoint(manifest);
+    if endpoint.contains("127.0.0.1")
+        || endpoint.contains("localhost")
+        || endpoint.contains("[::1]")
+    {
+        WorkerLocality::Local
+    } else {
+        WorkerLocality::Remote
+    }
+}
+
+fn worker_locality_name(locality: &WorkerLocality) -> &'static str {
+    match locality {
+        WorkerLocality::Local => "local",
+        WorkerLocality::Remote => "remote",
+        WorkerLocality::Cloud => "cloud",
+    }
+}
+
+fn worker_labels_match_selector(
+    labels: &BTreeMap<String, String>,
+    selector: &LabelSelector,
+) -> bool {
+    selector
+        .match_labels
+        .iter()
+        .all(|(key, value)| labels.get(key) == Some(value))
+}
+
+fn worker_supports_required_capabilities(
+    manifest: &ResourceEnvelope<WorkerSpec>,
+    required_capabilities: &[String],
+) -> bool {
+    required_capabilities.iter().all(|required| {
+        manifest
+            .spec
+            .capabilities
+            .iter()
+            .any(|capability| capability == required)
+    })
+}
+
+fn worker_request_namespace(request: &WorkerJobSpec, control_namespace: &str) -> String {
+    normalize_namespaced_resource_namespace(
+        request
+            .resource_namespace
+            .as_deref()
+            .or(Some(control_namespace)),
+    )
+}
+
+fn count_worker_runs_in_state(
+    state: &JobControllerState,
+    worker_namespace: &str,
+    worker_name: &str,
+) -> (usize, usize) {
+    let mut active = 0;
+    let mut pending = 0;
+    for run in &state.runs {
+        if run.backend != JobRunBackend::Worker {
+            continue;
+        }
+        if run.worker_name.as_deref() != Some(worker_name)
+            || run.worker_namespace.as_deref() != Some(worker_namespace)
+        {
+            continue;
+        }
+        match run.status {
+            JobRunPhase::Active => active += 1,
+            JobRunPhase::Pending => pending += 1,
+            _ => {}
+        }
+    }
+    (active, pending)
+}
+
+fn worker_run_counts(
+    worker_namespace: &str,
+    worker_name: &str,
+    current_job: Option<(&str, &str, &JobControllerState)>,
+) -> anyhow::Result<(usize, usize)> {
+    let mut active = 0;
+    let mut pending = 0;
+    for manifest in load_manifests_by_kind(ResourceKind::Job, None)? {
+        let ResourceManifest::Job(job) = manifest else {
+            continue;
+        };
+        if current_job
+            .map(|(namespace, name, _)| {
+                namespace == job.namespace_key() && name == job.metadata.name.as_str()
+            })
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let state =
+            load_job_controller_state(job.namespace_key(), &job.metadata.name).unwrap_or_default();
+        let (job_active, job_pending) =
+            count_worker_runs_in_state(&state, worker_namespace, worker_name);
+        active += job_active;
+        pending += job_pending;
+    }
+    if let Some((_, _, state)) = current_job {
+        let (job_active, job_pending) =
+            count_worker_runs_in_state(state, worker_namespace, worker_name);
+        active += job_active;
+        pending += job_pending;
+    }
+    Ok((active, pending))
+}
+
+fn select_worker_for_job_run(
+    manifest: &ResourceEnvelope<JobSpec>,
+    state: &JobControllerState,
+) -> anyhow::Result<WorkerSelection> {
+    let request = manifest
+        .spec
+        .worker
+        .as_ref()
+        .ok_or_else(|| anyhow!("job '{}' has no worker request", manifest.metadata.name))?;
+    let worker_namespace = worker_request_namespace(request, manifest.namespace_key());
+    let named_worker = request
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let selector = request.selector.as_ref();
+    let mut candidates = Vec::new();
+
+    if let Some(name) = named_worker {
+        if let Ok(ResourceManifest::Worker(worker)) =
+            load_manifest(ResourceKind::Worker, name, Some(&worker_namespace))
+        {
+            candidates.push(worker);
+        } else {
+            return Ok(WorkerSelection {
+                name: Some(name.to_string()),
+                namespace: Some(worker_namespace),
+                available_slots: 0,
+                reason: format!("waiting for named worker '{}'", name),
+            });
+        }
+    } else {
+        for manifest in load_manifests_by_kind(ResourceKind::Worker, Some(&worker_namespace))? {
+            let ResourceManifest::Worker(worker) = manifest else {
+                continue;
+            };
+            candidates.push(worker);
+        }
+    }
+
+    if let Some(selector) = selector {
+        candidates.retain(|worker| worker_labels_match_selector(&worker.metadata.labels, selector));
+    }
+    if !request.required_capabilities.is_empty() {
+        candidates.retain(|worker| {
+            worker_supports_required_capabilities(worker, &request.required_capabilities)
+        });
+    }
+
+    if candidates.is_empty() {
+        return Ok(WorkerSelection {
+            name: named_worker.map(ToOwned::to_owned),
+            namespace: Some(worker_namespace),
+            available_slots: 0,
+            reason: "waiting for a matching worker".to_string(),
+        });
+    }
+
+    let current_job = Some((
+        manifest.namespace_key(),
+        manifest.metadata.name.as_str(),
+        state,
+    ));
+    let mut scored = Vec::new();
+    for worker in candidates {
+        let locality = effective_worker_locality(&worker);
+        let (active_runs, _pending_runs) =
+            worker_run_counts(&worker_namespace, &worker.metadata.name, current_job)?;
+        let max_concurrent = effective_worker_max_concurrent(&worker);
+        let available_slots = max_concurrent.saturating_sub(active_runs);
+        scored.push((
+            request.prefer_local && locality == WorkerLocality::Local,
+            available_slots,
+            active_runs,
+            max_concurrent,
+            worker.metadata.name.clone(),
+            worker_namespace.clone(),
+            locality,
+        ));
+    }
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.4.cmp(&right.4))
+    });
+    let (
+        preferred_local,
+        available_slots,
+        active_runs,
+        max_concurrent,
+        worker_name,
+        worker_namespace,
+        locality,
+    ) = scored
+        .into_iter()
+        .next()
+        .expect("at least one worker candidate exists");
+    let reason = if available_slots > 0 {
+        format!(
+            "admitted on {} worker '{}' with {} slot(s) remaining",
+            worker_locality_name(&locality),
+            worker_name,
+            available_slots.saturating_sub(1)
+        )
+    } else {
+        format!(
+            "waiting for capacity on {} worker '{}' (active {}, max {})",
+            if preferred_local {
+                "preferred local"
+            } else {
+                worker_locality_name(&locality)
+            },
+            worker_name,
+            active_runs,
+            max_concurrent
+        )
+    };
+    Ok(WorkerSelection {
+        name: Some(worker_name),
+        namespace: Some(worker_namespace),
+        available_slots,
+        reason,
+    })
+}
+
 fn worker_status(manifest: &ResourceEnvelope<WorkerSpec>) -> anyhow::Result<WorkerStatus> {
     let loaded = match manifest.spec.provider {
         WorkerProvider::Ollama => ollama_model_loaded(&manifest.spec.model)?,
     };
+    let locality = effective_worker_locality(manifest);
+    let max_concurrent = effective_worker_max_concurrent(manifest);
+    let (active_runs, pending_runs) =
+        worker_run_counts(manifest.namespace_key(), &manifest.metadata.name, None)?;
+    let available_slots = max_concurrent.saturating_sub(active_runs);
     Ok(WorkerStatus {
         provider: "ollama".to_string(),
         model: manifest.spec.model.clone(),
         endpoint: worker_endpoint(manifest),
+        locality: worker_locality_name(&locality).to_string(),
         role: manifest.spec.role.clone(),
+        capabilities: manifest.spec.capabilities.clone(),
         output_mode: match effective_worker_output_mode(manifest) {
             WorkerOutputMode::Text => "text".to_string(),
             WorkerOutputMode::Json => "json".to_string(),
+        },
+        max_concurrent,
+        active_runs,
+        pending_runs,
+        available_slots,
+        admission: if available_slots > 0 {
+            "ready".to_string()
+        } else {
+            "saturated".to_string()
         },
         loaded,
     })
@@ -6499,7 +6963,7 @@ spec:
         };
 
         let worker = job.spec.worker.as_ref().expect("worker spec should exist");
-        assert_eq!(worker.name, "qwen-junior");
+        assert_eq!(worker.name.as_deref(), Some("qwen-junior"));
         assert_eq!(worker.prompt, "Return strict JSON only.");
         assert!(job.spec.template.task_note.is_empty());
     }
@@ -6612,7 +7076,7 @@ spec:
             },
             spec: JobSpec {
                 worker: Some(WorkerJobSpec {
-                    name: "qwen-junior".to_string(),
+                    name: Some("qwen-junior".to_string()),
                     prompt: "Return strict JSON only.".to_string(),
                     timeout_seconds: Some(30),
                     output_path: Some("/tmp/worker-job.out".to_string()),
@@ -6628,6 +7092,9 @@ spec:
                 created_at_epoch_ms: 1_000,
                 backend: JobRunBackend::Worker,
                 worker_name: Some("qwen-junior".to_string()),
+                worker_namespace: Some("workers-lab".to_string()),
+                admission_state: Some(JobRunAdmissionState::Granted),
+                admission_reason: Some("admitted on local worker 'qwen-junior'".to_string()),
                 last_active_epoch_ms: Some(1_000),
                 completed_at_epoch_ms: Some(2_000),
                 artifact_path: Some("/tmp/worker-job-artifact.out".to_string()),

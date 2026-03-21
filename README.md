@@ -232,7 +232,12 @@ metadata:
 spec:
   provider: ollama
   model: qwen3:8b
+  locality: local
   role: junior
+  capabilities:
+    - vault
+    - routing
+  maxConcurrent: 1
   outputMode: json
   temperature: 0
   numPredict: 256
@@ -250,6 +255,7 @@ jarvisctl worker invoke qwen-junior -n workers-lab \
 ```
 
 Use `outputMode: json` for bounded classification, extraction, or routing tasks where a larger Codex session would be wasteful. Use `outputMode: text` only when the task contract is already narrow enough that a plain-text answer is acceptable.
+`describe worker --output json` now also reports `locality`, `capabilities`, `max_concurrent`, `active_runs`, `pending_runs`, `available_slots`, and `admission`, so operator clients can see slot pressure and scheduler readiness directly.
 
 ### Run a worker-backed Job
 
@@ -264,7 +270,12 @@ spec:
   completions: 1
   backoffLimit: 0
   worker:
-    name: qwen-junior
+    selector:
+      matchLabels:
+        lane: junior
+    requiredCapabilities:
+      - vault
+    preferLocal: true
     timeoutSeconds: 120
     outputPath: /tmp/jarvisctl-worker-job-output.json
     prompt: |
@@ -278,6 +289,7 @@ jarvisctl describe job summarize-docs -n workers-lab --output json
 ```
 
 Worker-backed jobs do not create a live Codex runtime namespace. Instead, the controller spawns an asynchronous worker-run helper, stores the full worker response under `~/.jarvis/control-plane/state/worker-runs/.../artifacts/`, optionally mirrors it to `spec.worker.outputPath`, and reports per-run metadata in `status.run_details`.
+When all matching workers are saturated, runs stay in `phase: pending` with `admission_state: pending` and a scheduler reason such as `waiting for capacity on preferred local worker ...` until a slot becomes available.
 
 ### Apply a local kustomization tree
 
