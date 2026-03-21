@@ -10,7 +10,7 @@
 //! - Delete/List: manage native sessions
 
 use clap::{Parser, Subcommand, ValueEnum, ValueHint};
-use std::{env, ffi::OsStr, path::PathBuf, process::ExitCode};
+use std::{env, ffi::OsStr, fs, path::PathBuf, process::ExitCode, time::Duration};
 use sysinfo::{Pid, System};
 use thiserror::Error;
 use tracing::{error, info, instrument};
@@ -35,9 +35,12 @@ use codex_app::{
     tell_codex_app_with_mode,
 };
 use control_plane::{
-    ControlPlaneOutput, ControlPlaneResourceKindArg, apply_manifests, authorize_runtime_message,
-    render_describe_output, render_get_output, resolve_service_target,
-    resolve_service_target_for_message,
+    ControlPlaneOutput, ControlPlaneResourceKindArg, apply_kustomization, apply_manifests,
+    authorize_runtime_message, invoke_worker, pause_deployment_rollout,
+    render_application_diff_output, render_describe_output, render_get_output,
+    render_rollout_history_output, render_rollout_status_output, resolve_service_target,
+    resolve_service_target_for_message, restart_deployment_rollout, resume_deployment_rollout,
+    sync_application_resource, undo_deployment_rollout, wait_for_rollout_status_output,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use native::{
@@ -241,8 +244,11 @@ enum Command {
 
     /// Apply declarative control-plane resources from YAML manifests
     Apply {
-        #[arg(short = 'f', long = "file", required = true, value_hint = ValueHint::FilePath)]
+        #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
         file: Vec<PathBuf>,
+
+        #[arg(short = 'k', long = "kustomize", value_hint = ValueHint::DirPath)]
+        kustomize: Option<PathBuf>,
     },
 
     /// Get declarative control-plane resources
@@ -266,6 +272,25 @@ enum Command {
 
         #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Yaml)]
         output: ControlPlaneOutput,
+    },
+
+    /// Inspect or trigger Deployment rollouts
+    Rollout {
+        #[command(subcommand)]
+        command: RolloutCommand,
+    },
+
+    /// Inspect or trigger Application sync operations
+    #[command(alias = "app")]
+    Application {
+        #[command(subcommand)]
+        command: ApplicationCommand,
+    },
+
+    /// Invoke a namespaced worker resource
+    Worker {
+        #[command(subcommand)]
+        command: WorkerCommand,
     },
 
     /// Open a ratatui session dashboard
@@ -401,6 +426,111 @@ enum Command {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum RolloutCommand {
+    /// Show rollout status for a Deployment
+    Status {
+        deployment: String,
+
+        #[arg(short = 'n', long = "resource-namespace")]
+        resource_namespace: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        watch: bool,
+
+        #[arg(long = "timeout-seconds", default_value_t = 300)]
+        timeout_seconds: u64,
+
+        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Show rollout history for a Deployment
+    History {
+        deployment: String,
+
+        #[arg(short = 'n', long = "resource-namespace")]
+        resource_namespace: Option<String>,
+
+        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Trigger a rollout restart for a Deployment
+    Restart {
+        deployment: String,
+
+        #[arg(short = 'n', long = "resource-namespace")]
+        resource_namespace: Option<String>,
+    },
+
+    /// Pause a Deployment rollout
+    Pause {
+        deployment: String,
+
+        #[arg(short = 'n', long = "resource-namespace")]
+        resource_namespace: Option<String>,
+    },
+
+    /// Resume a paused Deployment rollout
+    Resume {
+        deployment: String,
+
+        #[arg(short = 'n', long = "resource-namespace")]
+        resource_namespace: Option<String>,
+    },
+
+    /// Roll a Deployment back to a prior revision
+    Undo {
+        deployment: String,
+
+        #[arg(short = 'n', long = "resource-namespace")]
+        resource_namespace: Option<String>,
+
+        #[arg(long = "to-revision")]
+        to_revision: Option<u64>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ApplicationCommand {
+    /// Force an Application sync, even if automated sync is disabled
+    Sync {
+        application: String,
+
+        #[arg(short = 'n', long = "resource-namespace")]
+        resource_namespace: Option<String>,
+    },
+
+    /// Show the diff between desired Application source and live managed resources
+    Diff {
+        application: String,
+
+        #[arg(short = 'n', long = "resource-namespace")]
+        resource_namespace: Option<String>,
+
+        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkerCommand {
+    /// Invoke a worker with a prompt or prompt file
+    Invoke {
+        worker: String,
+
+        #[arg(short = 'n', long = "resource-namespace")]
+        resource_namespace: Option<String>,
+
+        #[arg(long, conflicts_with = "file")]
+        prompt: Option<String>,
+
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "prompt")]
+        file: Option<PathBuf>,
+    },
+}
+
 #[instrument]
 fn main() -> ExitCode {
     // Initialize structured logging with environment override
@@ -518,7 +648,7 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             command,
         })
         .map_err(JarvisError::from),
-        Command::Apply { file } => apply_resources(&file),
+        Command::Apply { file, kustomize } => apply_resources(&file, kustomize.as_deref()),
         Command::Get {
             kind,
             resource_namespace,
@@ -530,6 +660,9 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             resource_namespace,
             output,
         } => describe_resource(kind, &name, resource_namespace.as_deref(), output),
+        Command::Rollout { command } => rollout_command(command),
+        Command::Application { command } => application_command(command),
+        Command::Worker { command } => worker_command(command),
         Command::Dashboard {
             backend,
             refresh_ms,
@@ -699,8 +832,25 @@ pub(crate) fn run_session_shell_with_context(
     Ok(())
 }
 
-fn apply_resources(files: &[PathBuf]) -> Result<(), JarvisError> {
-    for message in apply_manifests(files).map_err(JarvisError::from)? {
+fn apply_resources(
+    files: &[PathBuf],
+    kustomize: Option<&std::path::Path>,
+) -> Result<(), JarvisError> {
+    let messages = match (files.is_empty(), kustomize) {
+        (false, None) => apply_manifests(files).map_err(JarvisError::from)?,
+        (true, Some(path)) => apply_kustomization(path).map_err(JarvisError::from)?,
+        (false, Some(_)) => {
+            return Err(JarvisError::Other(anyhow::anyhow!(
+                "use either --file or --kustomize, not both"
+            )));
+        }
+        (true, None) => {
+            return Err(JarvisError::Other(anyhow::anyhow!(
+                "provide at least one --file or one --kustomize path"
+            )));
+        }
+    };
+    for message in messages {
         println!("{}", message);
     }
     Ok(())
@@ -730,6 +880,149 @@ fn describe_resource(
             .map_err(JarvisError::from)?
     );
     Ok(())
+}
+
+fn rollout_command(command: RolloutCommand) -> Result<(), JarvisError> {
+    match command {
+        RolloutCommand::Status {
+            deployment,
+            resource_namespace,
+            watch,
+            timeout_seconds,
+            output,
+        } => {
+            let rendered = if watch {
+                wait_for_rollout_status_output(
+                    &deployment,
+                    resource_namespace.as_deref(),
+                    output,
+                    Duration::from_secs(timeout_seconds),
+                )
+            } else {
+                render_rollout_status_output(&deployment, resource_namespace.as_deref(), output)
+            }
+            .map_err(JarvisError::from)?;
+            println!("{}", rendered);
+            Ok(())
+        }
+        RolloutCommand::History {
+            deployment,
+            resource_namespace,
+            output,
+        } => {
+            println!(
+                "{}",
+                render_rollout_history_output(&deployment, resource_namespace.as_deref(), output)
+                    .map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        RolloutCommand::Restart {
+            deployment,
+            resource_namespace,
+        } => {
+            println!(
+                "{}",
+                restart_deployment_rollout(&deployment, resource_namespace.as_deref())
+                    .map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        RolloutCommand::Pause {
+            deployment,
+            resource_namespace,
+        } => {
+            println!(
+                "{}",
+                pause_deployment_rollout(&deployment, resource_namespace.as_deref())
+                    .map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        RolloutCommand::Resume {
+            deployment,
+            resource_namespace,
+        } => {
+            println!(
+                "{}",
+                resume_deployment_rollout(&deployment, resource_namespace.as_deref())
+                    .map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        RolloutCommand::Undo {
+            deployment,
+            resource_namespace,
+            to_revision,
+        } => {
+            println!(
+                "{}",
+                undo_deployment_rollout(&deployment, resource_namespace.as_deref(), to_revision)
+                    .map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+    }
+}
+
+fn application_command(command: ApplicationCommand) -> Result<(), JarvisError> {
+    match command {
+        ApplicationCommand::Sync {
+            application,
+            resource_namespace,
+        } => {
+            println!(
+                "{}",
+                sync_application_resource(&application, resource_namespace.as_deref())
+                    .map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        ApplicationCommand::Diff {
+            application,
+            resource_namespace,
+            output,
+        } => {
+            println!(
+                "{}",
+                render_application_diff_output(&application, resource_namespace.as_deref(), output)
+                    .map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+    }
+}
+
+fn worker_command(command: WorkerCommand) -> Result<(), JarvisError> {
+    match command {
+        WorkerCommand::Invoke {
+            worker,
+            resource_namespace,
+            prompt,
+            file,
+        } => {
+            let prompt = read_worker_prompt(prompt.as_deref(), file.as_deref())?;
+            println!(
+                "{}",
+                invoke_worker(&worker, resource_namespace.as_deref(), &prompt)
+                    .map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+    }
+}
+
+fn read_worker_prompt(
+    prompt: Option<&str>,
+    file: Option<&std::path::Path>,
+) -> Result<String, JarvisError> {
+    match (prompt, file) {
+        (Some(prompt), None) => Ok(prompt.to_string()),
+        (None, Some(path)) => Ok(fs::read_to_string(path)?),
+        _ => Err(JarvisError::Other(anyhow::anyhow!(
+            "provide either --prompt or --file for worker invoke"
+        ))),
+    }
 }
 
 fn resolve_runtime_namespace(

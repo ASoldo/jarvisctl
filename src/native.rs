@@ -30,6 +30,7 @@ use crossterm::terminal::size as terminal_size;
 
 const SESSION_DIR_NAME: &str = "sessions";
 const MANIFEST_DIR_NAME: &str = "manifests";
+const COMPLETION_DIR_NAME: &str = "completions";
 const SOCKET_FILE_NAME: &str = "control.sock";
 const METADATA_FILE_NAME: &str = "metadata.json";
 const LOG_LIMIT_BYTES: usize = 512 * 1024;
@@ -201,6 +202,22 @@ pub struct NativeAgentMetadata {
     pub name: String,
     pub pid: u32,
     pub running: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeSessionCompletion {
+    pub namespace: String,
+    pub created_at_epoch_ms: u128,
+    pub agents: Vec<NativeAgentCompletion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeAgentCompletion {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -258,6 +275,7 @@ struct ManagedAgent {
     name: String,
     pid: u32,
     running: AtomicBool,
+    exit_code: Mutex<Option<i32>>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     child: Mutex<Box<dyn portable_pty::Child + Send>>,
@@ -281,6 +299,7 @@ impl NativeSession {
                     name: agent.name.clone(),
                     pid: agent.pid,
                     running: agent.is_running(),
+                    exit_code: *agent.exit_code.lock().unwrap(),
                 })
                 .collect(),
         }
@@ -316,6 +335,8 @@ impl NativeSession {
             return;
         }
 
+        let _ = self.write_completion_record();
+
         for agent in self.agents.values() {
             let _ = agent.kill();
         }
@@ -327,6 +348,28 @@ impl NativeSession {
 
     fn all_agents_exited(&self) -> bool {
         self.agents.values().all(|agent| !agent.is_running())
+    }
+
+    fn write_completion_record(&self) -> anyhow::Result<()> {
+        let record = NativeSessionCompletion {
+            namespace: self.namespace.clone(),
+            created_at_epoch_ms: self.created_at_epoch_ms,
+            agents: self
+                .agents
+                .values()
+                .map(|agent| NativeAgentCompletion {
+                    name: agent.name.clone(),
+                    exit_code: *agent.exit_code.lock().unwrap(),
+                })
+                .collect(),
+        };
+        let dir = native_root()?.join(COMPLETION_DIR_NAME);
+        fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create '{}'", dir.display()))?;
+        let path = completion_path_for(&self.namespace)?;
+        let raw = serde_json::to_string_pretty(&record)
+            .context("failed to serialize native session completion")?;
+        fs::write(&path, raw).with_context(|| format!("failed to write '{}'", path.display()))
     }
 }
 
@@ -445,6 +488,7 @@ pub fn spawn_native_session(
         "namespace must not be empty for native backend"
     );
     ensure!(agents > 0, "native backend needs at least one agent");
+    clear_native_completion(namespace)?;
 
     let manifest = NativeSessionManifest {
         namespace: namespace.to_string(),
@@ -559,6 +603,7 @@ pub fn serve_native_session(manifest_path: PathBuf) -> anyhow::Result<()> {
         }
 
         if session.all_agents_exited() {
+            let _ = session.write_completion_record();
             session.shutdown_requested.store(true, Ordering::SeqCst);
         }
     }
@@ -637,7 +682,7 @@ pub fn native_session_metadata(namespace: &str) -> anyhow::Result<Option<NativeS
 }
 
 pub fn delete_native_session(namespace: &str) -> anyhow::Result<()> {
-    match request(namespace, &ClientMessage::KillSession) {
+    let result = match request(namespace, &ClientMessage::KillSession) {
         Ok(ServerMessage::Ok) => {
             wait_for_native_shutdown(namespace)?;
             Ok(())
@@ -651,7 +696,25 @@ pub fn delete_native_session(namespace: &str) -> anyhow::Result<()> {
         Err(error) => wait_for_native_shutdown(namespace)
             .or(Err(error))
             .context("failed to delete native session cleanly"),
+    };
+    if result.is_ok() {
+        let _ = clear_native_completion(namespace);
     }
+    result
+}
+
+pub fn native_session_completion(
+    namespace: &str,
+) -> anyhow::Result<Option<NativeSessionCompletion>> {
+    let path = completion_path_for(namespace)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read '{}'", path.display()))?;
+    let completion: NativeSessionCompletion =
+        serde_json::from_str(&raw).context("failed to parse native session completion")?;
+    Ok(Some(completion))
 }
 
 pub fn tell_native(
@@ -2288,6 +2351,7 @@ fn spawn_managed_agent(
         name: agent_name.to_string(),
         pid,
         running: AtomicBool::new(true),
+        exit_code: Mutex::new(None),
         master: Mutex::new(pair.master),
         writer: Mutex::new(writer),
         child: Mutex::new(child),
@@ -2309,6 +2373,14 @@ fn spawn_managed_agent(
             }
             output_agent.append_output(&buffer[..read]);
         }
+        let exit_code = output_agent
+            .child
+            .lock()
+            .unwrap()
+            .wait()
+            .ok()
+            .map(|status| status.exit_code() as i32);
+        *output_agent.exit_code.lock().unwrap() = exit_code;
         output_agent.running.store(false, Ordering::SeqCst);
     });
 
@@ -2318,6 +2390,20 @@ fn spawn_managed_agent(
 fn native_root() -> anyhow::Result<PathBuf> {
     let home = env::var_os("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home).join(".jarvis").join("native"))
+}
+
+fn completion_path_for(namespace: &str) -> anyhow::Result<PathBuf> {
+    Ok(native_root()?
+        .join(COMPLETION_DIR_NAME)
+        .join(format!("{}.json", sanitize_namespace(namespace))))
+}
+
+fn clear_native_completion(namespace: &str) -> anyhow::Result<()> {
+    let path = completion_path_for(namespace)?;
+    if path.exists() {
+        fs::remove_file(&path).with_context(|| format!("failed to remove '{}'", path.display()))?;
+    }
+    Ok(())
 }
 
 fn socket_path_for(namespace: &str) -> anyhow::Result<PathBuf> {

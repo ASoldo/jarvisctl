@@ -1122,6 +1122,7 @@ pub fn serve_codex_app_session(manifest_path: PathBuf) -> anyhow::Result<()> {
             name: "agent0".to_string(),
             pid: child_pid,
             running: true,
+            exit_code: None,
         }],
     };
     let session = Arc::new(CodexAppSession {
