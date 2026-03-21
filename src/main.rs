@@ -40,7 +40,8 @@ use control_plane::{
     render_application_diff_output, render_describe_output, render_get_output,
     render_rollout_history_output, render_rollout_status_output, resolve_service_target,
     resolve_service_target_for_message, restart_deployment_rollout, resume_deployment_rollout,
-    sync_application_resource, undo_deployment_rollout, wait_for_rollout_status_output,
+    serve_worker_run, sync_application_resource, undo_deployment_rollout,
+    wait_for_rollout_status_output,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use native::{
@@ -424,6 +425,12 @@ enum Command {
         #[arg(long, value_hint = ValueHint::FilePath)]
         manifest: PathBuf,
     },
+
+    #[command(hide = true)]
+    WorkerRunServe {
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        manifest: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -747,6 +754,9 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         }
         Command::CodexAppSessionServe { manifest } => {
             serve_codex_app_session(manifest).map_err(JarvisError::from)
+        }
+        Command::WorkerRunServe { manifest } => {
+            serve_worker_run(manifest).map_err(JarvisError::from)
         }
     }
 }

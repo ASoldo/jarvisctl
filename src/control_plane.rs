@@ -20,8 +20,10 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::str::FromStr;
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 const API_VERSION: &str = "jarvisctl.io/v1alpha1";
@@ -194,6 +196,30 @@ pub struct WorkerSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkerJobSpec {
+    pub name: String,
+    #[serde(
+        default,
+        rename = "resourceNamespace",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub resource_namespace: Option<String>,
+    pub prompt: String,
+    #[serde(
+        default,
+        rename = "timeoutSeconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub timeout_seconds: Option<u64>,
+    #[serde(
+        default,
+        rename = "outputPath",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub output_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceRoutingStrategy {
     #[default]
@@ -318,6 +344,7 @@ pub struct DeploymentSpec {
     pub driver: Option<CodexRuntimeDriver>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_delay_ms: Option<u64>,
+    #[serde(default)]
     pub template: DeploymentTemplateSpec,
 }
 
@@ -483,6 +510,9 @@ pub struct JobSpec {
     pub driver: Option<CodexRuntimeDriver>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_delay_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<WorkerJobSpec>,
+    #[serde(default)]
     pub template: DeploymentTemplateSpec,
 }
 
@@ -496,6 +526,7 @@ impl Default for JobSpec {
             suspend: false,
             driver: None,
             startup_delay_ms: None,
+            worker: None,
             template: DeploymentTemplateSpec::default(),
         }
     }
@@ -689,6 +720,7 @@ struct JobStatus {
     succeeded: usize,
     failed: usize,
     runs: Vec<String>,
+    run_details: Vec<JobRunDetail>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -793,6 +825,20 @@ struct WorkerStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct JobRunDetail {
+    name: String,
+    execution_id: String,
+    backend: String,
+    phase: String,
+    worker: Option<String>,
+    created_at_epoch_ms: u128,
+    completed_at_epoch_ms: Option<u128>,
+    artifact_path: Option<String>,
+    output_path: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct NamespaceStatus {
     resources: usize,
     sessions: usize,
@@ -814,9 +860,29 @@ struct JobRunState {
     name: String,
     runtime_namespace: String,
     created_at_epoch_ms: u128,
+    #[serde(default)]
+    backend: JobRunBackend,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_active_epoch_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_at_epoch_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artifact_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
     status: JobRunPhase,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum JobRunBackend {
+    #[default]
+    Runtime,
+    Worker,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, Eq, PartialEq)]
@@ -831,6 +897,33 @@ enum JobRunPhase {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct JobControllerState {
     runs: Vec<JobRunState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkerRunLaunchManifest {
+    control_namespace: String,
+    job_name: String,
+    execution_id: String,
+    worker_name: String,
+    worker_namespace: String,
+    prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timeout_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkerRunCompletion {
+    execution_id: String,
+    worker_name: String,
+    status: JobRunPhase,
+    completed_at_epoch_ms: u128,
+    artifact_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1701,11 +1794,44 @@ fn validate_job(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<()> {
         "Job '{}' must set spec.agents > 0",
         manifest.metadata.name
     );
+    let has_worker = manifest.spec.worker.is_some();
+    let has_runtime_template = !manifest.spec.template.task_note.trim().is_empty();
     ensure!(
-        !manifest.spec.template.task_note.trim().is_empty(),
-        "Job '{}' must set spec.template.task_note",
+        has_worker || has_runtime_template,
+        "Job '{}' must set either spec.template.task_note or spec.worker",
         manifest.metadata.name
     );
+    ensure!(
+        !(has_worker && has_runtime_template),
+        "Job '{}' must choose either spec.template.task_note or spec.worker, not both",
+        manifest.metadata.name
+    );
+    if let Some(worker) = manifest.spec.worker.as_ref() {
+        ensure!(
+            !worker.name.trim().is_empty(),
+            "Job '{}' must set spec.worker.name",
+            manifest.metadata.name
+        );
+        ensure!(
+            !worker.prompt.trim().is_empty(),
+            "Job '{}' must set spec.worker.prompt",
+            manifest.metadata.name
+        );
+        if let Some(timeout_seconds) = worker.timeout_seconds {
+            ensure!(
+                timeout_seconds > 0,
+                "Job '{}' must set spec.worker.timeoutSeconds > 0",
+                manifest.metadata.name
+            );
+        }
+        if let Some(output_path) = worker.output_path.as_deref() {
+            ensure!(
+                !output_path.trim().is_empty(),
+                "Job '{}' has an empty spec.worker.outputPath",
+                manifest.metadata.name
+            );
+        }
+    }
     Ok(())
 }
 
@@ -2637,11 +2763,30 @@ fn reconcile_job(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<String>
             let runtime_namespace =
                 job_runtime_namespace(manifest.namespace_key(), &manifest.metadata.name, run_index);
             launch_job_run(manifest, run_index, &runtime_namespace)?;
+            let now = now_epoch_ms();
             state.runs.push(JobRunState {
                 name: format!("run-{}", run_index),
                 runtime_namespace,
-                created_at_epoch_ms: now_epoch_ms(),
-                last_active_epoch_ms: Some(now_epoch_ms()),
+                created_at_epoch_ms: now,
+                backend: if manifest.spec.worker.is_some() {
+                    JobRunBackend::Worker
+                } else {
+                    JobRunBackend::Runtime
+                },
+                worker_name: manifest
+                    .spec
+                    .worker
+                    .as_ref()
+                    .map(|worker| worker.name.clone()),
+                last_active_epoch_ms: Some(now),
+                completed_at_epoch_ms: None,
+                artifact_path: None,
+                output_path: manifest
+                    .spec
+                    .worker
+                    .as_ref()
+                    .and_then(|worker| worker.output_path.clone()),
+                last_error: None,
                 status: JobRunPhase::Active,
             });
             status = job_status_from_state(manifest, &state);
@@ -2666,6 +2811,9 @@ fn launch_job_run(
     run_index: usize,
     runtime_namespace: &str,
 ) -> anyhow::Result<()> {
+    if let Some(worker) = manifest.spec.worker.as_ref() {
+        return launch_worker_job_run(manifest, worker, runtime_namespace, run_index);
+    }
     let control_namespace = manifest.namespace_key().to_string();
     let namespace_defaults = load_namespace_defaults(&control_namespace)?;
     let driver = manifest
@@ -2752,6 +2900,32 @@ fn launch_job_run(
         return Err(error);
     }
     Ok(())
+}
+
+fn launch_worker_job_run(
+    manifest: &ResourceEnvelope<JobSpec>,
+    worker: &WorkerJobSpec,
+    execution_id: &str,
+    _run_index: usize,
+) -> anyhow::Result<()> {
+    let control_namespace = manifest.namespace_key().to_string();
+    let worker_namespace = normalize_namespaced_resource_namespace(
+        worker
+            .resource_namespace
+            .as_deref()
+            .or(Some(control_namespace.as_str())),
+    );
+    let launch = WorkerRunLaunchManifest {
+        control_namespace: control_namespace.clone(),
+        job_name: manifest.metadata.name.clone(),
+        execution_id: execution_id.to_string(),
+        worker_name: worker.name.clone(),
+        worker_namespace,
+        prompt: worker.prompt.clone(),
+        timeout_seconds: worker.timeout_seconds,
+        output_path: worker.output_path.clone(),
+    };
+    spawn_worker_run(launch)
 }
 
 fn build_job_operator_message(
@@ -2887,6 +3061,186 @@ fn save_job_controller_state(
     let raw =
         serde_json::to_string_pretty(state).context("failed to encode job controller state")?;
     fs::write(&path, raw).with_context(|| format!("failed to write '{}'", path.display()))
+}
+
+fn worker_run_root(control_namespace: &str, job_name: &str) -> anyhow::Result<PathBuf> {
+    Ok(control_plane_root()?
+        .join("state")
+        .join("worker-runs")
+        .join(control_namespace)
+        .join(slugify(job_name)))
+}
+
+fn worker_run_manifest_path(
+    control_namespace: &str,
+    job_name: &str,
+    execution_id: &str,
+) -> anyhow::Result<PathBuf> {
+    Ok(worker_run_root(control_namespace, job_name)?
+        .join("manifests")
+        .join(format!("{}.json", slugify(execution_id))))
+}
+
+fn worker_run_completion_path(
+    control_namespace: &str,
+    job_name: &str,
+    execution_id: &str,
+) -> anyhow::Result<PathBuf> {
+    Ok(worker_run_root(control_namespace, job_name)?
+        .join("results")
+        .join(format!("{}.json", slugify(execution_id))))
+}
+
+fn worker_run_artifact_path(
+    control_namespace: &str,
+    job_name: &str,
+    execution_id: &str,
+) -> anyhow::Result<PathBuf> {
+    Ok(worker_run_root(control_namespace, job_name)?
+        .join("artifacts")
+        .join(format!("{}.out", slugify(execution_id))))
+}
+
+fn load_worker_run_completion(
+    control_namespace: &str,
+    job_name: &str,
+    execution_id: &str,
+) -> anyhow::Result<Option<WorkerRunCompletion>> {
+    let path = worker_run_completion_path(control_namespace, job_name, execution_id)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read '{}'", path.display()))?;
+    let completion = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse '{}'", path.display()))?;
+    Ok(Some(completion))
+}
+
+fn save_worker_run_completion(
+    control_namespace: &str,
+    job_name: &str,
+    completion: &WorkerRunCompletion,
+) -> anyhow::Result<()> {
+    let path = worker_run_completion_path(control_namespace, job_name, &completion.execution_id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create '{}'", parent.display()))?;
+    }
+    let raw =
+        serde_json::to_string_pretty(completion).context("failed to encode worker completion")?;
+    fs::write(&path, raw).with_context(|| format!("failed to write '{}'", path.display()))
+}
+
+fn spawn_worker_run(manifest: WorkerRunLaunchManifest) -> anyhow::Result<()> {
+    let manifest_path = worker_run_manifest_path(
+        &manifest.control_namespace,
+        &manifest.job_name,
+        &manifest.execution_id,
+    )?;
+    if let Some(parent) = manifest_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create '{}'", parent.display()))?;
+    }
+    let raw =
+        serde_json::to_string_pretty(&manifest).context("failed to encode worker-run manifest")?;
+    fs::write(&manifest_path, raw)
+        .with_context(|| format!("failed to write '{}'", manifest_path.display()))?;
+    let mut command =
+        ProcessCommand::new(env::current_exe().context("failed to resolve current executable")?);
+    command
+        .arg("worker-run-serve")
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+        .spawn()
+        .context("failed to spawn worker-run helper process")?;
+    Ok(())
+}
+
+pub fn serve_worker_run(manifest_path: PathBuf) -> anyhow::Result<()> {
+    let raw = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("failed to read '{}'", manifest_path.display()))?;
+    let manifest: WorkerRunLaunchManifest =
+        serde_json::from_str(&raw).context("failed to parse worker-run manifest")?;
+    let _ = fs::remove_file(&manifest_path);
+
+    let artifact_path = worker_run_artifact_path(
+        &manifest.control_namespace,
+        &manifest.job_name,
+        &manifest.execution_id,
+    )?;
+    if let Some(parent) = artifact_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create '{}'", parent.display()))?;
+    }
+
+    let timeout = Duration::from_secs(manifest.timeout_seconds.unwrap_or(300));
+    let (tx, rx) = mpsc::channel();
+    let worker_name = manifest.worker_name.clone();
+    let worker_namespace = manifest.worker_namespace.clone();
+    let prompt = manifest.prompt.clone();
+    thread::spawn(move || {
+        let result = invoke_worker(&worker_name, Some(&worker_namespace), &prompt);
+        let _ = tx.send(result);
+    });
+
+    let outcome = match rx.recv_timeout(timeout) {
+        Ok(result) => result.map_err(|error| error.to_string()),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "worker run '{}' timed out after {}s",
+            manifest.execution_id,
+            timeout.as_secs()
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(format!(
+            "worker run '{}' disconnected before reporting a result",
+            manifest.execution_id
+        )),
+    };
+
+    let completed_at_epoch_ms = now_epoch_ms();
+    let completion = match outcome {
+        Ok(output) => {
+            fs::write(&artifact_path, &output)
+                .with_context(|| format!("failed to write '{}'", artifact_path.display()))?;
+            if let Some(output_path) = manifest.output_path.as_deref() {
+                let output_path = PathBuf::from(output_path);
+                if let Some(parent) = output_path.parent() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("failed to create '{}'", parent.display()))?;
+                }
+                fs::write(&output_path, &output)
+                    .with_context(|| format!("failed to write '{}'", output_path.display()))?;
+            }
+            WorkerRunCompletion {
+                execution_id: manifest.execution_id.clone(),
+                worker_name: manifest.worker_name.clone(),
+                status: JobRunPhase::Succeeded,
+                completed_at_epoch_ms,
+                artifact_path: artifact_path.display().to_string(),
+                output_path: manifest.output_path.clone(),
+                error: None,
+            }
+        }
+        Err(error) => {
+            fs::write(&artifact_path, format!("ERROR: {error}\n"))
+                .with_context(|| format!("failed to write '{}'", artifact_path.display()))?;
+            WorkerRunCompletion {
+                execution_id: manifest.execution_id.clone(),
+                worker_name: manifest.worker_name.clone(),
+                status: JobRunPhase::Failed,
+                completed_at_epoch_ms,
+                artifact_path: artifact_path.display().to_string(),
+                output_path: manifest.output_path.clone(),
+                error: Some(error),
+            }
+        }
+    };
+
+    save_worker_run_completion(&manifest.control_namespace, &manifest.job_name, &completion)
 }
 
 fn reconcile_cron_job(manifest: &ResourceEnvelope<CronJobSpec>) -> anyhow::Result<String> {
@@ -3892,11 +4246,20 @@ fn delete_deployment_resources(
 fn delete_job_resources(control_namespace: &str, job_name: &str) -> anyhow::Result<()> {
     let state = load_job_controller_state(control_namespace, job_name).unwrap_or_default();
     for run in &state.runs {
-        let _ = delete_runtime_session_by_namespace(&run.runtime_namespace);
+        match run.backend {
+            JobRunBackend::Runtime => {
+                let _ = delete_runtime_session_by_namespace(&run.runtime_namespace);
+            }
+            JobRunBackend::Worker => {}
+        }
     }
     let state_path = job_controller_state_path(control_namespace, job_name)?;
     if state_path.exists() {
         let _ = fs::remove_file(&state_path);
+    }
+    let worker_run_root = worker_run_root(control_namespace, job_name)?;
+    if worker_run_root.exists() {
+        let _ = fs::remove_dir_all(&worker_run_root);
     }
     delete_manifest_only(ResourceKind::Job, job_name, Some(control_namespace))
 }
@@ -5039,6 +5402,25 @@ fn job_status_from_state(
             .filter(|run| run.status == JobRunPhase::Failed)
             .count(),
         runs,
+        run_details: state
+            .runs
+            .iter()
+            .map(|run| JobRunDetail {
+                name: run.name.clone(),
+                execution_id: run.runtime_namespace.clone(),
+                backend: match run.backend {
+                    JobRunBackend::Runtime => "runtime".to_string(),
+                    JobRunBackend::Worker => "worker".to_string(),
+                },
+                phase: job_phase_name(run.status).to_string(),
+                worker: run.worker_name.clone(),
+                created_at_epoch_ms: run.created_at_epoch_ms,
+                completed_at_epoch_ms: run.completed_at_epoch_ms,
+                artifact_path: run.artifact_path.clone(),
+                output_path: run.output_path.clone(),
+                error: run.last_error.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -5055,24 +5437,63 @@ fn refreshed_job_state(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<J
     let sessions = collect_runtime_sessions()?;
     let now = now_epoch_ms();
     for run in &mut state.runs {
-        let session = sessions
-            .iter()
-            .find(|session| session.namespace == run.runtime_namespace);
-        let completion = if session.is_none() {
-            native_session_completion(&run.runtime_namespace)?
-        } else {
-            None
-        };
-        if job_session_is_active(session) {
-            run.last_active_epoch_ms = Some(now);
+        match run.backend {
+            JobRunBackend::Runtime => {
+                let session = sessions
+                    .iter()
+                    .find(|session| session.namespace == run.runtime_namespace);
+                let completion = if session.is_none() {
+                    native_session_completion(&run.runtime_namespace)?
+                } else {
+                    None
+                };
+                if job_session_is_active(session) {
+                    run.last_active_epoch_ms = Some(now);
+                }
+                run.status = job_run_phase(
+                    session,
+                    completion.as_ref(),
+                    run.status,
+                    run.last_active_epoch_ms.unwrap_or(run.created_at_epoch_ms),
+                    now,
+                );
+                if run.status != JobRunPhase::Active && run.completed_at_epoch_ms.is_none() {
+                    run.completed_at_epoch_ms = Some(now);
+                }
+            }
+            JobRunBackend::Worker => {
+                if let Some(completion) = load_worker_run_completion(
+                    manifest.namespace_key(),
+                    &manifest.metadata.name,
+                    &run.runtime_namespace,
+                )? {
+                    run.status = completion.status;
+                    run.completed_at_epoch_ms = Some(completion.completed_at_epoch_ms);
+                    run.artifact_path = Some(completion.artifact_path);
+                    run.output_path = completion.output_path;
+                    run.last_error = completion.error;
+                } else if run.status == JobRunPhase::Active {
+                    let timeout_seconds = manifest
+                        .spec
+                        .worker
+                        .as_ref()
+                        .and_then(|worker| worker.timeout_seconds)
+                        .unwrap_or(300);
+                    let max_active_ms =
+                        u128::from(timeout_seconds).saturating_mul(1000) + JOB_COMPLETION_GRACE_MS;
+                    if now.saturating_sub(run.created_at_epoch_ms) > max_active_ms {
+                        run.status = JobRunPhase::Failed;
+                        run.completed_at_epoch_ms = Some(now);
+                        if run.last_error.is_none() {
+                            run.last_error = Some(format!(
+                                "worker run '{}' did not report completion within {}s",
+                                run.runtime_namespace, timeout_seconds
+                            ));
+                        }
+                    }
+                }
+            }
         }
-        run.status = job_run_phase(
-            session,
-            completion.as_ref(),
-            run.status,
-            run.last_active_epoch_ms.unwrap_or(run.created_at_epoch_ms),
-            now,
-        );
     }
     save_job_controller_state(manifest.namespace_key(), &manifest.metadata.name, &state)?;
     Ok(state)
@@ -6057,6 +6478,50 @@ spec:
     }
 
     #[test]
+    fn parse_worker_backed_job_manifest_without_task_note() {
+        let manifests = parse_manifest_documents(
+            r#"apiVersion: jarvisctl.io/v1alpha1
+kind: Job
+metadata:
+  name: summarize-docs
+spec:
+  parallelism: 1
+  completions: 1
+  worker:
+    name: qwen-junior
+    prompt: Return strict JSON only.
+"#,
+        )
+        .unwrap();
+
+        let ResourceManifest::Job(job) = &manifests[0] else {
+            panic!("expected job manifest");
+        };
+
+        let worker = job.spec.worker.as_ref().expect("worker spec should exist");
+        assert_eq!(worker.name, "qwen-junior");
+        assert_eq!(worker.prompt, "Return strict JSON only.");
+        assert!(job.spec.template.task_note.is_empty());
+    }
+
+    #[test]
+    fn worker_backed_job_rejects_missing_prompt() {
+        let error = parse_manifest_documents(
+            r#"apiVersion: jarvisctl.io/v1alpha1
+kind: Job
+metadata:
+  name: summarize-docs
+spec:
+  worker:
+    name: qwen-junior
+    prompt: ""
+"#,
+        )
+        .expect_err("expected validation failure");
+        assert!(error.to_string().contains("spec.worker.prompt"));
+    }
+
+    #[test]
     fn kubernetes_cron_parser_accepts_five_field_syntax() {
         assert!(parse_kubernetes_cron_schedule("* * * * *").is_ok());
         assert!(parse_kubernetes_cron_schedule("@hourly").is_ok());
@@ -6132,6 +6597,55 @@ spec:
 
         let phase = job_run_phase(None, Some(&completion), JobRunPhase::Active, 1_000, 2_000);
         assert_eq!(phase, JobRunPhase::Succeeded);
+    }
+
+    #[test]
+    fn job_status_includes_structured_worker_run_details() {
+        let manifest = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Job".to_string(),
+            metadata: ResourceMetadata {
+                name: "summarize-docs".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: JobSpec {
+                worker: Some(WorkerJobSpec {
+                    name: "qwen-junior".to_string(),
+                    prompt: "Return strict JSON only.".to_string(),
+                    timeout_seconds: Some(30),
+                    output_path: Some("/tmp/worker-job.out".to_string()),
+                    ..WorkerJobSpec::default()
+                }),
+                ..JobSpec::default()
+            },
+        };
+        let state = JobControllerState {
+            runs: vec![JobRunState {
+                name: "run-0".to_string(),
+                runtime_namespace: "workers-lab--summarize-docs--j0".to_string(),
+                created_at_epoch_ms: 1_000,
+                backend: JobRunBackend::Worker,
+                worker_name: Some("qwen-junior".to_string()),
+                last_active_epoch_ms: Some(1_000),
+                completed_at_epoch_ms: Some(2_000),
+                artifact_path: Some("/tmp/worker-job-artifact.out".to_string()),
+                output_path: Some("/tmp/worker-job.out".to_string()),
+                last_error: None,
+                status: JobRunPhase::Succeeded,
+            }],
+        };
+
+        let status = job_status_from_state(&manifest, &state);
+        assert_eq!(status.succeeded, 1);
+        assert_eq!(status.run_details.len(), 1);
+        assert_eq!(status.run_details[0].backend, "worker");
+        assert_eq!(status.run_details[0].worker.as_deref(), Some("qwen-junior"));
+        assert_eq!(
+            status.run_details[0].artifact_path.as_deref(),
+            Some("/tmp/worker-job-artifact.out")
+        );
     }
 
     #[test]
