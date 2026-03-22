@@ -274,17 +274,18 @@ Use `outputMode: json` for bounded classification, extraction, or routing tasks 
 Hosted `nvidia` and `moonshot` workers use OpenAI-compatible chat-completions endpoints. By default, `nvidia` reads `NVIDIA_API_KEY` and targets `https://integrate.api.nvidia.com/v1/chat/completions`, while `moonshot` reads `MOONSHOT_API_KEY` and targets `https://api.moonshot.cn/v1/chat/completions`.
 For GUI-launched operators like the Obsidian plugin, prefer `spec.apiKeySecretRef` over shell env inheritance. A worker can now resolve hosted credentials from a `Secret` resource in the same control namespace, with the env var acting only as an override when present.
 Third-party models served through NVIDIA Build, such as `moonshotai/kimi-k2-instruct`, still use `provider: nvidia` because the endpoint and credential are NVIDIA-managed. Use `provider: moonshot` only when you are calling Moonshot's own API directly.
-For a concrete hosted-lane setup, see [contrib/openclaw-hosted-workers.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-hosted-workers.yaml). It defines a small `openclaw` namespace with NVIDIA-backed `routing-svc` and `code-svc` worker services over Nemotron and Kimi using secret-backed credentials. Pair it with [contrib/openclaw-hosted-secrets.example.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-hosted-secrets.example.yaml) to create the `Secret` resources those workers expect.
+For a concrete hosted-lane setup, see [contrib/openclaw-hosted-workers.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-hosted-workers.yaml). It defines a small `openclaw` namespace with NVIDIA-backed `routing-svc` and `code-svc` worker services over Kimi using secret-backed credentials. Pair it with [contrib/openclaw-hosted-secrets.example.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-hosted-secrets.example.yaml) to create the `Secret` resources those workers expect.
 
 The NVIDIA Build free-endpoint catalog currently shows 94 preview/free models under the `nim_type_preview` filter, but not all of them fit `jarvisctl`'s current bounded text/json worker contract. For that reason the OpenClaw preset separates **stable hot-path lanes** from **experimental catalog lanes**. See [contrib/openclaw-nvidia-free-endpoints.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-nvidia-free-endpoints.yaml) with its matching [contrib/openclaw-nvidia-build-secret.example.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-nvidia-build-secret.example.yaml).
 
 Stable services in that preset:
 
-* `routing-svc`: `nvidia/nemotron-mini-4b-instruct`
+* `routing-svc`: `moonshotai/kimi-k2-instruct`
 * `code-svc`: `moonshotai/kimi-k2-instruct`
 
 Experimental services in that preset:
 
+* `routing-exp-svc`: `nvidia/nemotron-mini-4b-instruct` with `z-ai/glm4.7`
 * `planning-exp-svc`: `stepfun-ai/step-3-5-flash`
 * `reasoning-exp-svc`: `deepseek-ai/deepseek-v3.1-terminus` with `microsoft/phi-4-mini-flash-reasoning`
 * `heavy-code-exp-svc`: `qwen/qwen3-coder-480b-a35b-instruct` with `mistralai/devstral-2-123b-instruct-2512`
@@ -292,9 +293,9 @@ Experimental services in that preset:
 
 The preset also tags workers with `metadata.labels.stability: stable|experimental`, and the stable services select only `stability: stable` workers. That keeps the hot path narrow in the UI and at runtime:
 
-* `routing-svc` resolves only the proven routing lane
+* `routing-svc` resolves only the proven Kimi routing lane
 * `code-svc` resolves only the proven Kimi coding lane
-* `*-exp-svc` resources are explicit opt-in lanes for scorecards, probes, and manual evaluation
+* `*-exp-svc` resources are explicit opt-in lanes for scorecards, probes, and manual evaluation, including the weaker routing alternates
 
 Typical bootstrap:
 

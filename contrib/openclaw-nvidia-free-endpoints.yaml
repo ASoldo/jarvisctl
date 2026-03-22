@@ -107,7 +107,7 @@ spec:
 apiVersion: jarvisctl.io/v1alpha1
 kind: Worker
 metadata:
-  name: nemotron-routing
+  name: kimi-routing
   namespace: openclaw
   labels:
     stability: stable
@@ -115,7 +115,7 @@ metadata:
     role: routing
 spec:
   provider: nvidia
-  model: nvidia/nemotron-mini-4b-instruct
+  model: moonshotai/kimi-k2-instruct
   locality: remote
   apiKeySecretRef:
     name: nvidia-build
@@ -123,6 +123,41 @@ spec:
   pool: nvidia-routing
   classes:
     - junior-routing
+  capabilities:
+    - routing
+    - triage
+    - reasoning
+    - json
+  maxConcurrent: 2
+  outputMode: json
+  temperature: 0.1
+  topP: 0.7
+  numPredict: 384
+  systemPrompt: |
+    You are a bounded routing worker.
+    Return strict JSON only with no markdown fences or extra commentary.
+    When a schema shows choices like "a|b|c", pick exactly one allowed value.
+    Never echo the union string itself.
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Worker
+metadata:
+  name: nemotron-routing
+  namespace: openclaw
+  labels:
+    stability: experimental
+    lane: route
+    role: routing-exp
+spec:
+  provider: nvidia
+  model: nvidia/nemotron-mini-4b-instruct
+  locality: remote
+  apiKeySecretRef:
+    name: nvidia-build
+    key: apiKey
+  pool: nvidia-routing-exp
+  classes:
+    - experimental-routing
   capabilities:
     - routing
     - triage
@@ -134,7 +169,7 @@ spec:
   topP: 0.7
   numPredict: 256
   systemPrompt: |
-    You are a bounded routing worker.
+    You are an experimental routing worker.
     Return strict JSON only with no markdown fences or extra commentary.
     When a schema shows choices like "a|b|c", pick exactly one allowed value.
     Never echo the union string itself.
@@ -349,6 +384,28 @@ spec:
   fallbackClassNames:
     - junior-code
   requiredCapabilities:
+    - json
+  preferredProviders:
+    - nvidia
+  allowedIntents:
+    - route_task
+    - task_offload
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Service
+metadata:
+  name: routing-exp-svc
+  namespace: openclaw
+spec:
+  targetKind: worker
+  selector:
+    stability: experimental
+    lane: route
+  className: experimental-routing
+  fallbackClassNames:
+    - junior-routing
+  requiredCapabilities:
+    - routing
     - json
   preferredProviders:
     - nvidia
