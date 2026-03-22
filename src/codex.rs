@@ -194,6 +194,8 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
         },
         options.context_overlay.clone(),
     );
+    let runtime_environment =
+        merge_runtime_environment(options.environment.clone(), &namespace, &runtime_context);
     let (runtime_backend, codex_session_id) = match options.driver {
         CodexRuntimeDriver::CliPty => {
             let mut launch_command = if launches_codex(&command) {
@@ -205,7 +207,10 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
             };
             launch_command.push(prompt.clone());
 
-            let wrapped_command = wrap_launch_command(&finish_mode, &launch_command);
+            let wrapped_command = wrap_launch_command(
+                &finish_mode,
+                &with_environment(launch_command, &runtime_environment),
+            );
             let resume_transcript_path = match resume_session_id.as_deref() {
                 Some(session_id) => transcript_path_for_session_id(session_id)?,
                 None => None,
@@ -245,7 +250,7 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
                     .iter()
                     .map(|image| image.display().to_string())
                     .collect(),
-                environment: options.environment.clone(),
+                environment: runtime_environment.clone(),
                 resume_session_id: resume_session_id.clone(),
                 created_at_epoch_ms: timestamp_ms,
                 context: runtime_context.clone(),
@@ -457,6 +462,57 @@ fn with_environment(command: Vec<String>, environment: &BTreeMap<String, String>
     }
     wrapped.extend(command);
     wrapped
+}
+
+fn merge_runtime_environment(
+    mut environment: BTreeMap<String, String>,
+    runtime_namespace: &str,
+    context: &RuntimeContextMetadata,
+) -> BTreeMap<String, String> {
+    environment
+        .entry("JARVIS_RUNTIME_NAMESPACE".to_string())
+        .or_insert_with(|| runtime_namespace.to_string());
+    if let Some(control_namespace) = context
+        .control_namespace
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        environment
+            .entry("JARVIS_CONTROL_NAMESPACE".to_string())
+            .or_insert_with(|| control_namespace.to_string());
+    }
+    if let Some(deployment) = context
+        .deployment
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        environment
+            .entry("JARVIS_DEPLOYMENT".to_string())
+            .or_insert_with(|| deployment.to_string());
+    }
+    if let Some(workload) = context
+        .workload
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        environment
+            .entry("JARVIS_WORKLOAD".to_string())
+            .or_insert_with(|| workload.to_string());
+    }
+    if let Some(task_id) = context
+        .task_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        environment
+            .entry("JARVIS_TASK_ID".to_string())
+            .or_insert_with(|| task_id.to_string());
+    }
+    environment
 }
 
 fn merge_runtime_context(
@@ -967,10 +1023,11 @@ fn read_session_meta(path: &Path) -> Option<SessionMetaEnvelope> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HistoricalLaunchRecord, build_base_command, build_codex_prompt, canonical_path_string,
-        discover_latest_launch_session_id_in_dir,
+        HistoricalLaunchRecord, RuntimeContextMetadata, build_base_command, build_codex_prompt,
+        canonical_path_string, discover_latest_launch_session_id_in_dir, merge_runtime_environment,
     };
     use crate::ticket::TicketNote;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1048,6 +1105,42 @@ repo_path: /tmp/repo
         .unwrap();
         assert_eq!(resolved.as_deref(), Some("session-new"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn merge_runtime_environment_injects_runtime_context_vars() {
+        let merged = merge_runtime_environment(
+            BTreeMap::new(),
+            "openclaw-offloader",
+            &RuntimeContextMetadata {
+                workload: Some("codex".to_string()),
+                task_id: Some("demo-task".to_string()),
+                control_namespace: Some("openclaw".to_string()),
+                deployment: Some("planner".to_string()),
+                ..RuntimeContextMetadata::default()
+            },
+        );
+
+        assert_eq!(
+            merged.get("JARVIS_RUNTIME_NAMESPACE").map(String::as_str),
+            Some("openclaw-offloader")
+        );
+        assert_eq!(
+            merged.get("JARVIS_CONTROL_NAMESPACE").map(String::as_str),
+            Some("openclaw")
+        );
+        assert_eq!(
+            merged.get("JARVIS_WORKLOAD").map(String::as_str),
+            Some("codex")
+        );
+        assert_eq!(
+            merged.get("JARVIS_TASK_ID").map(String::as_str),
+            Some("demo-task")
+        );
+        assert_eq!(
+            merged.get("JARVIS_DEPLOYMENT").map(String::as_str),
+            Some("planner")
+        );
     }
 
     fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {

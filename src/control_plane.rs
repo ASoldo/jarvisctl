@@ -356,6 +356,48 @@ pub struct WorkerValidationSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkerOffloadRequest {
+    pub service_name: String,
+    pub resource_namespace: Option<String>,
+    pub prompt: String,
+    pub intent: Option<String>,
+    pub timeout_seconds: Option<u64>,
+    pub output_path: Option<String>,
+    pub job_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerOffloadResult {
+    pub job_name: String,
+    pub namespace: String,
+    pub service_name: String,
+    pub phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_class: Option<String>,
+    pub fallback_class: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_namespace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_locality: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceRoutingStrategy {
     #[default]
@@ -2722,20 +2764,53 @@ fn atomic_write_string(path: &Path, raw: &str) -> anyhow::Result<()> {
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| anyhow!("path '{}' has no file name", path.display()))?;
-    let temp_path = parent.join(format!(
-        ".{}.tmp.{}.{}",
-        file_name,
-        std::process::id(),
-        Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    ));
-    fs::write(&temp_path, raw)
-        .with_context(|| format!("failed to write '{}'", temp_path.display()))?;
-    fs::rename(&temp_path, path).with_context(|| {
-        format!(
-            "failed to rename '{}' to '{}'",
-            temp_path.display(),
-            path.display()
-        )
+    let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let temp_candidates = [
+        parent.join(format!(
+            ".{}.tmp.{}.{}",
+            file_name,
+            std::process::id(),
+            timestamp
+        )),
+        parent.join(format!(
+            "{}.tmp.{}.{}",
+            file_name,
+            std::process::id(),
+            timestamp
+        )),
+    ];
+    let mut last_error = None;
+
+    for temp_path in &temp_candidates {
+        match fs::write(temp_path, raw) {
+            Ok(()) => {
+                return fs::rename(temp_path, path).with_context(|| {
+                    format!(
+                        "failed to rename '{}' to '{}'",
+                        temp_path.display(),
+                        path.display()
+                    )
+                });
+            }
+            Err(error) => {
+                last_error = Some(anyhow!(
+                    "failed to write '{}': {}",
+                    temp_path.display(),
+                    error
+                ));
+            }
+        }
+    }
+
+    fs::write(path, raw).with_context(|| {
+        if let Some(error) = &last_error {
+            format!(
+                "failed to write '{}' after temp-file fallbacks ({error})",
+                path.display()
+            )
+        } else {
+            format!("failed to write '{}'", path.display())
+        }
     })
 }
 
@@ -9007,6 +9082,195 @@ pub fn invoke_worker(
         WorkerProvider::Nvidia => invoke_openai_compatible_worker(&worker, prompt),
         WorkerProvider::Moonshot => invoke_openai_compatible_worker(&worker, prompt),
     }
+}
+
+pub fn offload_worker_task(request: WorkerOffloadRequest) -> anyhow::Result<WorkerOffloadResult> {
+    let control_namespace =
+        normalize_namespaced_resource_namespace(request.resource_namespace.as_deref());
+    let service_name = request.service_name.trim();
+    ensure!(
+        !service_name.is_empty(),
+        "worker offload requires a service name"
+    );
+    ensure!(
+        !request.prompt.trim().is_empty(),
+        "worker offload requires a prompt"
+    );
+
+    let job_name = request
+        .job_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "offload-{}-{}",
+                slugify(service_name),
+                now_epoch_ms() % 1_000_000
+            )
+        });
+    let timeout_seconds = request.timeout_seconds.unwrap_or(180);
+    let mut labels = current_offload_source_labels();
+    labels.insert("jarvisctl.io/offload".to_string(), "true".to_string());
+    labels.insert("jarvisctl.io/service".to_string(), service_name.to_string());
+
+    let job = ResourceEnvelope {
+        api_version: API_VERSION.to_string(),
+        kind: "Job".to_string(),
+        metadata: ResourceMetadata {
+            name: job_name.clone(),
+            namespace: Some(control_namespace.clone()),
+            labels,
+            annotations: BTreeMap::new(),
+        },
+        spec: JobSpec {
+            backoff_limit: 0,
+            worker: Some(WorkerJobSpec {
+                service_name: Some(service_name.to_string()),
+                service_namespace: Some(control_namespace.clone()),
+                intent: request.intent.clone(),
+                prompt: request.prompt,
+                timeout_seconds: Some(timeout_seconds),
+                output_path: request.output_path.clone(),
+                ..WorkerJobSpec::default()
+            }),
+            ..JobSpec::default()
+        },
+    };
+
+    save_manifest(&ResourceManifest::Job(job.clone()))?;
+    let _ = reconcile_control_plane()?;
+
+    let wait_timeout = Duration::from_secs(timeout_seconds.saturating_add(30));
+    let start = Instant::now();
+    loop {
+        let _ = reconcile_control_plane()?;
+        let manifest = load_manifest(ResourceKind::Job, &job_name, Some(&control_namespace))?;
+        let ResourceManifest::Job(job_manifest) = manifest else {
+            bail!("resource '{}/{}' is not a Job", control_namespace, job_name);
+        };
+        let status = job_status(&job_manifest)?;
+        let complete = status.succeeded >= status.completions;
+        let failed = job_terminal_failure(&job_manifest, &status);
+        if complete || failed {
+            let result = worker_offload_result(&job_manifest, &status)?;
+            if complete {
+                return Ok(result);
+            }
+            let detail = result
+                .validation_message
+                .clone()
+                .or_else(|| result.response.clone())
+                .or_else(|| {
+                    status
+                        .run_details
+                        .iter()
+                        .find_map(|run| run.error.clone().or_else(|| run.reason.clone()))
+                })
+                .unwrap_or_else(|| "worker offload failed".to_string());
+            bail!(
+                "worker offload job '{}/{}' failed via service '{}': {}",
+                control_namespace,
+                job_name,
+                service_name,
+                detail
+            );
+        }
+        if start.elapsed() >= wait_timeout {
+            bail!(
+                "timed out waiting for worker offload job '{}/{}' after {}s",
+                control_namespace,
+                job_name,
+                wait_timeout.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn current_offload_source_labels() -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    if let Ok(value) = env::var("JARVIS_RUNTIME_NAMESPACE") {
+        let value = value.trim();
+        if !value.is_empty() {
+            labels.insert(
+                "jarvisctl.io/source-runtime-namespace".to_string(),
+                value.to_string(),
+            );
+        }
+    }
+    if let Ok(value) = env::var("JARVIS_WORKLOAD") {
+        let value = value.trim();
+        if !value.is_empty() {
+            labels.insert("workload".to_string(), value.to_string());
+        }
+    }
+    if let Ok(value) = env::var("JARVIS_TASK_ID") {
+        let value = value.trim();
+        if !value.is_empty() {
+            labels.insert("jarvisctl.io/task-id".to_string(), value.to_string());
+        }
+    }
+    if let Ok(value) = env::var("JARVIS_DEPLOYMENT") {
+        let value = value.trim();
+        if !value.is_empty() {
+            labels.insert("jarvisctl.io/deployment".to_string(), value.to_string());
+        }
+    }
+    labels
+}
+
+fn worker_offload_result(
+    manifest: &ResourceEnvelope<JobSpec>,
+    status: &JobStatus,
+) -> anyhow::Result<WorkerOffloadResult> {
+    let detail = primary_job_run_detail(status)
+        .ok_or_else(|| anyhow!("worker offload job has no run details"))?;
+    let response_path = detail
+        .output_path
+        .as_deref()
+        .or(detail.artifact_path.as_deref());
+    let response = response_path
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .map(|path| {
+            fs::read_to_string(&path).with_context(|| {
+                format!("failed to read worker offload output '{}'", path.display())
+            })
+        })
+        .transpose()?;
+
+    Ok(WorkerOffloadResult {
+        job_name: manifest.metadata.name.clone(),
+        namespace: manifest.namespace_key().to_string(),
+        service_name: detail
+            .service_name
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        phase: detail.phase.clone(),
+        selected_class: detail.selected_class.clone(),
+        fallback_class: detail.fallback_class,
+        worker: detail.worker.clone(),
+        worker_namespace: detail.worker_namespace.clone(),
+        worker_provider: detail.worker_provider.clone(),
+        worker_model: detail.worker_model.clone(),
+        worker_locality: detail.worker_locality.clone(),
+        validation_state: detail.validation_state.clone(),
+        validation_message: detail.validation_message.clone(),
+        artifact_path: detail.artifact_path.clone(),
+        output_path: detail.output_path.clone(),
+        response,
+    })
+}
+
+fn primary_job_run_detail(status: &JobStatus) -> Option<&JobRunDetail> {
+    status
+        .run_details
+        .iter()
+        .find(|run| run.phase == "succeeded")
+        .or_else(|| status.run_details.iter().find(|run| run.phase == "failed"))
+        .or_else(|| status.run_details.first())
 }
 
 fn invoke_ollama_worker(

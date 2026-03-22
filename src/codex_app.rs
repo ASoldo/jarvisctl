@@ -1,3 +1,4 @@
+use crate::control_plane::{WorkerOffloadRequest, WorkerOffloadResult, offload_worker_task};
 use crate::native::{
     NativeAgentMetadata, NativeSessionMetadata, RuntimeContextMetadata, RuntimeFeedEntry,
     RuntimeSubagentAction, RuntimeSubagentMetadata,
@@ -62,6 +63,9 @@ pub enum CodexAppInputMode {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 enum ClientMessage {
     Metadata,
+    WorkerOffload {
+        request: WorkerOffloadRequest,
+    },
     Attach {
         agent: String,
     },
@@ -79,6 +83,7 @@ enum ServerMessage {
     Ok,
     Error { message: String },
     Metadata(NativeSessionMetadata),
+    WorkerOffloadResult(WorkerOffloadResult),
     Attached { namespace: String, agent: String },
     Output { data_base64: String },
     Exited { agent: String },
@@ -1245,8 +1250,15 @@ pub fn serve_codex_app_session(manifest_path: PathBuf) -> anyhow::Result<()> {
         }
     });
 
+    let queue_session = Arc::clone(&session);
+    thread::spawn(move || {
+        while !queue_session.shutdown_requested.load(Ordering::SeqCst) {
+            let _ = drain_control_queue(&queue_session);
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+
     while !session.shutdown_requested.load(Ordering::SeqCst) {
-        let _ = drain_control_queue(&session);
         match listener.accept() {
             Ok((stream, _)) => {
                 let session = Arc::clone(&session);
@@ -1293,7 +1305,7 @@ pub fn collect_codex_app_sessions() -> anyhow::Result<Vec<NativeSessionMetadata>
         let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
             continue;
         };
-        match codex_app_session_metadata(&name)? {
+        match read_session_metadata_file(&name)? {
             Some(metadata) => sessions.push(metadata),
             None => {}
         }
@@ -1315,6 +1327,8 @@ pub fn codex_app_session_metadata(
         );
         let stream = UnixStream::connect(&socket_path)
             .with_context(|| format!("failed to connect '{}'", socket_path.display()))?;
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
         let mut writer = stream
             .try_clone()
             .context("failed to clone codex app metadata stream")?;
@@ -1473,7 +1487,9 @@ pub fn attach_codex_app(namespace: &str) -> anyhow::Result<()> {
                         .push(format!("[attach] {}", message));
                     break;
                 }
-                ServerMessage::Ok | ServerMessage::Metadata(..) => {}
+                ServerMessage::Ok
+                | ServerMessage::Metadata(..)
+                | ServerMessage::WorkerOffloadResult(..) => {}
             }
         }
     });
@@ -1517,7 +1533,12 @@ fn handle_client(stream: UnixStream, session: Arc<CodexAppSession>) -> anyhow::R
             );
         }
         other => {
-            let response = handle_client_message(&session, other)?;
+            let response = match handle_client_message(&session, other) {
+                Ok(response) => response,
+                Err(error) => ServerMessage::Error {
+                    message: error.to_string(),
+                },
+            };
             send_server_message(&mut writer, &response)?;
         }
     }
@@ -1531,6 +1552,10 @@ fn handle_client_message(
 ) -> anyhow::Result<ServerMessage> {
     match request {
         ClientMessage::Metadata => Ok(ServerMessage::Metadata(session.metadata())),
+        ClientMessage::WorkerOffload { request } => {
+            let result = offload_worker_task(request)?;
+            Ok(ServerMessage::WorkerOffloadResult(result))
+        }
         ClientMessage::Attach { .. } => {
             bail!("attach is not supported over the filesystem control queue")
         }
@@ -1578,6 +1603,44 @@ fn request_metadata_direct(namespace: &str) -> anyhow::Result<NativeSessionMetad
             other
         )),
     }
+}
+
+pub fn request_worker_offload_via_runtime_namespace(
+    runtime_namespace: &str,
+    request_payload: WorkerOffloadRequest,
+) -> anyhow::Result<WorkerOffloadResult> {
+    let runtime_namespace = runtime_namespace.trim();
+    ensure!(
+        !runtime_namespace.is_empty(),
+        "runtime namespace must not be empty for worker offload proxy"
+    );
+    match request(
+        runtime_namespace,
+        &ClientMessage::WorkerOffload {
+            request: request_payload,
+        },
+    )? {
+        ServerMessage::WorkerOffloadResult(result) => Ok(result),
+        ServerMessage::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected worker offload response while waiting for codex app session '{}': {:?}",
+            runtime_namespace,
+            other
+        )),
+    }
+}
+
+pub fn request_worker_offload_for_current_runtime(
+    request_payload: WorkerOffloadRequest,
+) -> anyhow::Result<Option<WorkerOffloadResult>> {
+    let runtime_namespace = env::var("JARVIS_RUNTIME_NAMESPACE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let Some(runtime_namespace) = runtime_namespace else {
+        return Ok(None);
+    };
+    request_worker_offload_via_runtime_namespace(&runtime_namespace, request_payload).map(Some)
 }
 
 fn send_message(stream: &mut UnixStream, message: &ClientMessage) -> anyhow::Result<()> {
@@ -2344,7 +2407,7 @@ fn request_via_control_queue(
         },
     )?;
 
-    let deadline = SystemTime::now() + Duration::from_secs(5);
+    let deadline = SystemTime::now() + control_queue_response_timeout(message);
     loop {
         if response_path.exists() {
             let raw = fs::read_to_string(&response_path)
@@ -2361,6 +2424,19 @@ fn request_via_control_queue(
             );
         }
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn control_queue_response_timeout(message: &ClientMessage) -> Duration {
+    match message {
+        ClientMessage::WorkerOffload { request } => Duration::from_secs(
+            request
+                .timeout_seconds
+                .unwrap_or(180)
+                .saturating_add(30)
+                .max(30),
+        ),
+        _ => Duration::from_secs(5),
     }
 }
 

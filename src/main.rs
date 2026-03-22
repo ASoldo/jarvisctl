@@ -31,17 +31,18 @@ use agent::spawn_agent;
 use codex::{CodexLaunchOptions, CodexRuntimeDriver, enrich_native_sessions, launch_codex_ticket};
 use codex_app::{
     CodexAppInputMode, attach_codex_app, codex_app_session_metadata, collect_codex_app_sessions,
-    delete_codex_app_session, interrupt_codex_app, serve_codex_app_session,
+    delete_codex_app_session, interrupt_codex_app, request_worker_offload_for_current_runtime,
+    request_worker_offload_via_runtime_namespace, serve_codex_app_session,
     tell_codex_app_with_mode,
 };
 use control_plane::{
-    ControlPlaneOutput, ControlPlaneResourceKindArg, apply_kustomization, apply_manifests,
-    authorize_runtime_message, invoke_worker, pause_deployment_rollout,
-    render_application_diff_output, render_describe_output, render_get_output,
-    render_rollout_history_output, render_rollout_status_output, resolve_service_target,
-    resolve_service_target_for_message, restart_deployment_rollout, resume_deployment_rollout,
-    serve_worker_run, sync_application_resource, undo_deployment_rollout,
-    wait_for_rollout_status_output,
+    ControlPlaneOutput, ControlPlaneResourceKindArg, WorkerOffloadRequest, apply_kustomization,
+    apply_manifests, authorize_runtime_message, invoke_worker, offload_worker_task,
+    pause_deployment_rollout, render_application_diff_output, render_describe_output,
+    render_get_output, render_rollout_history_output, render_rollout_status_output,
+    resolve_service_target, resolve_service_target_for_message, restart_deployment_rollout,
+    resume_deployment_rollout, serve_worker_run, sync_application_resource,
+    undo_deployment_rollout, wait_for_rollout_status_output,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use native::{
@@ -54,6 +55,13 @@ use tui::{run_dashboard, view_agent};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum SessionBackend {
     Native,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum WorkerOffloadOutput {
+    Text,
+    Json,
+    Yaml,
 }
 
 #[derive(Error, Debug)]
@@ -150,6 +158,10 @@ enum Command {
         /// Override the runtime namespace
         #[arg(long)]
         namespace: Option<String>,
+
+        /// Bind the launched Codex runtime to a control-plane namespace
+        #[arg(long = "control-namespace")]
+        control_namespace: Option<String>,
 
         /// Number of Codex agents to create
         #[arg(long, default_value_t = 1)]
@@ -536,6 +548,39 @@ enum WorkerCommand {
         #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "prompt")]
         file: Option<PathBuf>,
     },
+
+    /// Submit a worker-backed offload job through a worker Service and wait for the result
+    Offload {
+        #[arg(long)]
+        service: String,
+
+        #[arg(short = 'n', long = "resource-namespace")]
+        resource_namespace: Option<String>,
+
+        #[arg(long = "via-runtime-namespace")]
+        via_runtime_namespace: Option<String>,
+
+        #[arg(long, conflicts_with = "file")]
+        prompt: Option<String>,
+
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "prompt")]
+        file: Option<PathBuf>,
+
+        #[arg(long)]
+        intent: Option<String>,
+
+        #[arg(long = "job-name")]
+        job_name: Option<String>,
+
+        #[arg(long = "timeout-seconds", default_value_t = 180)]
+        timeout_seconds: u64,
+
+        #[arg(long = "output-path", value_hint = ValueHint::FilePath)]
+        output_path: Option<PathBuf>,
+
+        #[arg(long, value_enum, default_value_t = WorkerOffloadOutput::Text)]
+        output: WorkerOffloadOutput,
+    },
 }
 
 #[instrument]
@@ -598,6 +643,7 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             driver,
             task_note,
             namespace,
+            control_namespace,
             agents,
             agent,
             fresh,
@@ -622,7 +668,10 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             operator_message: message,
             images: image,
             environment: Default::default(),
-            context_overlay: RuntimeContextMetadata::default(),
+            context_overlay: RuntimeContextMetadata {
+                control_namespace,
+                ..RuntimeContextMetadata::default()
+            },
             extra_runtime_args: Vec::new(),
             startup_delay_ms,
             command,
@@ -1017,6 +1066,73 @@ fn worker_command(command: WorkerCommand) -> Result<(), JarvisError> {
                 invoke_worker(&worker, resource_namespace.as_deref(), &prompt)
                     .map_err(JarvisError::from)?
             );
+            Ok(())
+        }
+        WorkerCommand::Offload {
+            service,
+            resource_namespace,
+            via_runtime_namespace,
+            prompt,
+            file,
+            intent,
+            job_name,
+            timeout_seconds,
+            output_path,
+            output,
+        } => {
+            let prompt = read_worker_prompt(prompt.as_deref(), file.as_deref())?;
+            let request_payload = WorkerOffloadRequest {
+                service_name: service,
+                resource_namespace,
+                prompt,
+                intent,
+                timeout_seconds: Some(timeout_seconds),
+                output_path: output_path.map(|path| path.display().to_string()),
+                job_name,
+            };
+            let result = if let Some(runtime_namespace) = via_runtime_namespace {
+                request_worker_offload_via_runtime_namespace(&runtime_namespace, request_payload)
+                    .map_err(JarvisError::from)?
+            } else {
+                request_worker_offload_for_current_runtime(request_payload.clone())
+                    .map_err(JarvisError::from)?
+                    .map_or_else(
+                        || offload_worker_task(request_payload).map_err(JarvisError::from),
+                        Ok,
+                    )?
+            };
+
+            match output {
+                WorkerOffloadOutput::Text => {
+                    if let Some(response) = result.response.as_deref() {
+                        print!("{}", response);
+                        if !response.ends_with('\n') {
+                            println!();
+                        }
+                    } else {
+                        println!(
+                            "worker offload completed: {}/{} via {}",
+                            result.namespace, result.job_name, result.service_name
+                        );
+                    }
+                }
+                WorkerOffloadOutput::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&result)
+                            .map_err(anyhow::Error::from)
+                            .map_err(JarvisError::from)?
+                    );
+                }
+                WorkerOffloadOutput::Yaml => {
+                    println!(
+                        "{}",
+                        serde_yaml::to_string(&result)
+                            .map_err(anyhow::Error::from)
+                            .map_err(JarvisError::from)?
+                    );
+                }
+            }
             Ok(())
         }
     }

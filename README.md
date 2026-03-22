@@ -419,6 +419,59 @@ When `preferLocal: true` is set and a matching local worker is blocked by RAM or
 Optional `spec.worker.validation.shellCommand` lets you score or verify the produced worker output after the model returns. The validator receives `JARVIS_WORKER_ARTIFACT_PATH`, `JARVIS_WORKER_OUTPUT_PATH`, `JARVIS_WORKER_NAME`, `JARVIS_WORKER_NAMESPACE`, `JARVIS_WORKER_EXECUTION_ID`, `JARVIS_WORKER_PROVIDER`, and `JARVIS_WORKER_MODEL`. Set `failJobOnFailure: true` to make a failed scorecard fail the Job, or leave it `false` to keep the run successful while still surfacing `validation_state`, `validation_message`, and validation events in `status.run_details`.
 For a concrete hosted-model scorecard example, see [contrib/openclaw-validated-probes.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-validated-probes.yaml). It layers route and code probes on top of the hosted OpenClaw worker services and demonstrates non-enforcing validation for Nemotron routing plus enforcing validation for Kimi code generation.
 
+### Offload from a live Codex runtime
+
+If a live Codex namespace should stay in the loop but hand a bounded task to a worker lane, launch that runtime with a control namespace and then offload through a worker `Service`.
+
+Launch the runtime:
+
+```bash
+jarvisctl codex \
+  --namespace openclaw-runtime-v3 \
+  --control-namespace openclaw \
+  --task-note /home/rootster/documents/codex/Tickets/openclaw-runtime-worker-flow-v3.md \
+  --message 'Stay open. Use worker services for bounded route/code tasks.'
+```
+
+Then offload via the runtime host session:
+
+```bash
+jarvisctl worker offload \
+  --service routing-svc \
+  -n openclaw \
+  --via-runtime-namespace openclaw-runtime-v3 \
+  --prompt 'Return strict JSON with lane, confidence, and selected_files for a bounded title-case helper task.' \
+  --output json
+```
+
+Or for a code lane:
+
+```bash
+jarvisctl worker offload \
+  --service code-svc \
+  -n openclaw \
+  --via-runtime-namespace openclaw-runtime-v3 \
+  --prompt 'Return strict JSON with a JavaScript function implementing normalizeTitleCase(input).' \
+  --output json
+```
+
+This path matters because a sandboxed live Codex shell may not be allowed to write manifests under `~/.jarvis/control-plane/...` directly. `--via-runtime-namespace` sends the request through the live app-server host session, which creates the worker-backed `Job`, waits for it, and returns a structured `WorkerOffloadResult`.
+
+The returned JSON includes:
+
+* `job_name`, `namespace`, and `service_name`
+* selected `worker`, `worker_provider`, `worker_model`, and `worker_locality`
+* `selected_class` and `fallback_class`
+* `validation_state` and `validation_message` when a scorecard ran
+* `artifact_path`, `output_path`, and inline `response` when available
+
+The OpenClaw runtime demo uses this split:
+
+* Codex runtime: orchestration, checkpointing, subagent review, receiver handoff
+* `routing-svc`: bounded route selection
+* `code-svc`: bounded junior-code generation on Kimi
+* receiver namespace: parked follow-up endpoint for cross-namespace queue validation
+
 ### Inspect CronJob status
 
 ```bash
