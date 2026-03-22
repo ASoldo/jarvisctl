@@ -1,0 +1,119 @@
+apiVersion: jarvisctl.io/v1alpha1
+kind: Job
+metadata:
+  name: route-triage
+  namespace: openclaw
+spec:
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  worker:
+    serviceName: routing-svc
+    serviceNamespace: openclaw
+    intent: route_task
+    timeoutSeconds: 120
+    outputPath: /tmp/openclaw-route-validated.json
+    validation:
+      shellCommand: |
+        python3 - <<'PY'
+        import json
+        import os
+        import sys
+
+        path = os.environ["JARVIS_WORKER_OUTPUT_PATH"]
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+
+        files = set(payload.get("files") or [])
+        lane = payload.get("lane")
+        confidence = float(payload.get("confidence") or 0.0)
+        expected_files = {"src/control_plane.rs", "README.md"}
+
+        checks = []
+        if lane != "junior-code":
+            checks.append(f"lane={lane!r}")
+        if files != expected_files:
+            checks.append(f"files={sorted(files)!r}")
+        if confidence < 0.6:
+            checks.append(f"confidence={confidence}")
+
+        if checks:
+            print("route scorecard failed: " + ", ".join(checks))
+            sys.exit(1)
+
+        print(f"route scorecard passed with confidence={confidence}")
+        PY
+      failJobOnFailure: false
+    prompt: |
+      Return strict JSON only with this schema:
+      {"lane":"junior-routing|junior-code","files":["string"],"confidence":number,"reason":"string"}
+
+      Task:
+      Add service-level worker routing defaults and provider preference to jarvisctl, then document the new policy fields in README.
+
+      Rules:
+      - Choose exactly one lane value: "junior-routing" or "junior-code".
+      - Return confidence as a float between 0 and 1.
+      - Include the two most important files only.
+      - Files must be chosen from this candidate set only:
+        - src/control_plane.rs
+        - README.md
+        - contrib/openclaw-hosted-workers.yaml
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Job
+metadata:
+  name: code-slugify
+  namespace: openclaw
+spec:
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  worker:
+    serviceName: code-svc
+    serviceNamespace: openclaw
+    intent: code_task
+    timeoutSeconds: 180
+    outputPath: /tmp/openclaw-code-validated.json
+    validation:
+      shellCommand: |
+        python3 - <<'PY'
+        import json
+        import os
+
+        path = os.environ["JARVIS_WORKER_OUTPUT_PATH"]
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+
+        namespace = {}
+        exec(payload["code"], namespace)
+        fn = namespace[payload["entrypoint"]]
+
+        cases = {
+            "Hello, World!": "hello-world",
+            "  Multi   Space  ": "multi-space",
+            "Already---Slugged": "already-slugged",
+            "snake_case name": "snake-case-name",
+        }
+
+        for raw, expected in cases.items():
+            actual = fn(raw)
+            if actual != expected:
+                raise SystemExit(
+                    f"slug scorecard failed: {raw!r} -> {actual!r} expected {expected!r}"
+                )
+
+        print("slug scorecard passed")
+        PY
+      failJobOnFailure: true
+    prompt: |
+      Return strict JSON only with this schema:
+      {"language":"python","entrypoint":"string","code":"string"}
+
+      Write a Python function named normalize_slug(value: str) -> str that:
+      - lowercases input
+      - trims surrounding whitespace
+      - removes punctuation other than spaces, underscores, and dashes
+      - converts spaces and underscores to single dashes
+      - collapses repeated dashes
+      - strips leading and trailing dashes

@@ -201,6 +201,12 @@ pub struct WorkerSpec {
     pub endpoint: Option<String>,
     #[serde(default, rename = "apiKeyEnv", skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    #[serde(
+        default,
+        rename = "apiKeySecretRef",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub api_key_secret_ref: Option<SecretKeyRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(
@@ -264,6 +270,14 @@ pub struct WorkerSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SecretKeyRef {
+    pub name: String,
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WorkerJobSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -324,6 +338,20 @@ pub struct WorkerJobSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub output_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<WorkerValidationSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkerValidationSpec {
+    #[serde(
+        default,
+        rename = "shellCommand",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub shell_command: Option<String>,
+    #[serde(default, rename = "failJobOnFailure", skip_serializing_if = "is_false")]
+    pub fail_job_on_failure: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1172,6 +1200,9 @@ struct JobRunDetail {
     worker_classes: Vec<String>,
     admission_state: Option<String>,
     admission_code: Option<String>,
+    validation_state: Option<String>,
+    validation_message: Option<String>,
+    validation_enforced: bool,
     reason: Option<String>,
     created_at_epoch_ms: u128,
     completed_at_epoch_ms: Option<u128>,
@@ -1224,6 +1255,12 @@ struct JobRunState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     admission_code: Option<WorkerAdmissionCode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    validation_state: Option<WorkerRunValidationState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    validation_message: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    validation_enforced: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     admission_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_active_epoch_ms: Option<u128>,
@@ -1267,6 +1304,13 @@ enum WorkerAdmissionCode {
     RemoteFallback,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum WorkerRunValidationState {
+    Passed,
+    Failed,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum JobRunPhase {
@@ -1294,6 +1338,8 @@ struct WorkerRunLaunchManifest {
     timeout_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    validation: Option<WorkerValidationSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1306,7 +1352,19 @@ struct WorkerRunCompletion {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    validation_state: Option<WorkerRunValidationState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    validation_message: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    validation_enforced: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkerValidationOutcome {
+    state: WorkerRunValidationState,
+    message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -2401,6 +2459,15 @@ fn validate_job(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<()> {
                 manifest.metadata.name
             );
         }
+        if let Some(validation) = worker.validation.as_ref() {
+            if let Some(shell_command) = validation.shell_command.as_deref() {
+                ensure!(
+                    !shell_command.trim().is_empty(),
+                    "Job '{}' has an empty spec.worker.validation.shellCommand",
+                    manifest.metadata.name
+                );
+            }
+        }
         if let Some(intent) = worker.intent.as_deref() {
             ensure!(
                 !intent.trim().is_empty(),
@@ -2538,6 +2605,25 @@ fn validate_worker(manifest: &ResourceEnvelope<WorkerSpec>) -> anyhow::Result<()
             "Worker '{}' has an empty spec.apiKeyEnv",
             manifest.metadata.name
         );
+    }
+    if let Some(secret_ref) = manifest.spec.api_key_secret_ref.as_ref() {
+        ensure!(
+            !secret_ref.name.trim().is_empty(),
+            "Worker '{}' has an empty spec.apiKeySecretRef.name",
+            manifest.metadata.name
+        );
+        ensure!(
+            !secret_ref.key.trim().is_empty(),
+            "Worker '{}' has an empty spec.apiKeySecretRef.key",
+            manifest.metadata.name
+        );
+        if let Some(namespace) = secret_ref.namespace.as_deref() {
+            ensure!(
+                !namespace.trim().is_empty(),
+                "Worker '{}' has an empty spec.apiKeySecretRef.namespace",
+                manifest.metadata.name
+            );
+        }
     }
     if let Some(max_concurrent) = manifest.spec.max_concurrent {
         ensure!(
@@ -3567,6 +3653,9 @@ fn reconcile_job(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<String>
                     None
                 },
                 admission_code: None,
+                validation_state: None,
+                validation_message: None,
+                validation_enforced: false,
                 admission_reason: None,
                 last_active_epoch_ms: Some(now),
                 completed_at_epoch_ms: None,
@@ -3847,6 +3936,7 @@ fn launch_worker_job_run(
         prompt: worker.prompt.clone(),
         timeout_seconds: worker.timeout_seconds,
         output_path: worker.output_path.clone(),
+        validation: worker.validation.clone(),
     };
     spawn_worker_run(launch)
 }
@@ -4024,6 +4114,100 @@ fn worker_run_artifact_path(
         .join(format!("{}.out", slugify(execution_id))))
 }
 
+fn worker_validation_state_name(state: WorkerRunValidationState) -> &'static str {
+    match state {
+        WorkerRunValidationState::Passed => "passed",
+        WorkerRunValidationState::Failed => "failed",
+    }
+}
+
+fn run_worker_output_validation(
+    manifest: &WorkerRunLaunchManifest,
+    artifact_path: &Path,
+) -> anyhow::Result<Option<WorkerValidationOutcome>> {
+    let Some(validation) = manifest.validation.as_ref() else {
+        return Ok(None);
+    };
+    let Some(shell_command) = validation
+        .shell_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let worker_manifest = match load_manifest(
+        ResourceKind::Worker,
+        &manifest.worker_name,
+        Some(&manifest.worker_namespace),
+    ) {
+        Ok(ResourceManifest::Worker(worker)) => Some(worker),
+        _ => None,
+    };
+    let mut command = ProcessCommand::new("bash");
+    command.arg("-lc").arg(shell_command);
+    command.env(
+        "JARVIS_WORKER_ARTIFACT_PATH",
+        artifact_path.display().to_string(),
+    );
+    command.env(
+        "JARVIS_WORKER_OUTPUT_PATH",
+        manifest
+            .output_path
+            .clone()
+            .unwrap_or_else(|| artifact_path.display().to_string()),
+    );
+    command.env("JARVIS_WORKER_NAME", &manifest.worker_name);
+    command.env("JARVIS_WORKER_NAMESPACE", &manifest.worker_namespace);
+    command.env("JARVIS_WORKER_EXECUTION_ID", &manifest.execution_id);
+    if let Some(worker_manifest) = worker_manifest.as_ref() {
+        command.env(
+            "JARVIS_WORKER_PROVIDER",
+            worker_provider_name(worker_manifest.spec.provider),
+        );
+        command.env("JARVIS_WORKER_MODEL", &worker_manifest.spec.model);
+    }
+    let output = command
+        .output()
+        .context("failed to execute worker validation command")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let message = if output.status.success() {
+        if stdout.is_empty() {
+            "validation passed".to_string()
+        } else {
+            stdout
+        }
+    } else {
+        let mut parts = Vec::new();
+        if !stdout.is_empty() {
+            parts.push(stdout);
+        }
+        if !stderr.is_empty() {
+            parts.push(stderr);
+        }
+        if parts.is_empty() {
+            parts.push(
+                output
+                    .status
+                    .code()
+                    .map(|code| format!("validation command exited with status {}", code))
+                    .unwrap_or_else(|| "validation command terminated by signal".to_string()),
+            );
+        }
+        parts.join(" | ")
+    };
+    Ok(Some(WorkerValidationOutcome {
+        state: if output.status.success() {
+            WorkerRunValidationState::Passed
+        } else {
+            WorkerRunValidationState::Failed
+        },
+        message,
+    }))
+}
+
 fn load_worker_run_completion(
     control_namespace: &str,
     job_name: &str,
@@ -4137,14 +4321,33 @@ pub fn serve_worker_run(manifest_path: PathBuf) -> anyhow::Result<()> {
                 fs::write(&output_path, &output)
                     .with_context(|| format!("failed to write '{}'", output_path.display()))?;
             }
+            let validation = run_worker_output_validation(&manifest, &artifact_path)?;
+            let validation_enforced = manifest
+                .validation
+                .as_ref()
+                .map(|spec| spec.fail_job_on_failure)
+                .unwrap_or(false);
+            let validation_failed = validation
+                .as_ref()
+                .is_some_and(|outcome| outcome.state == WorkerRunValidationState::Failed);
             WorkerRunCompletion {
                 execution_id: manifest.execution_id.clone(),
                 worker_name: manifest.worker_name.clone(),
-                status: JobRunPhase::Succeeded,
+                status: if validation_failed && validation_enforced {
+                    JobRunPhase::Failed
+                } else {
+                    JobRunPhase::Succeeded
+                },
                 completed_at_epoch_ms,
                 artifact_path: artifact_path.display().to_string(),
                 output_path: manifest.output_path.clone(),
-                error: None,
+                validation_state: validation.as_ref().map(|outcome| outcome.state),
+                validation_message: validation.as_ref().map(|outcome| outcome.message.clone()),
+                validation_enforced,
+                error: validation.as_ref().and_then(|outcome| {
+                    (outcome.state == WorkerRunValidationState::Failed && validation_enforced)
+                        .then(|| format!("worker output validation failed: {}", outcome.message))
+                }),
             }
         }
         Err(error) => {
@@ -4157,6 +4360,9 @@ pub fn serve_worker_run(manifest_path: PathBuf) -> anyhow::Result<()> {
                 completed_at_epoch_ms,
                 artifact_path: artifact_path.display().to_string(),
                 output_path: manifest.output_path.clone(),
+                validation_state: None,
+                validation_message: None,
+                validation_enforced: false,
                 error: Some(error),
             }
         }
@@ -6776,6 +6982,41 @@ fn job_run_events(run: &JobRunState) -> Vec<StatusEvent> {
         ));
     }
 
+    if let Some(validation_state) = run.validation_state {
+        let transition_epoch_ms = run.completed_at_epoch_ms.unwrap_or(run.created_at_epoch_ms);
+        let reason = match validation_state {
+            WorkerRunValidationState::Passed => "ValidationPassed",
+            WorkerRunValidationState::Failed => {
+                if run.validation_enforced {
+                    "ValidationFailedEnforced"
+                } else {
+                    "ValidationFailedObserved"
+                }
+            }
+        };
+        let default_message = match validation_state {
+            WorkerRunValidationState::Passed => {
+                format!(
+                    "Run '{}' passed worker output validation",
+                    run.runtime_namespace
+                )
+            }
+            WorkerRunValidationState::Failed => {
+                format!(
+                    "Run '{}' failed worker output validation",
+                    run.runtime_namespace
+                )
+            }
+        };
+        events.push(status_event(
+            "job_run_validation",
+            reason,
+            run.validation_message.clone().unwrap_or(default_message),
+            transition_epoch_ms,
+            Some(run.runtime_namespace.clone()),
+        ));
+    }
+
     sort_status_events_desc(&mut events);
     events
 }
@@ -7284,6 +7525,11 @@ fn job_status_from_state(
                     admission_code: run
                         .admission_code
                         .map(|code| worker_admission_code_name(code).to_string()),
+                    validation_state: run
+                        .validation_state
+                        .map(|state| worker_validation_state_name(state).to_string()),
+                    validation_message: run.validation_message.clone(),
+                    validation_enforced: run.validation_enforced,
                     reason: run
                         .admission_reason
                         .clone()
@@ -7357,6 +7603,9 @@ fn refreshed_job_state(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<J
                     run.completed_at_epoch_ms = Some(completion.completed_at_epoch_ms);
                     run.artifact_path = Some(completion.artifact_path);
                     run.output_path = completion.output_path;
+                    run.validation_state = completion.validation_state;
+                    run.validation_message = completion.validation_message;
+                    run.validation_enforced = completion.validation_enforced;
                     run.last_error = completion.error;
                 } else if matches!(run.status, JobRunPhase::Active | JobRunPhase::Pending) {
                     let timeout_seconds = manifest
@@ -7598,38 +7847,166 @@ fn worker_provider_name(provider: WorkerProvider) -> &'static str {
     }
 }
 
-fn worker_api_key_env_name(manifest: &ResourceEnvelope<WorkerSpec>) -> Option<&str> {
-    match manifest.spec.provider {
-        WorkerProvider::Ollama => manifest
-            .spec
-            .api_key_env
-            .as_deref()
-            .filter(|value| !value.trim().is_empty()),
-        WorkerProvider::Nvidia => Some(
-            manifest
-                .spec
-                .api_key_env
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or("NVIDIA_API_KEY"),
-        ),
-        WorkerProvider::Moonshot => Some(
-            manifest
-                .spec
-                .api_key_env
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or("MOONSHOT_API_KEY"),
-        ),
+#[derive(Debug, Clone)]
+struct ResolvedSecretKeyRef {
+    namespace: String,
+    name: String,
+    key: String,
+}
+
+#[derive(Debug, Clone)]
+struct WorkerCredentialStatus {
+    present: bool,
+    missing_reason: Option<String>,
+}
+
+fn worker_explicit_api_key_env_name(manifest: &ResourceEnvelope<WorkerSpec>) -> Option<&str> {
+    manifest
+        .spec
+        .api_key_env
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn worker_default_api_key_env_name(provider: WorkerProvider) -> Option<&'static str> {
+    match provider {
+        WorkerProvider::Ollama => None,
+        WorkerProvider::Nvidia => Some("NVIDIA_API_KEY"),
+        WorkerProvider::Moonshot => Some("MOONSHOT_API_KEY"),
     }
 }
 
-fn worker_has_required_credentials(manifest: &ResourceEnvelope<WorkerSpec>) -> bool {
-    worker_api_key_env_name(manifest).is_none_or(|key| {
-        env::var_os(key)
+fn worker_api_key_env_name(manifest: &ResourceEnvelope<WorkerSpec>) -> Option<&str> {
+    worker_explicit_api_key_env_name(manifest)
+        .or_else(|| worker_default_api_key_env_name(manifest.spec.provider))
+}
+
+fn worker_api_key_secret_ref(
+    manifest: &ResourceEnvelope<WorkerSpec>,
+) -> Option<ResolvedSecretKeyRef> {
+    manifest
+        .spec
+        .api_key_secret_ref
+        .as_ref()
+        .map(|secret_ref| ResolvedSecretKeyRef {
+            namespace: normalize_namespaced_resource_namespace(
+                secret_ref
+                    .namespace
+                    .as_deref()
+                    .or(manifest.metadata.namespace.as_deref()),
+            ),
+            name: secret_ref.name.clone(),
+            key: secret_ref.key.clone(),
+        })
+}
+
+fn load_worker_api_key_from_secret(
+    manifest: &ResourceEnvelope<WorkerSpec>,
+    secret_ref: &ResolvedSecretKeyRef,
+) -> anyhow::Result<Option<String>> {
+    let secret_manifest = load_manifest(
+        ResourceKind::Secret,
+        &secret_ref.name,
+        Some(&secret_ref.namespace),
+    )?;
+    let ResourceManifest::Secret(secret) = secret_manifest else {
+        bail!(
+            "resource '{}/{}' is not a Secret",
+            secret_ref.namespace,
+            secret_ref.name
+        );
+    };
+    ensure!(
+        access_policy_allows_workload(
+            &secret.spec.access_policy,
+            manifest.namespace_key(),
+            &manifest.metadata.labels
+        ),
+        "secret '{}/{}' is not allowed for worker '{}'",
+        secret_ref.namespace,
+        secret_ref.name,
+        manifest.metadata.name
+    );
+    Ok(secret
+        .spec
+        .string_data
+        .get(&secret_ref.key)
+        .cloned()
+        .filter(|value| !value.trim().is_empty()))
+}
+
+fn resolve_worker_credential_status(
+    manifest: &ResourceEnvelope<WorkerSpec>,
+) -> WorkerCredentialStatus {
+    if let Some(key_env) = worker_explicit_api_key_env_name(manifest) {
+        if env::var_os(key_env)
             .and_then(|value| value.into_string().ok())
             .is_some_and(|value| !value.trim().is_empty())
-    })
+        {
+            return WorkerCredentialStatus {
+                present: true,
+                missing_reason: None,
+            };
+        }
+    }
+
+    if let Some(secret_ref) = worker_api_key_secret_ref(manifest) {
+        return match load_worker_api_key_from_secret(manifest, &secret_ref) {
+            Ok(Some(_)) => WorkerCredentialStatus {
+                present: true,
+                missing_reason: None,
+            },
+            Ok(None) => WorkerCredentialStatus {
+                present: false,
+                missing_reason: Some(format!(
+                    "waiting for {} worker '{}' because secret '{}/{}' key '{}' is not set",
+                    worker_locality_name(&effective_worker_locality(manifest)),
+                    manifest.metadata.name,
+                    secret_ref.namespace,
+                    secret_ref.name,
+                    secret_ref.key
+                )),
+            },
+            Err(error) => WorkerCredentialStatus {
+                present: false,
+                missing_reason: Some(format!(
+                    "waiting for {} worker '{}' because secret '{}/{}' key '{}' is unavailable: {}",
+                    worker_locality_name(&effective_worker_locality(manifest)),
+                    manifest.metadata.name,
+                    secret_ref.namespace,
+                    secret_ref.name,
+                    secret_ref.key,
+                    error
+                )),
+            },
+        };
+    }
+
+    if let Some(key_env) = worker_default_api_key_env_name(manifest.spec.provider) {
+        if env::var_os(key_env)
+            .and_then(|value| value.into_string().ok())
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return WorkerCredentialStatus {
+                present: true,
+                missing_reason: None,
+            };
+        }
+        return WorkerCredentialStatus {
+            present: false,
+            missing_reason: Some(format!(
+                "waiting for {} worker '{}' because env '{}' is not set",
+                worker_locality_name(&effective_worker_locality(manifest)),
+                manifest.metadata.name,
+                key_env
+            )),
+        };
+    }
+
+    WorkerCredentialStatus {
+        present: true,
+        missing_reason: None,
+    }
 }
 
 fn worker_admission_code_name(code: WorkerAdmissionCode) -> &'static str {
@@ -7945,16 +8322,17 @@ fn evaluate_worker_admission(
         .then_some(machine_capacity.gpu_memory_available_mib)
         .flatten();
 
-    let (admission_code, reason) = if !worker_has_required_credentials(manifest) {
-        let key = worker_api_key_env_name(manifest).unwrap_or("API_KEY");
+    let credential_status = resolve_worker_credential_status(manifest);
+    let (admission_code, reason) = if !credential_status.present {
         (
             WorkerAdmissionCode::CredentialsMissing,
-            format!(
-                "waiting for {} worker '{}' because env '{}' is not set",
-                worker_locality_name(&locality),
-                manifest.metadata.name,
-                key
-            ),
+            credential_status.missing_reason.unwrap_or_else(|| {
+                format!(
+                    "waiting for {} worker '{}' because credentials are not available",
+                    worker_locality_name(&locality),
+                    manifest.metadata.name
+                )
+            }),
         )
     } else if available_slots == 0 {
         (
@@ -8656,19 +9034,51 @@ fn invoke_openai_compatible_worker(
     prompt: &str,
 ) -> anyhow::Result<String> {
     let provider_name = worker_provider_name(manifest.spec.provider);
-    let key_env = worker_api_key_env_name(manifest).unwrap_or("API_KEY");
-    let api_key = env::var(key_env).with_context(|| {
-        format!(
-            "{} worker '{}' requires env '{}' to be set",
-            provider_name, manifest.metadata.name, key_env
-        )
-    })?;
+    let api_key = worker_explicit_api_key_env_name(manifest)
+        .and_then(|key_env| env::var(key_env).ok())
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            worker_api_key_secret_ref(manifest).and_then(|secret_ref| {
+                load_worker_api_key_from_secret(manifest, &secret_ref)
+                    .ok()
+                    .flatten()
+            })
+        })
+        .or_else(|| {
+            worker_default_api_key_env_name(manifest.spec.provider)
+                .and_then(|key_env| env::var(key_env).ok())
+                .filter(|value| !value.trim().is_empty())
+        })
+        .ok_or_else(|| {
+            if let Some(secret_ref) = worker_api_key_secret_ref(manifest) {
+                anyhow!(
+                    "{} worker '{}' requires secret '{}/{}' key '{}' or an available API-key env override",
+                    provider_name,
+                    manifest.metadata.name,
+                    secret_ref.namespace,
+                    secret_ref.name,
+                    secret_ref.key
+                )
+            } else if let Some(key_env) = worker_api_key_env_name(manifest) {
+                anyhow!(
+                    "{} worker '{}' requires env '{}' to be set",
+                    provider_name,
+                    manifest.metadata.name,
+                    key_env
+                )
+            } else {
+                anyhow!(
+                    "{} worker '{}' requires credentials to be configured",
+                    provider_name,
+                    manifest.metadata.name
+                )
+            }
+        })?;
     ensure!(
         !api_key.trim().is_empty(),
-        "{} worker '{}' requires env '{}' to be non-empty",
+        "{} worker '{}' requires non-empty credentials",
         provider_name,
-        manifest.metadata.name,
-        key_env
+        manifest.metadata.name
     );
 
     let mut system_parts = Vec::new();
@@ -9998,6 +10408,9 @@ spec:
                 worker_locality: Some(WorkerLocality::Local),
                 admission_state: Some(JobRunAdmissionState::Granted),
                 admission_code: Some(WorkerAdmissionCode::Ready),
+                validation_state: Some(WorkerRunValidationState::Passed),
+                validation_message: Some("validation passed".to_string()),
+                validation_enforced: true,
                 admission_reason: Some("admitted on local worker 'qwen-junior'".to_string()),
                 last_active_epoch_ms: Some(1_000),
                 completed_at_epoch_ms: Some(2_000),
@@ -10034,6 +10447,15 @@ spec:
             Some("junior-code")
         );
         assert!(status.run_details[0].fallback_class);
+        assert_eq!(
+            status.run_details[0].validation_state.as_deref(),
+            Some("passed")
+        );
+        assert_eq!(
+            status.run_details[0].validation_message.as_deref(),
+            Some("validation passed")
+        );
+        assert!(status.run_details[0].validation_enforced);
         assert_eq!(
             status.run_details[0].worker_locality.as_deref(),
             Some("local")
@@ -10121,6 +10543,9 @@ spec:
                     worker_locality: None,
                     admission_state: Some(JobRunAdmissionState::Granted),
                     admission_code: Some(WorkerAdmissionCode::Ready),
+                    validation_state: Some(WorkerRunValidationState::Passed),
+                    validation_message: Some("validation passed".to_string()),
+                    validation_enforced: false,
                     admission_reason: Some("admitted on local worker 'qwen-junior'".to_string()),
                     last_active_epoch_ms: Some(1_700_000_000_100),
                     completed_at_epoch_ms: Some(1_700_000_000_200),
@@ -10251,6 +10676,57 @@ spec:
     }
 
     #[test]
+    fn worker_status_accepts_secret_backed_nvidia_credentials() {
+        let _lock = home_env_lock().lock().unwrap();
+        let _home = TempHomeGuard::new("jarvisctl-worker-status-nvidia-secret-creds");
+        let _api_key = TempEnvVarGuard::set("NVIDIA_API_KEY", "");
+
+        save_manifest(&ResourceManifest::Secret(ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Secret".to_string(),
+            metadata: ResourceMetadata {
+                name: "nvidia-creds".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: SecretSpec {
+                string_data: BTreeMap::from([(
+                    "apiKey".to_string(),
+                    "test-secret-token".to_string(),
+                )]),
+                access_policy: ResourceAccessPolicy::default(),
+            },
+        }))
+        .unwrap();
+
+        let manifest = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Worker".to_string(),
+            metadata: ResourceMetadata {
+                name: "nemotron-secret".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: WorkerSpec {
+                provider: WorkerProvider::Nvidia,
+                model: "nvidia/nemotron-mini-4b-instruct".to_string(),
+                api_key_secret_ref: Some(SecretKeyRef {
+                    name: "nvidia-creds".to_string(),
+                    key: "apiKey".to_string(),
+                    namespace: None,
+                }),
+                ..WorkerSpec::default()
+            },
+        };
+
+        let status = worker_status(&manifest).unwrap();
+        assert_eq!(status.admission_code, "ready");
+        assert!(!status.admission_reason.contains("credentials"));
+    }
+
+    #[test]
     fn invoke_worker_supports_nvidia_openai_compatible_endpoint() {
         let _lock = home_env_lock().lock().unwrap();
         let _home = TempHomeGuard::new("jarvisctl-worker-nvidia-invoke");
@@ -10341,6 +10817,86 @@ spec:
                 .and_then(|message| message.get("role"))
                 .and_then(serde_json::Value::as_str),
             Some("system")
+        );
+    }
+
+    #[test]
+    fn invoke_worker_supports_secret_backed_nvidia_credentials() {
+        let _lock = home_env_lock().lock().unwrap();
+        let _home = TempHomeGuard::new("jarvisctl-worker-nvidia-secret-invoke");
+        let _api_key = TempEnvVarGuard::set("NVIDIA_API_KEY", "");
+
+        save_manifest(&ResourceManifest::Secret(ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Secret".to_string(),
+            metadata: ResourceMetadata {
+                name: "nvidia-creds".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: SecretSpec {
+                string_data: BTreeMap::from([(
+                    "apiKey".to_string(),
+                    "test-secret-token".to_string(),
+                )]),
+                access_policy: ResourceAccessPolicy::default(),
+            },
+        }))
+        .unwrap();
+
+        let (endpoint, rx, handle) = spawn_json_response_server(json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "{\"result\":\"ok\",\"lane\":\"routing\"}"
+                    }
+                }
+            ]
+        }));
+
+        save_manifest(&ResourceManifest::Worker(ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Worker".to_string(),
+            metadata: ResourceMetadata {
+                name: "nemotron-secret".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: WorkerSpec {
+                provider: WorkerProvider::Nvidia,
+                model: "nvidia/nemotron-mini-4b-instruct".to_string(),
+                endpoint: Some(format!("{}/v1", endpoint)),
+                api_key_secret_ref: Some(SecretKeyRef {
+                    name: "nvidia-creds".to_string(),
+                    key: "apiKey".to_string(),
+                    namespace: None,
+                }),
+                output_mode: Some(WorkerOutputMode::Json),
+                ..WorkerSpec::default()
+            },
+        }))
+        .unwrap();
+
+        let output = invoke_worker(
+            "nemotron-secret",
+            Some("workers-lab"),
+            "Return strict JSON with keys result and lane.",
+        )
+        .unwrap();
+        let request = rx.recv().unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(
+            output,
+            "{\n  \"lane\": \"routing\",\n  \"result\": \"ok\"\n}"
+        );
+        assert!(
+            request
+                .to_lowercase()
+                .contains("authorization: bearer test-secret-token"),
+            "{request}"
         );
     }
 
@@ -10553,6 +11109,9 @@ spec:
                     worker_locality: None,
                     admission_state: Some(JobRunAdmissionState::Granted),
                     admission_code: Some(WorkerAdmissionCode::Ready),
+                    validation_state: None,
+                    validation_message: None,
+                    validation_enforced: false,
                     admission_reason: Some("busy".to_string()),
                     last_active_epoch_ms: Some(1_100),
                     completed_at_epoch_ms: None,

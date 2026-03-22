@@ -272,8 +272,9 @@ Use `outputMode: json` for bounded classification, extraction, or routing tasks 
 `memoryMiB` and `gpuMemoryMiB` let the scheduler block a local worker before launch when the machine does not currently have enough free RAM or VRAM for that model class.
 `describe worker --output json` now also reports `locality`, `capabilities`, `max_concurrent`, `active_runs`, `pending_runs`, `available_slots`, `admission`, `admission_code`, `admission_reason`, and the estimated vs machine-available memory fields, so operator clients can see slot pressure and placement readiness directly.
 Hosted `nvidia` and `moonshot` workers use OpenAI-compatible chat-completions endpoints. By default, `nvidia` reads `NVIDIA_API_KEY` and targets `https://integrate.api.nvidia.com/v1/chat/completions`, while `moonshot` reads `MOONSHOT_API_KEY` and targets `https://api.moonshot.cn/v1/chat/completions`.
+For GUI-launched operators like the Obsidian plugin, prefer `spec.apiKeySecretRef` over shell env inheritance. A worker can now resolve hosted credentials from a `Secret` resource in the same control namespace, with the env var acting only as an override when present.
 Third-party models served through NVIDIA Build, such as `moonshotai/kimi-k2-instruct`, still use `provider: nvidia` because the endpoint and credential are NVIDIA-managed. Use `provider: moonshot` only when you are calling Moonshot's own API directly.
-For a concrete hosted-lane setup, see [contrib/openclaw-hosted-workers.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-hosted-workers.yaml). It defines a small `openclaw` namespace with NVIDIA-backed `routing-svc` and `code-svc` worker services over Nemotron and Kimi, using per-worker env names so model-specific free-route keys can coexist.
+For a concrete hosted-lane setup, see [contrib/openclaw-hosted-workers.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-hosted-workers.yaml). It defines a small `openclaw` namespace with NVIDIA-backed `routing-svc` and `code-svc` worker services over Nemotron and Kimi using secret-backed credentials. Pair it with [contrib/openclaw-hosted-secrets.example.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-hosted-secrets.example.yaml) to create the `Secret` resources those workers expect.
 
 ### Define a hosted NVIDIA or Moonshot worker
 
@@ -287,7 +288,9 @@ spec:
   provider: nvidia
   model: nvidia/nemotron-mini-4b-instruct
   locality: remote
-  apiKeyEnv: NVIDIA_API_KEY
+  apiKeySecretRef:
+    name: hosted-llm-creds
+    key: nvidiaApiKey
   pool: nvidia-mini
   classes:
     - junior-routing
@@ -311,7 +314,9 @@ spec:
   provider: moonshot
   model: moonshotai/kimi-k2-instruct
   locality: remote
-  apiKeyEnv: MOONSHOT_API_KEY
+  apiKeySecretRef:
+    name: hosted-llm-creds
+    key: moonshotApiKey
   pool: moonshot-code
   classes:
     - junior-code
@@ -327,7 +332,7 @@ spec:
     You are a bounded hosted code worker. Return strict JSON only.
 ```
 
-For hosted workers, make sure the API key env var is present in the process environment that runs `jarvisctl` or the Obsidian plugin. If the key is missing, the scheduler will surface `admission_code: credentials_missing` instead of attempting a request.
+For hosted workers, either provide `apiKeySecretRef` or make sure the API key env var is present in the process environment that runs `jarvisctl`. If the credential source is missing, the scheduler will surface `admission_code: credentials_missing` instead of attempting a request.
 
 ### Run a worker-backed Job
 
@@ -364,6 +369,8 @@ Worker-backed jobs do not create a live Codex runtime namespace. Instead, the co
 When all matching workers are saturated, runs stay in `phase: pending` with `admission_state: pending` and a scheduler reason such as `waiting for capacity on preferred local worker ...` until a slot becomes available.
 When `preferLocal: true` is set and a matching local worker is blocked by RAM or VRAM pressure, the scheduler can fall back to a matching remote worker and records that with `admission_code: remote_fallback`.
 `describe job --output json` now also exposes top-level `conditions` and `events`, while each `run_details[]` entry carries its own `events` timeline for UI clients.
+Optional `spec.worker.validation.shellCommand` lets you score or verify the produced worker output after the model returns. The validator receives `JARVIS_WORKER_ARTIFACT_PATH`, `JARVIS_WORKER_OUTPUT_PATH`, `JARVIS_WORKER_NAME`, `JARVIS_WORKER_NAMESPACE`, `JARVIS_WORKER_EXECUTION_ID`, `JARVIS_WORKER_PROVIDER`, and `JARVIS_WORKER_MODEL`. Set `failJobOnFailure: true` to make a failed scorecard fail the Job, or leave it `false` to keep the run successful while still surfacing `validation_state`, `validation_message`, and validation events in `status.run_details`.
+For a concrete hosted-model scorecard example, see [contrib/openclaw-validated-probes.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-validated-probes.yaml). It layers route and code probes on top of the hosted OpenClaw worker services and demonstrates non-enforcing validation for Nemotron routing plus enforcing validation for Kimi code generation.
 
 ### Inspect CronJob status
 

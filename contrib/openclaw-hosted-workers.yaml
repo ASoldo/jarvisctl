@@ -17,7 +17,9 @@ spec:
   provider: nvidia
   model: nvidia/nemotron-mini-4b-instruct
   locality: remote
-  apiKeyEnv: NVIDIA_NEMOTRON_API_KEY
+  apiKeySecretRef:
+    name: nvidia-nemotron
+    key: apiKey
   pool: nvidia-routing
   classes:
     - junior-routing
@@ -33,6 +35,8 @@ spec:
   systemPrompt: |
     You are a bounded routing worker.
     Return strict JSON only with no markdown fences or extra commentary.
+    When a schema shows choices like "a|b", pick exactly one allowed value.
+    Never echo the union string itself.
 ---
 apiVersion: jarvisctl.io/v1alpha1
 kind: Worker
@@ -46,7 +50,9 @@ spec:
   provider: nvidia
   model: moonshotai/kimi-k2-instruct
   locality: remote
-  apiKeyEnv: NVIDIA_KIMI_API_KEY
+  apiKeySecretRef:
+    name: nvidia-kimi
+    key: apiKey
   pool: nvidia-kimi
   classes:
     - junior-code
