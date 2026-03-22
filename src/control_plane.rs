@@ -25,6 +25,7 @@ use std::str::FromStr;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 const API_VERSION: &str = "jarvisctl.io/v1alpha1";
 const JOB_COMPLETION_GRACE_MS: u128 = 5_000;
@@ -129,6 +130,12 @@ pub struct NamespaceSpec {
 pub struct ConfigMapSpec {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub data: BTreeMap<String, String>,
+    #[serde(
+        default,
+        rename = "accessPolicy",
+        skip_serializing_if = "ResourceAccessPolicy::is_empty"
+    )]
+    pub access_policy: ResourceAccessPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -139,19 +146,33 @@ pub struct SecretSpec {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub string_data: BTreeMap<String, String>,
+    #[serde(
+        default,
+        rename = "accessPolicy",
+        skip_serializing_if = "ResourceAccessPolicy::is_empty"
+    )]
+    pub access_policy: ResourceAccessPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VolumeSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paths: Vec<String>,
+    #[serde(
+        default,
+        rename = "accessPolicy",
+        skip_serializing_if = "ResourceAccessPolicy::is_empty"
+    )]
+    pub access_policy: ResourceAccessPolicy,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerProvider {
     #[default]
     Ollama,
+    Nvidia,
+    Moonshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -178,6 +199,8 @@ pub struct WorkerSpec {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    #[serde(default, rename = "apiKeyEnv", skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(
@@ -194,6 +217,20 @@ pub struct WorkerSpec {
     pub output_mode: Option<WorkerOutputMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    #[serde(default, rename = "topP", skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(
+        default,
+        rename = "frequencyPenalty",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub frequency_penalty: Option<f32>,
+    #[serde(
+        default,
+        rename = "presencePenalty",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub presence_penalty: Option<f32>,
     #[serde(
         default,
         rename = "numPredict",
@@ -202,8 +239,20 @@ pub struct WorkerSpec {
     pub num_predict: Option<u32>,
     #[serde(default, rename = "numCtx", skip_serializing_if = "Option::is_none")]
     pub num_ctx: Option<u32>,
+    #[serde(default, rename = "memoryMiB", skip_serializing_if = "Option::is_none")]
+    pub memory_mib: Option<u64>,
+    #[serde(
+        default,
+        rename = "gpuMemoryMiB",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub gpu_memory_mib: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub classes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
     #[serde(
         default,
         rename = "maxConcurrent",
@@ -218,12 +267,32 @@ pub struct WorkerSpec {
 pub struct WorkerJobSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, rename = "className", skip_serializing_if = "Option::is_none")]
+    pub class_name: Option<String>,
+    #[serde(
+        default,
+        rename = "fallbackClassNames",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub fallback_class_names: Vec<String>,
     #[serde(
         default,
         rename = "resourceNamespace",
         skip_serializing_if = "Option::is_none"
     )]
     pub resource_namespace: Option<String>,
+    #[serde(
+        default,
+        rename = "serviceName",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub service_name: Option<String>,
+    #[serde(
+        default,
+        rename = "serviceNamespace",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub service_namespace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selector: Option<LabelSelector>,
     #[serde(
@@ -232,8 +301,16 @@ pub struct WorkerJobSpec {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub required_capabilities: Vec<String>,
+    #[serde(
+        default,
+        rename = "preferredProviders",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub preferred_providers: Vec<WorkerProvider>,
     #[serde(default, rename = "preferLocal")]
     pub prefer_local: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
     pub prompt: String,
     #[serde(
         default,
@@ -257,12 +334,60 @@ pub enum ServiceRoutingStrategy {
     RoundRobin,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceTargetKind {
+    #[default]
+    Runtime,
+    Worker,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServiceSpec {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub selector: BTreeMap<String, String>,
     #[serde(default)]
     pub strategy: ServiceRoutingStrategy,
+    #[serde(
+        default,
+        rename = "targetKind",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub target_kind: Option<ServiceTargetKind>,
+    #[serde(default, rename = "className", skip_serializing_if = "Option::is_none")]
+    pub class_name: Option<String>,
+    #[serde(
+        default,
+        rename = "fallbackClassNames",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub fallback_class_names: Vec<String>,
+    #[serde(
+        default,
+        rename = "requiredCapabilities",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub required_capabilities: Vec<String>,
+    #[serde(
+        default,
+        rename = "preferredProviders",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub preferred_providers: Vec<WorkerProvider>,
+    #[serde(default, rename = "preferLocal", skip_serializing_if = "is_false")]
+    pub prefer_local: bool,
+    #[serde(
+        default,
+        rename = "allowedIntents",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub allowed_intents: Vec<String>,
+    #[serde(
+        default,
+        rename = "accessPolicy",
+        skip_serializing_if = "ResourceAccessPolicy::is_empty"
+    )]
+    pub access_policy: ResourceAccessPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -273,6 +398,72 @@ pub struct LabelSelector {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub match_labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResourceAccessPolicy {
+    #[serde(
+        default,
+        rename = "allowedNamespaces",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub allowed_namespaces: Vec<String>,
+    #[serde(
+        default,
+        rename = "workloadSelector",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workload_selector: Option<LabelSelector>,
+}
+
+impl ResourceAccessPolicy {
+    fn is_empty(&self) -> bool {
+        self.allowed_namespaces.is_empty() && self.workload_selector.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EnvBindingRef {
+    Name(String),
+    Ref(NamedEnvBindingRef),
+}
+
+impl Default for EnvBindingRef {
+    fn default() -> Self {
+        Self::Name(String::new())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NamedEnvBindingRef {
+    pub name: String,
+    #[serde(default)]
+    pub optional: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum VolumeBindingRef {
+    Name(String),
+    Ref(NamedVolumeBindingRef),
+}
+
+impl Default for VolumeBindingRef {
+    fn default() -> Self {
+        Self::Name(String::new())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NamedVolumeBindingRef {
+    pub name: String,
+    #[serde(default)]
+    pub optional: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -335,11 +526,11 @@ pub struct DeploymentTemplateSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
     #[serde(default, rename = "configMaps", skip_serializing_if = "Vec::is_empty")]
-    pub config_maps: Vec<String>,
+    pub config_maps: Vec<EnvBindingRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub secrets: Vec<String>,
+    pub secrets: Vec<EnvBindingRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub volumes: Vec<String>,
+    pub volumes: Vec<VolumeBindingRef>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
 }
@@ -414,6 +605,10 @@ impl Default for IntOrPercent {
     fn default() -> Self {
         Self::String("25%".to_string())
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn is_default_int_or_percent(value: &IntOrPercent) -> bool {
@@ -727,9 +922,13 @@ struct DeploymentStatus {
     progress_deadline_seconds: u64,
     current_revision: Option<u64>,
     current_replica_set: Option<String>,
+    config_maps: Vec<EnvBindingStatus>,
+    secrets: Vec<EnvBindingStatus>,
+    volumes: Vec<VolumeBindingStatus>,
     replica_sets: Vec<ReplicaSetStatus>,
     sessions: Vec<String>,
-    conditions: Vec<DeploymentCondition>,
+    conditions: Vec<StatusCondition>,
+    events: Vec<StatusEvent>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -739,6 +938,9 @@ struct ReplicaSetStatus {
     template_hash: String,
     replicas: usize,
     ready_replicas: usize,
+    config_maps: Vec<EnvBindingStatus>,
+    secrets: Vec<EnvBindingStatus>,
+    volumes: Vec<VolumeBindingStatus>,
     sessions: Vec<String>,
     active: bool,
 }
@@ -752,6 +954,8 @@ struct JobStatus {
     failed: usize,
     runs: Vec<String>,
     run_details: Vec<JobRunDetail>,
+    conditions: Vec<StatusCondition>,
+    events: Vec<StatusEvent>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -759,6 +963,11 @@ struct CronJobStatus {
     schedule: String,
     active_jobs: Vec<String>,
     last_schedule_epoch_ms: Option<u128>,
+    successful_jobs: usize,
+    failed_jobs: usize,
+    history: Vec<CronJobJobHistoryEntry>,
+    conditions: Vec<StatusCondition>,
+    events: Vec<StatusEvent>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -778,16 +987,43 @@ struct ApplicationStatus {
     rendered_resources: usize,
     last_sync_epoch_ms: Option<u128>,
     history: Vec<ApplicationSyncHistoryEntry>,
+    conditions: Vec<StatusCondition>,
+    events: Vec<StatusEvent>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct DeploymentCondition {
+struct StatusCondition {
     #[serde(rename = "type")]
     condition_type: String,
     status: String,
     reason: String,
     message: String,
     last_transition_epoch_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StatusEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    reason: String,
+    message: String,
+    epoch_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    related: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CronJobJobHistoryEntry {
+    job_name: String,
+    phase: String,
+    scheduled_at_epoch_ms: Option<u128>,
+    last_transition_epoch_ms: Option<u128>,
+    pending: usize,
+    active: usize,
+    succeeded: usize,
+    failed: usize,
+    worker_backed: bool,
+    workers: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -834,9 +1070,37 @@ struct ApplicationDiffResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct ResourceAccessPolicyStatus {
+    allowed_namespaces: Vec<String>,
+    workload_selector: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EnvBindingStatus {
+    name: String,
+    optional: bool,
+    prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VolumeBindingStatus {
+    name: String,
+    optional: bool,
+    paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ServiceStatus {
+    target_kind: String,
     endpoints: Vec<String>,
     strategy: ServiceRoutingStrategy,
+    class_name: Option<String>,
+    fallback_class_names: Vec<String>,
+    required_capabilities: Vec<String>,
+    preferred_providers: Vec<String>,
+    prefer_local: bool,
+    allowed_intents: Vec<String>,
+    access_policy: ResourceAccessPolicyStatus,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -853,13 +1117,40 @@ struct WorkerStatus {
     locality: String,
     role: Option<String>,
     capabilities: Vec<String>,
+    classes: Vec<String>,
+    pool: Option<String>,
     output_mode: String,
     max_concurrent: usize,
     active_runs: usize,
     pending_runs: usize,
     available_slots: usize,
     admission: String,
+    admission_code: String,
+    admission_reason: String,
+    estimated_memory_mib: Option<u64>,
+    estimated_gpu_memory_mib: Option<u64>,
+    machine_memory_available_mib: Option<u64>,
+    machine_gpu_memory_available_mib: Option<u64>,
     loaded: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ConfigMapStatus {
+    entries: usize,
+    keys: Vec<String>,
+    access_policy: ResourceAccessPolicyStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SecretStatus {
+    keys: Vec<String>,
+    access_policy: ResourceAccessPolicyStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VolumeStatus {
+    paths: Vec<String>,
+    access_policy: ResourceAccessPolicyStatus,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -868,15 +1159,26 @@ struct JobRunDetail {
     execution_id: String,
     backend: String,
     phase: String,
+    service_name: Option<String>,
+    intent: Option<String>,
+    selected_class: Option<String>,
+    fallback_class: bool,
     worker: Option<String>,
     worker_namespace: Option<String>,
+    worker_provider: Option<String>,
+    worker_model: Option<String>,
+    worker_locality: Option<String>,
+    worker_pool: Option<String>,
+    worker_classes: Vec<String>,
     admission_state: Option<String>,
+    admission_code: Option<String>,
     reason: Option<String>,
     created_at_epoch_ms: u128,
     completed_at_epoch_ms: Option<u128>,
     artifact_path: Option<String>,
     output_path: Option<String>,
     error: Option<String>,
+    events: Vec<StatusEvent>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -908,7 +1210,19 @@ struct JobRunState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     worker_namespace: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    service_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    intent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selected_class: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    fallback_class: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    worker_locality: Option<WorkerLocality>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     admission_state: Option<JobRunAdmissionState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    admission_code: Option<WorkerAdmissionCode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     admission_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -938,6 +1252,19 @@ enum JobRunAdmissionState {
     Pending,
     Granted,
     Rejected,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum WorkerAdmissionCode {
+    Ready,
+    CapacitySaturated,
+    MemoryPressure,
+    GpuPressure,
+    CredentialsMissing,
+    NoMatchingWorker,
+    WaitingForNamedWorker,
+    RemoteFallback,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, Eq, PartialEq)]
@@ -1073,6 +1400,70 @@ impl<T> ResourceEnvelope<T> {
     fn namespace_key(&self) -> &str {
         self.metadata.namespace.as_deref().unwrap_or("default")
     }
+}
+
+fn env_binding_name(reference: &EnvBindingRef) -> &str {
+    match reference {
+        EnvBindingRef::Name(name) => name,
+        EnvBindingRef::Ref(reference) => &reference.name,
+    }
+}
+
+fn env_binding_optional(reference: &EnvBindingRef) -> bool {
+    match reference {
+        EnvBindingRef::Name(_) => false,
+        EnvBindingRef::Ref(reference) => reference.optional,
+    }
+}
+
+fn env_binding_prefix(reference: &EnvBindingRef) -> Option<&str> {
+    match reference {
+        EnvBindingRef::Name(_) => None,
+        EnvBindingRef::Ref(reference) => reference.prefix.as_deref(),
+    }
+}
+
+fn volume_binding_name(reference: &VolumeBindingRef) -> &str {
+    match reference {
+        VolumeBindingRef::Name(name) => name,
+        VolumeBindingRef::Ref(reference) => &reference.name,
+    }
+}
+
+fn volume_binding_optional(reference: &VolumeBindingRef) -> bool {
+    match reference {
+        VolumeBindingRef::Name(_) => false,
+        VolumeBindingRef::Ref(reference) => reference.optional,
+    }
+}
+
+fn volume_binding_paths(reference: &VolumeBindingRef) -> &[String] {
+    match reference {
+        VolumeBindingRef::Name(_) => &[],
+        VolumeBindingRef::Ref(reference) => &reference.paths,
+    }
+}
+
+fn env_binding_statuses(references: &[EnvBindingRef]) -> Vec<EnvBindingStatus> {
+    references
+        .iter()
+        .map(|reference| EnvBindingStatus {
+            name: env_binding_name(reference).to_string(),
+            optional: env_binding_optional(reference),
+            prefix: env_binding_prefix(reference).map(ToOwned::to_owned),
+        })
+        .collect()
+}
+
+fn volume_binding_statuses(references: &[VolumeBindingRef]) -> Vec<VolumeBindingStatus> {
+    references
+        .iter()
+        .map(|reference| VolumeBindingStatus {
+            name: volume_binding_name(reference).to_string(),
+            optional: volume_binding_optional(reference),
+            paths: volume_binding_paths(reference).to_vec(),
+        })
+        .collect()
 }
 
 impl RenderedResourceRef {
@@ -1510,7 +1901,7 @@ pub fn resolve_service_target(
     service_name: &str,
     control_namespace: Option<&str>,
 ) -> anyhow::Result<ServiceResolution> {
-    resolve_service_target_for_source(service_name, control_namespace, None)
+    resolve_service_target_for_source(service_name, control_namespace, None, None)
 }
 
 pub fn resolve_service_target_for_message(
@@ -1518,7 +1909,12 @@ pub fn resolve_service_target_for_message(
     control_namespace: Option<&str>,
     source_runtime_namespace: Option<&str>,
 ) -> anyhow::Result<ServiceResolution> {
-    resolve_service_target_for_source(service_name, control_namespace, source_runtime_namespace)
+    resolve_service_target_for_source(
+        service_name,
+        control_namespace,
+        source_runtime_namespace,
+        Some("conversation"),
+    )
 }
 
 pub fn authorize_runtime_message(
@@ -1537,6 +1933,7 @@ fn resolve_service_target_for_source(
     service_name: &str,
     control_namespace: Option<&str>,
     source_runtime_namespace: Option<&str>,
+    intent: Option<&str>,
 ) -> anyhow::Result<ServiceResolution> {
     let namespace = normalize_namespaced_resource_namespace(control_namespace);
     let _ = reconcile_control_plane()?;
@@ -1544,11 +1941,41 @@ fn resolve_service_target_for_source(
     let ResourceManifest::Service(service) = manifest else {
         bail!("resource '{}' is not a Service", service_name);
     };
+    ensure!(
+        effective_service_target_kind(&service.spec) == ServiceTargetKind::Runtime,
+        "service '{}/{}' targets workers and cannot be used as a runtime endpoint",
+        namespace,
+        service_name
+    );
+    ensure!(
+        service_allows_intent(&service.spec, intent),
+        "service '{}/{}' does not allow intent '{}'",
+        namespace,
+        service_name,
+        intent.unwrap_or("unspecified")
+    );
 
     let source = match source_runtime_namespace {
         Some(namespace) => Some(load_runtime_session_by_namespace(namespace)?),
         None => None,
     };
+    if let Some(source) = source.as_ref() {
+        let empty_labels = BTreeMap::new();
+        let source_context = source.context.as_ref();
+        let source_control_namespace = source_context
+            .and_then(|context| context.control_namespace.as_deref())
+            .unwrap_or(namespace.as_str());
+        let source_labels = source_context
+            .map(|context| &context.labels)
+            .unwrap_or(&empty_labels);
+        ensure!(
+            service_allows_source_workload(&service.spec, source_control_namespace, source_labels),
+            "service '{}/{}' denies source workload '{}' by access policy",
+            namespace,
+            service_name,
+            source.namespace
+        );
+    }
     let mut sessions = collect_runtime_sessions()?;
     sessions.retain(|session| service_matches_session(&service, session));
     let reachable_before_policy = !sessions.is_empty();
@@ -1584,6 +2011,45 @@ fn resolve_service_target_for_source(
     Ok(ServiceResolution {
         runtime_namespace: sessions[index].namespace.clone(),
     })
+}
+
+fn resolve_worker_candidates_for_service(
+    service_name: &str,
+    control_namespace: Option<&str>,
+    source_control_namespace: &str,
+    source_labels: &BTreeMap<String, String>,
+    intent: Option<&str>,
+) -> anyhow::Result<(
+    ResourceEnvelope<ServiceSpec>,
+    Vec<ResourceEnvelope<WorkerSpec>>,
+)> {
+    let namespace = normalize_namespaced_resource_namespace(control_namespace);
+    let manifest = load_manifest(ResourceKind::Service, service_name, Some(&namespace))?;
+    let ResourceManifest::Service(service) = manifest else {
+        bail!("resource '{}' is not a Service", service_name);
+    };
+    ensure!(
+        effective_service_target_kind(&service.spec) == ServiceTargetKind::Worker,
+        "service '{}/{}' does not target workers",
+        namespace,
+        service_name
+    );
+    ensure!(
+        service_allows_intent(&service.spec, intent),
+        "service '{}/{}' does not allow intent '{}'",
+        namespace,
+        service_name,
+        intent.unwrap_or("task_offload")
+    );
+    ensure!(
+        service_allows_source_workload(&service.spec, source_control_namespace, source_labels),
+        "service '{}/{}' denies source workload in namespace '{}' by access policy",
+        namespace,
+        service_name,
+        source_control_namespace
+    );
+    let workers = load_workers_for_service(&service, &namespace)?;
+    Ok((service, workers))
 }
 
 fn parse_manifest_documents(raw: &str) -> anyhow::Result<Vec<ResourceManifest>> {
@@ -1747,11 +2213,6 @@ fn normalize_metadata(metadata: &mut ResourceMetadata, cluster_scoped: bool) -> 
 
 fn validate_deployment(manifest: &ResourceEnvelope<DeploymentSpec>) -> anyhow::Result<()> {
     ensure!(
-        manifest.spec.replicas > 0,
-        "Deployment '{}' must set spec.replicas > 0",
-        manifest.metadata.name
-    );
-    ensure!(
         manifest.spec.agents > 0,
         "Deployment '{}' must set spec.agents > 0",
         manifest.metadata.name
@@ -1780,6 +2241,9 @@ fn validate_deployment(manifest: &ResourceEnvelope<DeploymentSpec>) -> anyhow::R
         match strategy.strategy_type {
             DeploymentStrategyType::Recreate => {}
             DeploymentStrategyType::RollingUpdate => {
+                if manifest.spec.replicas == 0 {
+                    return Ok(());
+                }
                 let rolling_update = strategy
                     .rolling_update
                     .clone()
@@ -1802,6 +2266,11 @@ fn validate_deployment(manifest: &ResourceEnvelope<DeploymentSpec>) -> anyhow::R
             }
         }
     }
+    validate_template_bindings(
+        &manifest.spec.template,
+        "Deployment",
+        &manifest.metadata.name,
+    )?;
     Ok(())
 }
 
@@ -1831,6 +2300,11 @@ fn validate_replica_set(manifest: &ResourceEnvelope<ReplicaSetSpec>) -> anyhow::
         "ReplicaSet '{}' must set spec.template.task_note",
         manifest.metadata.name
     );
+    validate_template_bindings(
+        &manifest.spec.template,
+        "ReplicaSet",
+        &manifest.metadata.name,
+    )?;
     Ok(())
 }
 
@@ -1870,15 +2344,41 @@ fn validate_job(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<()> {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .is_some()
+                || worker
+                    .class_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_some()
+                || worker
+                    .service_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .is_some()
                 || worker.selector.is_some()
                 || !worker.required_capabilities.is_empty(),
-            "Job '{}' must set spec.worker.name, spec.worker.selector, or spec.worker.requiredCapabilities",
+            "Job '{}' must set spec.worker.name, spec.worker.className, spec.worker.serviceName, spec.worker.selector, or spec.worker.requiredCapabilities",
             manifest.metadata.name
         );
         if let Some(name) = worker.name.as_deref() {
             ensure!(
                 !name.trim().is_empty(),
                 "Job '{}' has an empty spec.worker.name",
+                manifest.metadata.name
+            );
+        }
+        if let Some(class_name) = worker.class_name.as_deref() {
+            ensure!(
+                !class_name.trim().is_empty(),
+                "Job '{}' has an empty spec.worker.className",
+                manifest.metadata.name
+            );
+        }
+        if let Some(service_name) = worker.service_name.as_deref() {
+            ensure!(
+                !service_name.trim().is_empty(),
+                "Job '{}' has an empty spec.worker.serviceName",
                 manifest.metadata.name
             );
         }
@@ -1901,6 +2401,15 @@ fn validate_job(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<()> {
                 manifest.metadata.name
             );
         }
+        if let Some(intent) = worker.intent.as_deref() {
+            ensure!(
+                !intent.trim().is_empty(),
+                "Job '{}' has an empty spec.worker.intent",
+                manifest.metadata.name
+            );
+        }
+    } else {
+        validate_template_bindings(&manifest.spec.template, "Job", &manifest.metadata.name)?;
     }
     Ok(())
 }
@@ -1944,11 +2453,49 @@ fn validate_application(manifest: &ResourceEnvelope<ApplicationSpec>) -> anyhow:
 }
 
 fn validate_service(manifest: &ResourceEnvelope<ServiceSpec>) -> anyhow::Result<()> {
+    let target_kind = effective_service_target_kind(&manifest.spec);
     ensure!(
-        !manifest.spec.selector.is_empty(),
-        "Service '{}' must set spec.selector",
+        !manifest.spec.selector.is_empty()
+            || manifest.spec.class_name.is_some()
+            || !manifest.spec.required_capabilities.is_empty(),
+        "Service '{}' must set spec.selector, spec.className, or spec.requiredCapabilities",
         manifest.metadata.name
     );
+    if target_kind == ServiceTargetKind::Runtime {
+        ensure!(
+            manifest.spec.class_name.is_none(),
+            "Service '{}' cannot set spec.className when targetKind=runtime",
+            manifest.metadata.name
+        );
+        ensure!(
+            manifest.spec.fallback_class_names.is_empty(),
+            "Service '{}' cannot set spec.fallbackClassNames when targetKind=runtime",
+            manifest.metadata.name
+        );
+        ensure!(
+            manifest.spec.required_capabilities.is_empty(),
+            "Service '{}' cannot set spec.requiredCapabilities when targetKind=runtime",
+            manifest.metadata.name
+        );
+        ensure!(
+            manifest.spec.preferred_providers.is_empty(),
+            "Service '{}' cannot set spec.preferredProviders when targetKind=runtime",
+            manifest.metadata.name
+        );
+        ensure!(
+            !manifest.spec.prefer_local,
+            "Service '{}' cannot set spec.preferLocal when targetKind=runtime",
+            manifest.metadata.name
+        );
+    } else {
+        if let Some(class_name) = manifest.spec.class_name.as_deref() {
+            ensure!(
+                !class_name.trim().is_empty(),
+                "Service '{}' has an empty spec.className",
+                manifest.metadata.name
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1985,11 +2532,86 @@ fn validate_worker(manifest: &ResourceEnvelope<WorkerSpec>) -> anyhow::Result<()
             endpoint
         );
     }
+    if let Some(api_key_env) = manifest.spec.api_key_env.as_deref() {
+        ensure!(
+            !api_key_env.trim().is_empty(),
+            "Worker '{}' has an empty spec.apiKeyEnv",
+            manifest.metadata.name
+        );
+    }
     if let Some(max_concurrent) = manifest.spec.max_concurrent {
         ensure!(
             max_concurrent > 0,
             "Worker '{}' must set spec.maxConcurrent > 0",
             manifest.metadata.name
+        );
+    }
+    if let Some(memory_mib) = manifest.spec.memory_mib {
+        ensure!(
+            memory_mib > 0,
+            "Worker '{}' must set spec.memoryMiB > 0",
+            manifest.metadata.name
+        );
+    }
+    if let Some(gpu_memory_mib) = manifest.spec.gpu_memory_mib {
+        ensure!(
+            gpu_memory_mib > 0,
+            "Worker '{}' must set spec.gpuMemoryMiB > 0",
+            manifest.metadata.name
+        );
+    }
+    if let Some(top_p) = manifest.spec.top_p {
+        ensure!(
+            (0.0..=1.0).contains(&top_p),
+            "Worker '{}' must set spec.topP between 0.0 and 1.0",
+            manifest.metadata.name
+        );
+    }
+    if let Some(pool) = manifest.spec.pool.as_deref() {
+        ensure!(
+            !pool.trim().is_empty(),
+            "Worker '{}' has an empty spec.pool",
+            manifest.metadata.name
+        );
+    }
+    Ok(())
+}
+
+fn validate_template_bindings(
+    template: &DeploymentTemplateSpec,
+    kind: &str,
+    name: &str,
+) -> anyhow::Result<()> {
+    for reference in &template.config_maps {
+        ensure!(
+            !env_binding_name(reference).trim().is_empty(),
+            "{} '{}' has an empty configMaps entry",
+            kind,
+            name
+        );
+        if matches!(reference, EnvBindingRef::Ref(reference) if reference.prefix.as_deref() == Some(""))
+        {
+            bail!("{} '{}' has an empty configMaps prefix", kind, name);
+        }
+    }
+    for reference in &template.secrets {
+        ensure!(
+            !env_binding_name(reference).trim().is_empty(),
+            "{} '{}' has an empty secrets entry",
+            kind,
+            name
+        );
+        if matches!(reference, EnvBindingRef::Ref(reference) if reference.prefix.as_deref() == Some(""))
+        {
+            bail!("{} '{}' has an empty secrets prefix", kind, name);
+        }
+    }
+    for reference in &template.volumes {
+        ensure!(
+            !volume_binding_name(reference).trim().is_empty(),
+            "{} '{}' has an empty volumes entry",
+            kind,
+            name
         );
     }
     Ok(())
@@ -2002,7 +2624,32 @@ fn save_manifest(manifest: &ResourceManifest) -> anyhow::Result<()> {
             .with_context(|| format!("failed to create '{}'", parent.display()))?;
     }
     let raw = serde_yaml::to_string(manifest).context("failed to encode manifest")?;
-    fs::write(&path, raw).with_context(|| format!("failed to write '{}'", path.display()))
+    atomic_write_string(&path, &raw)
+}
+
+fn atomic_write_string(path: &Path, raw: &str) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("path '{}' has no parent", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("path '{}' has no file name", path.display()))?;
+    let temp_path = parent.join(format!(
+        ".{}.tmp.{}.{}",
+        file_name,
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    fs::write(&temp_path, raw)
+        .with_context(|| format!("failed to write '{}'", temp_path.display()))?;
+    fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "failed to rename '{}' to '{}'",
+            temp_path.display(),
+            path.display()
+        )
+    })
 }
 
 fn reconcile_control_plane() -> anyhow::Result<Vec<String>> {
@@ -2347,6 +2994,16 @@ fn scale_rolling_update_deployment(
     rolling_update: RollingUpdateDeployment,
 ) -> anyhow::Result<()> {
     let desired = manifest.spec.replicas;
+    if desired == 0 {
+        for replica_set in replica_sets.iter_mut() {
+            if replica_set.spec.replicas == 0 {
+                continue;
+            }
+            replica_set.spec.replicas = 0;
+            save_manifest(&ResourceManifest::ReplicaSet(replica_set.clone()))?;
+        }
+        return Ok(());
+    }
     let max_unavailable = resolve_int_or_percent(&rolling_update.max_unavailable, desired, false)?;
     let max_surge = resolve_int_or_percent(&rolling_update.max_surge, desired, true)?;
     ensure!(
@@ -2540,10 +3197,21 @@ fn launch_replica_set_replica(
         .clone()
         .map(PathBuf::from);
 
-    let config_maps =
-        load_config_map_values(&control_namespace, &replica_set.spec.template.config_maps)?;
-    let secrets = load_secret_values(&control_namespace, &replica_set.spec.template.secrets)?;
-    let volumes = load_volume_paths(&control_namespace, &replica_set.spec.template.volumes)?;
+    let config_maps = load_config_map_values(
+        &control_namespace,
+        &replica_set.spec.template.config_maps,
+        &replica_set.spec.template.labels,
+    )?;
+    let secrets = load_secret_values(
+        &control_namespace,
+        &replica_set.spec.template.secrets,
+        &replica_set.spec.template.labels,
+    )?;
+    let volumes = load_volume_paths(
+        &control_namespace,
+        &replica_set.spec.template.volumes,
+        &replica_set.spec.template.labels,
+    )?;
     let service_environment = service_discovery_environment(&control_namespace)?;
     let environment = merged_environment(
         &config_maps,
@@ -2562,9 +3230,27 @@ fn launch_replica_set_replica(
         control_namespace: Some(control_namespace.clone()),
         deployment: Some(replica_set.spec.deployment_name.clone()),
         labels: replica_set_runtime_labels(replica_set, ordinal),
-        config_maps: replica_set.spec.template.config_maps.clone(),
-        secrets: replica_set.spec.template.secrets.clone(),
-        volumes: replica_set.spec.template.volumes.clone(),
+        config_maps: replica_set
+            .spec
+            .template
+            .config_maps
+            .iter()
+            .map(|reference| env_binding_name(reference).to_string())
+            .collect(),
+        secrets: replica_set
+            .spec
+            .template
+            .secrets
+            .iter()
+            .map(|reference| env_binding_name(reference).to_string())
+            .collect(),
+        volumes: replica_set
+            .spec
+            .template
+            .volumes
+            .iter()
+            .map(|reference| volume_binding_name(reference).to_string())
+            .collect(),
         ..RuntimeContextMetadata::default()
     };
     let operator_message = build_control_plane_operator_message(
@@ -2858,11 +3544,29 @@ fn reconcile_job(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<String>
                     .as_ref()
                     .and_then(|worker| worker.name.clone()),
                 worker_namespace: None,
+                service_name: manifest
+                    .spec
+                    .worker
+                    .as_ref()
+                    .and_then(|worker| worker.service_name.clone()),
+                intent: manifest
+                    .spec
+                    .worker
+                    .as_ref()
+                    .and_then(|worker| worker.intent.clone()),
+                selected_class: manifest
+                    .spec
+                    .worker
+                    .as_ref()
+                    .and_then(|worker| worker.class_name.clone()),
+                fallback_class: false,
+                worker_locality: None,
                 admission_state: if manifest.spec.worker.is_some() {
                     Some(JobRunAdmissionState::Pending)
                 } else {
                     None
                 },
+                admission_code: None,
                 admission_reason: None,
                 last_active_epoch_ms: Some(now),
                 completed_at_epoch_ms: None,
@@ -2928,10 +3632,21 @@ fn launch_job_run(
         .or(namespace_defaults.default_working_directory)
         .map(PathBuf::from);
 
-    let config_maps =
-        load_config_map_values(&control_namespace, &manifest.spec.template.config_maps)?;
-    let secrets = load_secret_values(&control_namespace, &manifest.spec.template.secrets)?;
-    let volumes = load_volume_paths(&control_namespace, &manifest.spec.template.volumes)?;
+    let config_maps = load_config_map_values(
+        &control_namespace,
+        &manifest.spec.template.config_maps,
+        &manifest.spec.template.labels,
+    )?;
+    let secrets = load_secret_values(
+        &control_namespace,
+        &manifest.spec.template.secrets,
+        &manifest.spec.template.labels,
+    )?;
+    let volumes = load_volume_paths(
+        &control_namespace,
+        &manifest.spec.template.volumes,
+        &manifest.spec.template.labels,
+    )?;
     let service_environment = service_discovery_environment(&control_namespace)?;
     let environment = merged_environment(
         &config_maps,
@@ -2947,9 +3662,27 @@ fn launch_job_run(
     let context_overlay = RuntimeContextMetadata {
         control_namespace: Some(control_namespace.clone()),
         labels: job_labels(manifest, run_index),
-        config_maps: manifest.spec.template.config_maps.clone(),
-        secrets: manifest.spec.template.secrets.clone(),
-        volumes: manifest.spec.template.volumes.clone(),
+        config_maps: manifest
+            .spec
+            .template
+            .config_maps
+            .iter()
+            .map(|reference| env_binding_name(reference).to_string())
+            .collect(),
+        secrets: manifest
+            .spec
+            .template
+            .secrets
+            .iter()
+            .map(|reference| env_binding_name(reference).to_string())
+            .collect(),
+        volumes: manifest
+            .spec
+            .template
+            .volumes
+            .iter()
+            .map(|reference| volume_binding_name(reference).to_string())
+            .collect(),
         ..RuntimeContextMetadata::default()
     };
     let operator_message = build_job_operator_message(
@@ -3007,11 +3740,20 @@ fn admit_worker_job_run(
     let now = now_epoch_ms();
     let selection = select_worker_for_job_run(manifest, state)?;
 
-    if selection.available_slots == 0 || selection.name.is_none() || selection.namespace.is_none() {
+    if !is_worker_admissible(selection.admission_code)
+        || selection.name.is_none()
+        || selection.namespace.is_none()
+    {
         run.status = JobRunPhase::Pending;
         run.worker_name = selection.name;
         run.worker_namespace = selection.namespace;
+        run.service_name = selection.service_name;
+        run.intent = selection.intent;
+        run.selected_class = selection.selected_class;
+        run.fallback_class = selection.fallback_class;
+        run.worker_locality = selection.locality;
         run.admission_state = Some(JobRunAdmissionState::Pending);
+        run.admission_code = Some(selection.admission_code);
         run.admission_reason = Some(selection.reason);
         return Ok(());
     }
@@ -3029,7 +3771,13 @@ fn admit_worker_job_run(
     run.status = JobRunPhase::Active;
     run.worker_name = selection.name;
     run.worker_namespace = selection.namespace;
+    run.service_name = selection.service_name;
+    run.intent = selection.intent;
+    run.selected_class = selection.selected_class;
+    run.fallback_class = selection.fallback_class;
+    run.worker_locality = selection.locality;
     run.admission_state = Some(JobRunAdmissionState::Granted);
+    run.admission_code = Some(selection.admission_code);
     run.admission_reason = Some(selection.reason);
     run.last_active_epoch_ms = Some(now);
     Ok(())
@@ -3235,7 +3983,7 @@ fn save_job_controller_state(
     }
     let raw =
         serde_json::to_string_pretty(state).context("failed to encode job controller state")?;
-    fs::write(&path, raw).with_context(|| format!("failed to write '{}'", path.display()))
+    atomic_write_string(&path, &raw)
 }
 
 fn worker_run_root(control_namespace: &str, job_name: &str) -> anyhow::Result<PathBuf> {
@@ -3304,7 +4052,7 @@ fn save_worker_run_completion(
     }
     let raw =
         serde_json::to_string_pretty(completion).context("failed to encode worker completion")?;
-    fs::write(&path, raw).with_context(|| format!("failed to write '{}'", path.display()))
+    atomic_write_string(&path, &raw)
 }
 
 fn spawn_worker_run(manifest: WorkerRunLaunchManifest) -> anyhow::Result<()> {
@@ -3319,8 +4067,7 @@ fn spawn_worker_run(manifest: WorkerRunLaunchManifest) -> anyhow::Result<()> {
     }
     let raw =
         serde_json::to_string_pretty(&manifest).context("failed to encode worker-run manifest")?;
-    fs::write(&manifest_path, raw)
-        .with_context(|| format!("failed to write '{}'", manifest_path.display()))?;
+    atomic_write_string(&manifest_path, &raw)?;
     let mut command =
         ProcessCommand::new(env::current_exe().context("failed to resolve current executable")?);
     command
@@ -3618,7 +4365,7 @@ fn save_cron_job_controller_state(
     }
     let raw =
         serde_json::to_string_pretty(state).context("failed to encode cronjob controller state")?;
-    fs::write(&path, raw).with_context(|| format!("failed to write '{}'", path.display()))
+    atomic_write_string(&path, &raw)
 }
 
 fn parse_kubernetes_cron_schedule(raw: &str) -> anyhow::Result<Schedule> {
@@ -4555,7 +5302,7 @@ fn save_application_controller_state(
     }
     let raw = serde_json::to_string_pretty(state)
         .context("failed to encode application controller state")?;
-    fs::write(&path, raw).with_context(|| format!("failed to write '{}'", path.display()))
+    atomic_write_string(&path, &raw)
 }
 
 fn load_namespace_defaults(control_namespace: &str) -> anyhow::Result<NamespaceSpec> {
@@ -4566,13 +5313,77 @@ fn load_namespace_defaults(control_namespace: &str) -> anyhow::Result<NamespaceS
     }
 }
 
+fn resource_access_policy_status(policy: &ResourceAccessPolicy) -> ResourceAccessPolicyStatus {
+    ResourceAccessPolicyStatus {
+        allowed_namespaces: policy.allowed_namespaces.clone(),
+        workload_selector: policy
+            .workload_selector
+            .as_ref()
+            .map(|selector| selector.match_labels.clone())
+            .unwrap_or_default(),
+    }
+}
+
+fn access_policy_summary(policy: &ResourceAccessPolicy) -> String {
+    let mut parts = Vec::new();
+    if !policy.allowed_namespaces.is_empty() {
+        parts.push(format!(
+            "namespaces {}",
+            policy.allowed_namespaces.join(",")
+        ));
+    }
+    if let Some(selector) = policy.workload_selector.as_ref() {
+        if !selector.match_labels.is_empty() {
+            let labels = selector
+                .match_labels
+                .iter()
+                .map(|(key, value)| format!("{}={}", key, value))
+                .collect::<Vec<_>>()
+                .join(",");
+            parts.push(format!("selector {}", labels));
+        }
+    }
+    if parts.is_empty() {
+        "all workloads".to_string()
+    } else {
+        parts.join(" + ")
+    }
+}
+
+fn access_policy_allows_workload(
+    policy: &ResourceAccessPolicy,
+    control_namespace: &str,
+    workload_labels: &BTreeMap<String, String>,
+) -> bool {
+    let namespace_allowed = policy.allowed_namespaces.is_empty()
+        || policy
+            .allowed_namespaces
+            .iter()
+            .any(|namespace| namespace == control_namespace);
+    let selector_allowed = policy
+        .workload_selector
+        .as_ref()
+        .map(|selector| label_selector_matches(selector, workload_labels))
+        .unwrap_or(true);
+    namespace_allowed && selector_allowed
+}
+
 fn load_config_map_values(
     control_namespace: &str,
-    names: &[String],
+    references: &[EnvBindingRef],
+    workload_labels: &BTreeMap<String, String>,
 ) -> anyhow::Result<BTreeMap<String, BTreeMap<String, String>>> {
     let mut values = BTreeMap::new();
-    for name in names {
-        let manifest = load_manifest(ResourceKind::ConfigMap, name, Some(control_namespace))?;
+    for reference in references {
+        let name = env_binding_name(reference);
+        let manifest = match load_manifest(ResourceKind::ConfigMap, name, Some(control_namespace)) {
+            Ok(manifest) => manifest,
+            Err(error) if env_binding_optional(reference) => {
+                let _ = error;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let ResourceManifest::ConfigMap(config_map) = manifest else {
             bail!(
                 "resource '{}/{}' is not a ConfigMap",
@@ -4580,34 +5391,121 @@ fn load_config_map_values(
                 name
             );
         };
-        values.insert(name.clone(), config_map.spec.data);
+        ensure!(
+            access_policy_allows_workload(
+                &config_map.spec.access_policy,
+                control_namespace,
+                workload_labels
+            ),
+            "configmap '{}/{}' is not allowed for this workload",
+            control_namespace,
+            name
+        );
+        let data = if let Some(prefix) = env_binding_prefix(reference) {
+            config_map
+                .spec
+                .data
+                .into_iter()
+                .map(|(key, value)| (format!("{}{}", prefix, key), value))
+                .collect::<BTreeMap<_, _>>()
+        } else {
+            config_map.spec.data
+        };
+        let key = env_binding_prefix(reference)
+            .map(|prefix| format!("{}:{}", name, prefix))
+            .unwrap_or_else(|| name.to_string());
+        values.insert(key, data);
     }
     Ok(values)
 }
 
 fn load_secret_values(
     control_namespace: &str,
-    names: &[String],
+    references: &[EnvBindingRef],
+    workload_labels: &BTreeMap<String, String>,
 ) -> anyhow::Result<BTreeMap<String, BTreeMap<String, String>>> {
     let mut values = BTreeMap::new();
-    for name in names {
-        let manifest = load_manifest(ResourceKind::Secret, name, Some(control_namespace))?;
+    for reference in references {
+        let name = env_binding_name(reference);
+        let manifest = match load_manifest(ResourceKind::Secret, name, Some(control_namespace)) {
+            Ok(manifest) => manifest,
+            Err(error) if env_binding_optional(reference) => {
+                let _ = error;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let ResourceManifest::Secret(secret) = manifest else {
             bail!("resource '{}/{}' is not a Secret", control_namespace, name);
         };
-        values.insert(name.clone(), secret.spec.string_data);
+        ensure!(
+            access_policy_allows_workload(
+                &secret.spec.access_policy,
+                control_namespace,
+                workload_labels
+            ),
+            "secret '{}/{}' is not allowed for this workload",
+            control_namespace,
+            name
+        );
+        let data = if let Some(prefix) = env_binding_prefix(reference) {
+            secret
+                .spec
+                .string_data
+                .into_iter()
+                .map(|(key, value)| (format!("{}{}", prefix, key), value))
+                .collect::<BTreeMap<_, _>>()
+        } else {
+            secret.spec.string_data
+        };
+        let key = env_binding_prefix(reference)
+            .map(|prefix| format!("{}:{}", name, prefix))
+            .unwrap_or_else(|| name.to_string());
+        values.insert(key, data);
     }
     Ok(values)
 }
 
-fn load_volume_paths(control_namespace: &str, names: &[String]) -> anyhow::Result<Vec<String>> {
+fn load_volume_paths(
+    control_namespace: &str,
+    references: &[VolumeBindingRef],
+    workload_labels: &BTreeMap<String, String>,
+) -> anyhow::Result<Vec<String>> {
     let mut paths = Vec::new();
-    for name in names {
-        let manifest = load_manifest(ResourceKind::Volume, name, Some(control_namespace))?;
+    for reference in references {
+        let name = volume_binding_name(reference);
+        let manifest = match load_manifest(ResourceKind::Volume, name, Some(control_namespace)) {
+            Ok(manifest) => manifest,
+            Err(error) if volume_binding_optional(reference) => {
+                let _ = error;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let ResourceManifest::Volume(volume) = manifest else {
             bail!("resource '{}/{}' is not a Volume", control_namespace, name);
         };
-        for path in volume.spec.paths {
+        ensure!(
+            access_policy_allows_workload(
+                &volume.spec.access_policy,
+                control_namespace,
+                workload_labels
+            ),
+            "volume '{}/{}' is not allowed for this workload",
+            control_namespace,
+            name
+        );
+        let selected_paths = if volume_binding_paths(reference).is_empty() {
+            volume.spec.paths
+        } else {
+            volume
+                .spec
+                .paths
+                .into_iter()
+                .filter(|path| volume_binding_paths(reference).contains(path))
+                .collect::<Vec<_>>()
+        };
+        for path in selected_paths {
             ensure!(
                 Path::new(&path).exists(),
                 "volume path '{}' from {}/{} does not exist",
@@ -4817,8 +5715,16 @@ fn resource_summary(manifest: &ResourceManifest) -> anyhow::Result<ResourceSumma
                 kind: "Service".to_string(),
                 namespace: service.metadata.namespace.clone(),
                 name: service.metadata.name.clone(),
-                status: format!("{} endpoints", status.endpoints.len()),
-                detail: status.endpoints.join(", "),
+                status: format!(
+                    "{} {} endpoints",
+                    status.target_kind,
+                    status.endpoints.len()
+                ),
+                detail: if status.endpoints.is_empty() {
+                    "no resolved endpoints".to_string()
+                } else {
+                    status.endpoints.join(", ")
+                },
             })
         }
         ResourceManifest::NetworkPolicy(network_policy) => {
@@ -4845,33 +5751,57 @@ fn resource_summary(manifest: &ResourceManifest) -> anyhow::Result<ResourceSumma
             namespace: config_map.metadata.namespace.clone(),
             name: config_map.metadata.name.clone(),
             status: format!("{} entries", config_map.spec.data.len()),
-            detail: config_map
-                .spec
-                .data
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", "),
+            detail: if config_map.spec.access_policy.is_empty() {
+                config_map
+                    .spec
+                    .data
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                format!(
+                    "{} keys; scoped to {}",
+                    config_map.spec.data.len(),
+                    access_policy_summary(&config_map.spec.access_policy)
+                )
+            },
         }),
         ResourceManifest::Secret(secret) => Ok(ResourceSummary {
             kind: "Secret".to_string(),
             namespace: secret.metadata.namespace.clone(),
             name: secret.metadata.name.clone(),
             status: format!("{} keys", secret.spec.string_data.len()),
-            detail: secret
-                .spec
-                .string_data
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", "),
+            detail: if secret.spec.access_policy.is_empty() {
+                secret
+                    .spec
+                    .string_data
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                format!(
+                    "{} keys; scoped to {}",
+                    secret.spec.string_data.len(),
+                    access_policy_summary(&secret.spec.access_policy)
+                )
+            },
         }),
         ResourceManifest::Volume(volume) => Ok(ResourceSummary {
             kind: "Volume".to_string(),
             namespace: volume.metadata.namespace.clone(),
             name: volume.metadata.name.clone(),
             status: format!("{} paths", volume.spec.paths.len()),
-            detail: volume.spec.paths.join(", "),
+            detail: if volume.spec.access_policy.is_empty() {
+                volume.spec.paths.join(", ")
+            } else {
+                format!(
+                    "{} paths; scoped to {}",
+                    volume.spec.paths.len(),
+                    access_policy_summary(&volume.spec.access_policy)
+                )
+            },
         }),
         ResourceManifest::Worker(worker) => {
             let status = worker_status(worker)?;
@@ -4890,8 +5820,21 @@ fn resource_summary(manifest: &ResourceManifest) -> anyhow::Result<ResourceSumma
                     status.admission
                 ),
                 detail: format!(
-                    "{} {} {}/{} active",
-                    status.provider, status.locality, status.active_runs, status.max_concurrent
+                    "{} {} {}/{} active{}{}",
+                    status.provider,
+                    status.locality,
+                    status.active_runs,
+                    status.max_concurrent,
+                    status
+                        .pool
+                        .as_deref()
+                        .map(|pool| format!(" pool:{}", pool))
+                        .unwrap_or_default(),
+                    if status.classes.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" classes:{}", status.classes.join("|"))
+                    }
                 ),
             })
         }
@@ -4966,6 +5909,7 @@ fn deployment_status(
         available,
         failed,
     );
+    let events = deployment_events(manifest, target_replica_set, &conditions);
     Ok(DeploymentStatus {
         replicas: manifest.spec.replicas,
         ready_replicas,
@@ -4980,9 +5924,13 @@ fn deployment_status(
         current_revision: target_replica_set.map(|replica_set| replica_set.spec.revision),
         current_replica_set: target_replica_set
             .map(|replica_set| replica_set.metadata.name.clone()),
+        config_maps: env_binding_statuses(&manifest.spec.template.config_maps),
+        secrets: env_binding_statuses(&manifest.spec.template.secrets),
+        volumes: volume_binding_statuses(&manifest.spec.template.volumes),
         replica_sets,
         sessions: active_sessions,
         conditions,
+        events,
     })
 }
 
@@ -5044,13 +5992,13 @@ fn deployment_conditions(
     ready_replicas: usize,
     available: bool,
     failed: bool,
-) -> Vec<DeploymentCondition> {
+) -> Vec<StatusCondition> {
     let now = now_epoch_ms();
     let current_replica_set_name = target_replica_set
         .map(|replica_set| replica_set.metadata.name.as_str())
         .unwrap_or("unknown");
     let mut conditions = Vec::new();
-    conditions.push(DeploymentCondition {
+    conditions.push(StatusCondition {
         condition_type: "Available".to_string(),
         status: if available {
             "True".to_string()
@@ -5077,7 +6025,7 @@ fn deployment_conditions(
     });
 
     let progressing_condition = if manifest.spec.paused {
-        DeploymentCondition {
+        StatusCondition {
             condition_type: "Progressing".to_string(),
             status: "Unknown".to_string(),
             reason: "DeploymentPaused".to_string(),
@@ -5090,7 +6038,7 @@ fn deployment_conditions(
             last_transition_epoch_ms: now,
         }
     } else if failed {
-        DeploymentCondition {
+        StatusCondition {
             condition_type: "Progressing".to_string(),
             status: "False".to_string(),
             reason: "ProgressDeadlineExceeded".to_string(),
@@ -5103,7 +6051,7 @@ fn deployment_conditions(
             last_transition_epoch_ms: now,
         }
     } else if available {
-        DeploymentCondition {
+        StatusCondition {
             condition_type: "Progressing".to_string(),
             status: "True".to_string(),
             reason: "NewReplicaSetAvailable".to_string(),
@@ -5121,7 +6069,7 @@ fn deployment_conditions(
             .iter()
             .filter(|replica_set| replica_set.active)
             .count();
-        DeploymentCondition {
+        StatusCondition {
             condition_type: "Progressing".to_string(),
             status: "True".to_string(),
             reason: "ReplicaSetUpdating".to_string(),
@@ -5137,6 +6085,76 @@ fn deployment_conditions(
     };
     conditions.push(progressing_condition);
     conditions
+}
+
+fn status_event(
+    event_type: impl Into<String>,
+    reason: impl Into<String>,
+    message: impl Into<String>,
+    epoch_ms: u128,
+    related: Option<String>,
+) -> StatusEvent {
+    StatusEvent {
+        event_type: event_type.into(),
+        reason: reason.into(),
+        message: message.into(),
+        epoch_ms,
+        related,
+    }
+}
+
+fn sort_status_events_desc(events: &mut Vec<StatusEvent>) {
+    events.sort_by(|left, right| {
+        right
+            .epoch_ms
+            .cmp(&left.epoch_ms)
+            .then_with(|| left.event_type.cmp(&right.event_type))
+    });
+}
+
+fn deployment_events(
+    manifest: &ResourceEnvelope<DeploymentSpec>,
+    target_replica_set: Option<&ResourceEnvelope<ReplicaSetSpec>>,
+    conditions: &[StatusCondition],
+) -> Vec<StatusEvent> {
+    let mut events = conditions
+        .iter()
+        .map(|condition| {
+            status_event(
+                format!(
+                    "deployment_{}",
+                    condition.condition_type.to_ascii_lowercase()
+                ),
+                condition.reason.clone(),
+                condition.message.clone(),
+                condition.last_transition_epoch_ms,
+                Some(manifest.metadata.name.clone()),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(replica_set) = target_replica_set {
+        let created_at_epoch_ms = replica_set
+            .metadata
+            .annotations
+            .get("jarvisctl.io/created-at-epoch-ms")
+            .and_then(|value| value.parse::<u128>().ok())
+            .unwrap_or_else(now_epoch_ms);
+        events.push(status_event(
+            "deployment_rollout",
+            "TargetReplicaSet",
+            format!(
+                "Deployment targets ReplicaSet '{}' at revision {}",
+                replica_set.metadata.name, replica_set.spec.revision
+            ),
+            created_at_epoch_ms,
+            Some(replica_set.metadata.name.clone()),
+        ));
+    }
+
+    sort_status_events_desc(&mut events);
+    events.truncate(16);
+    events
 }
 
 fn replica_set_status(
@@ -5175,6 +6193,9 @@ fn replica_set_status_with_sessions(
         template_hash: manifest.spec.template_hash.clone(),
         replicas: manifest.spec.replicas,
         ready_replicas,
+        config_maps: env_binding_statuses(&manifest.spec.template.config_maps),
+        secrets: env_binding_statuses(&manifest.spec.template.secrets),
+        volumes: volume_binding_statuses(&manifest.spec.template.volumes),
         sessions: desired_namespaces,
         active: manifest.spec.replicas > 0,
     })
@@ -5291,11 +6312,26 @@ fn cron_job_status(manifest: &ResourceEnvelope<CronJobSpec>) -> anyhow::Result<C
         }
     }
     active_jobs.sort();
-    Ok(CronJobStatus {
+    let history = cron_job_history_entries(manifest, &state)?;
+    let mut status = CronJobStatus {
         schedule: manifest.spec.schedule.clone(),
         active_jobs,
         last_schedule_epoch_ms: state.last_schedule_epoch_ms,
-    })
+        successful_jobs: history
+            .iter()
+            .filter(|entry| entry.phase == "succeeded")
+            .count(),
+        failed_jobs: history
+            .iter()
+            .filter(|entry| entry.phase == "failed")
+            .count(),
+        history,
+        conditions: Vec::new(),
+        events: Vec::new(),
+    };
+    status.conditions = cron_job_conditions(manifest, &status);
+    status.events = cron_job_events(manifest, &status);
+    Ok(status)
 }
 
 fn application_status(
@@ -5312,7 +6348,7 @@ fn application_status(
     } else {
         "OutOfSync".to_string()
     };
-    Ok(ApplicationStatus {
+    let mut status = ApplicationStatus {
         source_path: manifest.spec.source.path.clone(),
         repo_url: desired.source.repo_url,
         source_type: desired.source.source_type,
@@ -5328,7 +6364,12 @@ fn application_status(
         rendered_resources: state.rendered_resources.len(),
         last_sync_epoch_ms: state.last_sync_epoch_ms,
         history: state.history.clone(),
-    })
+        conditions: Vec::new(),
+        events: Vec::new(),
+    };
+    status.conditions = application_conditions(manifest, &status);
+    status.events = application_events(manifest, &status);
+    Ok(status)
 }
 
 fn application_diff(
@@ -5549,6 +6590,605 @@ fn application_health_status(resources: &[RenderedResourceRef]) -> anyhow::Resul
     }
 }
 
+fn latest_job_epoch_ms(state: &JobControllerState) -> Option<u128> {
+    state.runs.iter().fold(None, |latest, run| {
+        let candidate = run
+            .completed_at_epoch_ms
+            .or(run.last_active_epoch_ms)
+            .unwrap_or(run.created_at_epoch_ms);
+        Some(latest.map_or(candidate, |value| value.max(candidate)))
+    })
+}
+
+fn job_terminal_failure(manifest: &ResourceEnvelope<JobSpec>, status: &JobStatus) -> bool {
+    status.failed > manifest.spec.backoff_limit
+}
+
+fn job_conditions(
+    manifest: &ResourceEnvelope<JobSpec>,
+    state: &JobControllerState,
+    status: &JobStatus,
+) -> Vec<StatusCondition> {
+    let transition_epoch_ms = latest_job_epoch_ms(state).unwrap_or_else(now_epoch_ms);
+    let complete = status.succeeded >= status.completions;
+    let failed = job_terminal_failure(manifest, status);
+    let complete_reason = if complete {
+        "CompletionsReached"
+    } else if status.pending > 0 {
+        "WaitingForWorkerAdmission"
+    } else if status.active > 0 {
+        "RunsActive"
+    } else if status.failed > 0 {
+        "RetryingAfterFailure"
+    } else {
+        "PendingCompletions"
+    };
+    let complete_message = if complete {
+        format!(
+            "Job reached {}/{} required completion(s)",
+            status.succeeded, status.completions
+        )
+    } else if status.pending > 0 {
+        format!(
+            "Job has {} pending run(s) waiting for worker admission",
+            status.pending
+        )
+    } else if status.active > 0 {
+        format!("Job has {} active run(s)", status.active)
+    } else if status.failed > 0 {
+        format!(
+            "Job has {} failed run(s) but remains within backoff limit {}",
+            status.failed, manifest.spec.backoff_limit
+        )
+    } else {
+        "Job has not reached the required completions yet".to_string()
+    };
+    let failed_reason = if failed {
+        "BackoffLimitExceeded"
+    } else {
+        "NoFailure"
+    };
+    let failed_message = if failed {
+        format!(
+            "Job exceeded backoff limit {} with {} failed run(s)",
+            manifest.spec.backoff_limit, status.failed
+        )
+    } else {
+        "Job has not exceeded its backoff limit".to_string()
+    };
+    vec![
+        StatusCondition {
+            condition_type: "Complete".to_string(),
+            status: if complete {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            },
+            reason: complete_reason.to_string(),
+            message: complete_message,
+            last_transition_epoch_ms: transition_epoch_ms,
+        },
+        StatusCondition {
+            condition_type: "Failed".to_string(),
+            status: if failed {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            },
+            reason: failed_reason.to_string(),
+            message: failed_message,
+            last_transition_epoch_ms: transition_epoch_ms,
+        },
+        StatusCondition {
+            condition_type: "Suspended".to_string(),
+            status: if manifest.spec.suspend {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            },
+            reason: if manifest.spec.suspend {
+                "JobSuspended".to_string()
+            } else {
+                "JobActive".to_string()
+            },
+            message: if manifest.spec.suspend {
+                "Job reconciliation is suspended".to_string()
+            } else {
+                "Job reconciliation is active".to_string()
+            },
+            last_transition_epoch_ms: transition_epoch_ms,
+        },
+    ]
+}
+
+fn job_run_events(run: &JobRunState) -> Vec<StatusEvent> {
+    let related = Some(run.runtime_namespace.clone());
+    let mut events = vec![status_event(
+        "job_run_created",
+        match run.backend {
+            JobRunBackend::Runtime => "RuntimeRunCreated",
+            JobRunBackend::Worker => "WorkerRunCreated",
+        },
+        format!("Run '{}' was created", run.runtime_namespace),
+        run.created_at_epoch_ms,
+        related.clone(),
+    )];
+
+    if matches!(
+        run.admission_state,
+        Some(JobRunAdmissionState::Pending) | Some(JobRunAdmissionState::Rejected)
+    ) || run.status == JobRunPhase::Pending
+    {
+        events.push(status_event(
+            "job_run_admission",
+            run.admission_code
+                .map(worker_admission_code_name)
+                .unwrap_or("pending"),
+            run.admission_reason
+                .clone()
+                .unwrap_or_else(|| format!("Run '{}' is waiting for admission", run.name)),
+            run.created_at_epoch_ms,
+            related.clone(),
+        ));
+    }
+
+    if matches!(
+        run.status,
+        JobRunPhase::Active | JobRunPhase::Succeeded | JobRunPhase::Failed
+    ) {
+        let start_epoch_ms = run.last_active_epoch_ms.unwrap_or(run.created_at_epoch_ms);
+        events.push(status_event(
+            "job_run_started",
+            match run.backend {
+                JobRunBackend::Runtime => "RuntimeStarted",
+                JobRunBackend::Worker => "WorkerAdmitted",
+            },
+            run.admission_reason
+                .clone()
+                .unwrap_or_else(|| format!("Run '{}' started", run.runtime_namespace)),
+            start_epoch_ms,
+            related.clone(),
+        ));
+    }
+
+    if let Some(completed_at_epoch_ms) = run.completed_at_epoch_ms {
+        let (event_type, reason, message) = if run.status == JobRunPhase::Succeeded {
+            (
+                "job_run_completed",
+                "RunSucceeded",
+                format!("Run '{}' completed successfully", run.runtime_namespace),
+            )
+        } else {
+            (
+                "job_run_failed",
+                "RunFailed",
+                run.last_error.clone().unwrap_or_else(|| {
+                    format!("Run '{}' completed with a failure", run.runtime_namespace)
+                }),
+            )
+        };
+        events.push(status_event(
+            event_type,
+            reason,
+            message,
+            completed_at_epoch_ms,
+            related,
+        ));
+    }
+
+    sort_status_events_desc(&mut events);
+    events
+}
+
+fn job_events(
+    manifest: &ResourceEnvelope<JobSpec>,
+    state: &JobControllerState,
+    status: &JobStatus,
+) -> Vec<StatusEvent> {
+    let mut events = state
+        .runs
+        .iter()
+        .flat_map(job_run_events)
+        .collect::<Vec<_>>();
+    let summary_epoch_ms = latest_job_epoch_ms(state).unwrap_or_else(now_epoch_ms);
+    if status.succeeded >= status.completions {
+        events.push(status_event(
+            "job_complete",
+            "CompletionsReached",
+            format!(
+                "Job reached {}/{} completion(s)",
+                status.succeeded, status.completions
+            ),
+            summary_epoch_ms,
+            Some(manifest.metadata.name.clone()),
+        ));
+    } else if job_terminal_failure(manifest, status) {
+        events.push(status_event(
+            "job_failed",
+            "BackoffLimitExceeded",
+            format!(
+                "Job exceeded backoff limit {} with {} failed run(s)",
+                manifest.spec.backoff_limit, status.failed
+            ),
+            summary_epoch_ms,
+            Some(manifest.metadata.name.clone()),
+        ));
+    } else if manifest.spec.suspend {
+        events.push(status_event(
+            "job_suspended",
+            "JobSuspended",
+            "Job reconciliation is suspended",
+            summary_epoch_ms,
+            Some(manifest.metadata.name.clone()),
+        ));
+    } else if status.pending > 0 {
+        events.push(status_event(
+            "job_pending",
+            "WaitingForWorkerAdmission",
+            format!("Job has {} pending run(s)", status.pending),
+            summary_epoch_ms,
+            Some(manifest.metadata.name.clone()),
+        ));
+    } else if status.active > 0 {
+        events.push(status_event(
+            "job_active",
+            "RunsActive",
+            format!("Job has {} active run(s)", status.active),
+            summary_epoch_ms,
+            Some(manifest.metadata.name.clone()),
+        ));
+    }
+    sort_status_events_desc(&mut events);
+    events.truncate(32);
+    events
+}
+
+fn cron_job_run_phase(status: &JobStatus) -> &'static str {
+    if status.active > 0 {
+        "active"
+    } else if status.pending > 0 {
+        "pending"
+    } else if status.succeeded >= status.completions {
+        "succeeded"
+    } else if status.failed > 0 {
+        "failed"
+    } else {
+        "idle"
+    }
+}
+
+fn cron_job_scheduled_at_epoch_ms(cron_job_name: &str, job_name: &str) -> Option<u128> {
+    let prefix = format!("{}-", slugify(cron_job_name));
+    job_name
+        .strip_prefix(&prefix)?
+        .parse::<i64>()
+        .ok()
+        .map(|seconds| (seconds as i128).saturating_mul(1000))
+        .and_then(|value| u128::try_from(value).ok())
+}
+
+fn cron_job_history_entries(
+    manifest: &ResourceEnvelope<CronJobSpec>,
+    state: &CronJobControllerState,
+) -> anyhow::Result<Vec<CronJobJobHistoryEntry>> {
+    let mut history = Vec::new();
+    for job_name in &state.jobs {
+        let Ok(ResourceManifest::Job(job)) = load_manifest(
+            ResourceKind::Job,
+            job_name,
+            manifest.metadata.namespace.as_deref(),
+        ) else {
+            continue;
+        };
+        let status = job_status(&job)?;
+        let mut workers = status
+            .run_details
+            .iter()
+            .filter_map(|detail| detail.worker.clone())
+            .collect::<Vec<_>>();
+        workers.sort();
+        workers.dedup();
+        let last_transition_epoch_ms = status
+            .run_details
+            .iter()
+            .filter_map(|detail| {
+                detail
+                    .completed_at_epoch_ms
+                    .or(Some(detail.created_at_epoch_ms))
+            })
+            .max();
+        history.push(CronJobJobHistoryEntry {
+            job_name: job_name.clone(),
+            phase: cron_job_run_phase(&status).to_string(),
+            scheduled_at_epoch_ms: cron_job_scheduled_at_epoch_ms(
+                &manifest.metadata.name,
+                job_name,
+            ),
+            last_transition_epoch_ms,
+            pending: status.pending,
+            active: status.active,
+            succeeded: status.succeeded,
+            failed: status.failed,
+            worker_backed: job.spec.worker.is_some(),
+            workers,
+        });
+    }
+    history.sort_by(|left, right| {
+        right
+            .scheduled_at_epoch_ms
+            .cmp(&left.scheduled_at_epoch_ms)
+            .then_with(|| {
+                right
+                    .last_transition_epoch_ms
+                    .cmp(&left.last_transition_epoch_ms)
+            })
+            .then_with(|| left.job_name.cmp(&right.job_name))
+    });
+    Ok(history)
+}
+
+fn cron_job_conditions(
+    manifest: &ResourceEnvelope<CronJobSpec>,
+    status: &CronJobStatus,
+) -> Vec<StatusCondition> {
+    let now = status.last_schedule_epoch_ms.unwrap_or_else(now_epoch_ms);
+    let last_terminal = status
+        .history
+        .iter()
+        .find(|entry| entry.phase == "succeeded" || entry.phase == "failed");
+    vec![
+        StatusCondition {
+            condition_type: "Suspended".to_string(),
+            status: if manifest.spec.suspend {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            },
+            reason: if manifest.spec.suspend {
+                "CronJobSuspended".to_string()
+            } else {
+                "CronJobActive".to_string()
+            },
+            message: if manifest.spec.suspend {
+                "CronJob scheduling is suspended".to_string()
+            } else {
+                "CronJob scheduling is active".to_string()
+            },
+            last_transition_epoch_ms: now,
+        },
+        StatusCondition {
+            condition_type: "Active".to_string(),
+            status: if status.active_jobs.is_empty() {
+                "False".to_string()
+            } else {
+                "True".to_string()
+            },
+            reason: if status.active_jobs.is_empty() {
+                "NoActiveJobs".to_string()
+            } else {
+                "JobsRunning".to_string()
+            },
+            message: if status.active_jobs.is_empty() {
+                "CronJob has no active child jobs".to_string()
+            } else {
+                format!(
+                    "CronJob has {} active child job(s)",
+                    status.active_jobs.len()
+                )
+            },
+            last_transition_epoch_ms: now,
+        },
+        StatusCondition {
+            condition_type: "LastRunSucceeded".to_string(),
+            status: match last_terminal {
+                Some(entry) if entry.phase == "succeeded" => "True".to_string(),
+                Some(entry) if entry.phase == "failed" => "False".to_string(),
+                _ => "Unknown".to_string(),
+            },
+            reason: match last_terminal {
+                Some(entry) if entry.phase == "succeeded" => "LastRunSucceeded".to_string(),
+                Some(entry) if entry.phase == "failed" => "LastRunFailed".to_string(),
+                _ => "NoCompletedRuns".to_string(),
+            },
+            message: match last_terminal {
+                Some(entry) if entry.phase == "succeeded" => {
+                    format!("Latest completed child job '{}' succeeded", entry.job_name)
+                }
+                Some(entry) if entry.phase == "failed" => {
+                    format!("Latest completed child job '{}' failed", entry.job_name)
+                }
+                _ => "CronJob has not completed any child jobs yet".to_string(),
+            },
+            last_transition_epoch_ms: last_terminal
+                .and_then(|entry| entry.last_transition_epoch_ms)
+                .unwrap_or(now),
+        },
+    ]
+}
+
+fn cron_job_events(
+    manifest: &ResourceEnvelope<CronJobSpec>,
+    status: &CronJobStatus,
+) -> Vec<StatusEvent> {
+    let mut events = Vec::new();
+    if let Some(last_schedule_epoch_ms) = status.last_schedule_epoch_ms {
+        events.push(status_event(
+            "cronjob_scheduled",
+            "ScheduleTriggered",
+            format!(
+                "CronJob '{}' last scheduled a child job at {}",
+                manifest.metadata.name, last_schedule_epoch_ms
+            ),
+            last_schedule_epoch_ms,
+            Some(manifest.metadata.name.clone()),
+        ));
+    }
+    if let Some(entry) = status.history.first() {
+        let reason = match entry.phase.as_str() {
+            "succeeded" => "ChildJobSucceeded",
+            "failed" => "ChildJobFailed",
+            "active" => "ChildJobActive",
+            "pending" => "ChildJobPending",
+            _ => "ChildJobObserved",
+        };
+        let message = format!("Latest child job '{}' is {}", entry.job_name, entry.phase);
+        events.push(status_event(
+            "cronjob_child_job",
+            reason,
+            message,
+            entry
+                .last_transition_epoch_ms
+                .or(entry.scheduled_at_epoch_ms)
+                .unwrap_or_else(now_epoch_ms),
+            Some(entry.job_name.clone()),
+        ));
+    }
+    if manifest.spec.suspend {
+        events.push(status_event(
+            "cronjob_suspended",
+            "CronJobSuspended",
+            "CronJob scheduling is suspended",
+            status.last_schedule_epoch_ms.unwrap_or_else(now_epoch_ms),
+            Some(manifest.metadata.name.clone()),
+        ));
+    }
+    sort_status_events_desc(&mut events);
+    events.truncate(16);
+    events
+}
+
+fn application_conditions(
+    manifest: &ResourceEnvelope<ApplicationSpec>,
+    status: &ApplicationStatus,
+) -> Vec<StatusCondition> {
+    let now = status.last_sync_epoch_ms.unwrap_or_else(now_epoch_ms);
+    let (health_condition_status, health_reason) = match status.health_status.as_str() {
+        "Healthy" => ("True", "ApplicationHealthy"),
+        "Progressing" => ("Unknown", "ResourcesProgressing"),
+        "Degraded" => ("False", "ResourcesDegraded"),
+        "Missing" => ("False", "ResourcesMissing"),
+        _ => ("Unknown", "HealthUnknown"),
+    };
+    let ready_status = status.sync_status == "Synced" && status.health_status == "Healthy";
+    vec![
+        StatusCondition {
+            condition_type: "Synced".to_string(),
+            status: if status.sync_status == "Synced" {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            },
+            reason: if status.sync_status == "Synced" {
+                "DesiredRevisionApplied".to_string()
+            } else {
+                "DiffDetected".to_string()
+            },
+            message: if status.sync_status == "Synced" {
+                format!(
+                    "Application is synced to resolved revision {}",
+                    status.resolved_revision
+                )
+            } else {
+                format!(
+                    "Application resolved revision {} differs from last applied {:?}",
+                    status.resolved_revision, status.last_applied_revision
+                )
+            },
+            last_transition_epoch_ms: now,
+        },
+        StatusCondition {
+            condition_type: "Healthy".to_string(),
+            status: health_condition_status.to_string(),
+            reason: health_reason.to_string(),
+            message: format!(
+                "Application '{}' health is {}",
+                manifest.metadata.name, status.health_status
+            ),
+            last_transition_epoch_ms: now,
+        },
+        StatusCondition {
+            condition_type: "Ready".to_string(),
+            status: if ready_status {
+                "True".to_string()
+            } else if status.health_status == "Progressing" {
+                "Unknown".to_string()
+            } else {
+                "False".to_string()
+            },
+            reason: if ready_status {
+                "ApplicationReady".to_string()
+            } else if status.sync_status != "Synced" {
+                "ApplicationOutOfSync".to_string()
+            } else {
+                "ApplicationNotHealthy".to_string()
+            },
+            message: if ready_status {
+                "Application is synced and healthy".to_string()
+            } else {
+                format!(
+                    "Application is {} and {}",
+                    status.sync_status, status.health_status
+                )
+            },
+            last_transition_epoch_ms: now,
+        },
+    ]
+}
+
+fn application_events(
+    manifest: &ResourceEnvelope<ApplicationSpec>,
+    status: &ApplicationStatus,
+) -> Vec<StatusEvent> {
+    let mut events = status
+        .history
+        .iter()
+        .map(|entry| {
+            status_event(
+                "application_sync",
+                "SyncApplied",
+                format!(
+                    "Applied revision {} with {} rendered resource(s)",
+                    entry.revision, entry.rendered_resources
+                ),
+                entry.synced_at_epoch_ms,
+                Some(manifest.metadata.name.clone()),
+            )
+        })
+        .collect::<Vec<_>>();
+    if status.sync_status != "Synced" {
+        events.push(status_event(
+            "application_drift",
+            "DiffDetected",
+            format!(
+                "Resolved revision {} has not been applied yet",
+                status.resolved_revision
+            ),
+            now_epoch_ms(),
+            Some(manifest.metadata.name.clone()),
+        ));
+    }
+    if status.health_status != "Healthy" {
+        events.push(status_event(
+            "application_health",
+            match status.health_status.as_str() {
+                "Progressing" => "ResourcesProgressing",
+                "Degraded" => "ResourcesDegraded",
+                "Missing" => "ResourcesMissing",
+                _ => "HealthUnknown",
+            },
+            format!(
+                "Application '{}' health is {}",
+                manifest.metadata.name, status.health_status
+            ),
+            now_epoch_ms(),
+            Some(manifest.metadata.name.clone()),
+        ));
+    }
+    sort_status_events_desc(&mut events);
+    events.truncate(16);
+    events
+}
+
 fn job_status_from_state(
     manifest: &ResourceEnvelope<JobSpec>,
     state: &JobControllerState,
@@ -5559,7 +7199,7 @@ fn job_status_from_state(
         .map(|run| format!("{} ({})", run.runtime_namespace, job_phase_name(run.status)))
         .collect::<Vec<_>>();
     runs.sort();
-    JobStatus {
+    let base_status = JobStatus {
         completions: manifest.spec.completions,
         pending: state
             .runs
@@ -5585,32 +7225,87 @@ fn job_status_from_state(
         run_details: state
             .runs
             .iter()
-            .map(|run| JobRunDetail {
-                name: run.name.clone(),
-                execution_id: run.runtime_namespace.clone(),
-                backend: match run.backend {
-                    JobRunBackend::Runtime => "runtime".to_string(),
-                    JobRunBackend::Worker => "worker".to_string(),
-                },
-                phase: job_phase_name(run.status).to_string(),
-                worker: run.worker_name.clone(),
-                worker_namespace: run.worker_namespace.clone(),
-                admission_state: run.admission_state.map(|state| match state {
-                    JobRunAdmissionState::Pending => "pending".to_string(),
-                    JobRunAdmissionState::Granted => "granted".to_string(),
-                    JobRunAdmissionState::Rejected => "rejected".to_string(),
-                }),
-                reason: run
-                    .admission_reason
-                    .clone()
-                    .or_else(|| run.last_error.clone()),
-                created_at_epoch_ms: run.created_at_epoch_ms,
-                completed_at_epoch_ms: run.completed_at_epoch_ms,
-                artifact_path: run.artifact_path.clone(),
-                output_path: run.output_path.clone(),
-                error: run.last_error.clone(),
+            .map(|run| {
+                let worker_manifest = run
+                    .worker_name
+                    .as_deref()
+                    .zip(run.worker_namespace.as_deref())
+                    .and_then(|(worker_name, worker_namespace)| {
+                        match load_manifest(
+                            ResourceKind::Worker,
+                            worker_name,
+                            Some(worker_namespace),
+                        ) {
+                            Ok(ResourceManifest::Worker(worker)) => Some(worker),
+                            _ => None,
+                        }
+                    });
+                JobRunDetail {
+                    name: run.name.clone(),
+                    execution_id: run.runtime_namespace.clone(),
+                    backend: match run.backend {
+                        JobRunBackend::Runtime => "runtime".to_string(),
+                        JobRunBackend::Worker => "worker".to_string(),
+                    },
+                    phase: job_phase_name(run.status).to_string(),
+                    service_name: run.service_name.clone(),
+                    intent: run.intent.clone(),
+                    selected_class: run.selected_class.clone(),
+                    fallback_class: run.fallback_class,
+                    worker: run.worker_name.clone(),
+                    worker_namespace: run.worker_namespace.clone(),
+                    worker_provider: worker_manifest
+                        .as_ref()
+                        .map(|worker| worker_provider_name(worker.spec.provider).to_string()),
+                    worker_model: worker_manifest
+                        .as_ref()
+                        .map(|worker| worker.spec.model.clone()),
+                    worker_locality: run
+                        .worker_locality
+                        .as_ref()
+                        .map(|locality| worker_locality_name(locality).to_string())
+                        .or_else(|| {
+                            worker_manifest.as_ref().map(|worker| {
+                                worker_locality_name(&effective_worker_locality(worker)).to_string()
+                            })
+                        }),
+                    worker_pool: worker_manifest
+                        .as_ref()
+                        .and_then(|worker| worker.spec.pool.clone()),
+                    worker_classes: worker_manifest
+                        .as_ref()
+                        .map(|worker| worker.spec.classes.clone())
+                        .unwrap_or_default(),
+                    admission_state: run.admission_state.map(|state| match state {
+                        JobRunAdmissionState::Pending => "pending".to_string(),
+                        JobRunAdmissionState::Granted => "granted".to_string(),
+                        JobRunAdmissionState::Rejected => "rejected".to_string(),
+                    }),
+                    admission_code: run
+                        .admission_code
+                        .map(|code| worker_admission_code_name(code).to_string()),
+                    reason: run
+                        .admission_reason
+                        .clone()
+                        .or_else(|| run.last_error.clone()),
+                    created_at_epoch_ms: run.created_at_epoch_ms,
+                    completed_at_epoch_ms: run.completed_at_epoch_ms,
+                    artifact_path: run.artifact_path.clone(),
+                    output_path: run.output_path.clone(),
+                    error: run.last_error.clone(),
+                    events: job_run_events(run),
+                }
             })
             .collect(),
+        conditions: Vec::new(),
+        events: Vec::new(),
+    };
+    let conditions = job_conditions(manifest, state, &base_status);
+    let events = job_events(manifest, state, &base_status);
+    JobStatus {
+        conditions,
+        events,
+        ..base_status
     }
 }
 
@@ -5761,15 +7456,42 @@ fn job_run_phase(
 }
 
 fn service_status(manifest: &ResourceEnvelope<ServiceSpec>) -> anyhow::Result<ServiceStatus> {
-    let mut sessions = collect_runtime_sessions()?;
-    sessions.retain(|session| service_matches_session(manifest, session));
-    sessions.sort_by(|left, right| left.namespace.cmp(&right.namespace));
+    let target_kind = effective_service_target_kind(&manifest.spec);
+    let mut endpoints = match target_kind {
+        ServiceTargetKind::Runtime => {
+            let mut sessions = collect_runtime_sessions()?;
+            sessions.retain(|session| service_matches_session(manifest, session));
+            sessions.sort_by(|left, right| left.namespace.cmp(&right.namespace));
+            sessions
+                .into_iter()
+                .map(|session| session.namespace)
+                .collect::<Vec<_>>()
+        }
+        ServiceTargetKind::Worker => {
+            let namespace = manifest.namespace_key().to_string();
+            let mut workers = load_workers_for_service(manifest, &namespace)?;
+            workers.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
+            workers
+                .into_iter()
+                .map(|worker| format!("{}/{}", namespace, worker.metadata.name))
+                .collect::<Vec<_>>()
+        }
+    };
+    endpoints.sort();
     Ok(ServiceStatus {
-        endpoints: sessions
-            .into_iter()
-            .map(|session| session.namespace)
-            .collect(),
+        target_kind: match target_kind {
+            ServiceTargetKind::Runtime => "runtime".to_string(),
+            ServiceTargetKind::Worker => "worker".to_string(),
+        },
+        endpoints,
         strategy: manifest.spec.strategy.clone(),
+        class_name: manifest.spec.class_name.clone(),
+        fallback_class_names: trimmed_vec(&manifest.spec.fallback_class_names),
+        required_capabilities: trimmed_vec(&manifest.spec.required_capabilities),
+        preferred_providers: worker_provider_labels(&manifest.spec.preferred_providers),
+        prefer_local: manifest.spec.prefer_local,
+        allowed_intents: manifest.spec.allowed_intents.clone(),
+        access_policy: resource_access_policy_status(&manifest.spec.access_policy),
     })
 }
 
@@ -5792,8 +7514,53 @@ fn network_policy_status(
 struct WorkerSelection {
     name: Option<String>,
     namespace: Option<String>,
-    available_slots: usize,
+    service_name: Option<String>,
+    intent: Option<String>,
+    selected_class: Option<String>,
+    fallback_class: bool,
+    locality: Option<WorkerLocality>,
+    admission_code: WorkerAdmissionCode,
     reason: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MachineCapacitySnapshot {
+    memory_available_mib: Option<u64>,
+    gpu_memory_available_mib: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkerAdmissionEvaluation {
+    locality: WorkerLocality,
+    max_concurrent: usize,
+    active_runs: usize,
+    pending_runs: usize,
+    available_slots: usize,
+    admission_code: WorkerAdmissionCode,
+    reason: String,
+    estimated_memory_mib: Option<u64>,
+    estimated_gpu_memory_mib: Option<u64>,
+    machine_memory_available_mib: Option<u64>,
+    machine_gpu_memory_available_mib: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkerCandidate {
+    worker_name: String,
+    worker_namespace: String,
+    worker_provider: WorkerProvider,
+    worker_pool: Option<String>,
+    pool_active_runs: usize,
+    pool_pending_runs: usize,
+    pool_capacity: usize,
+    evaluation: WorkerAdmissionEvaluation,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WorkerPoolLoad {
+    active_runs: usize,
+    pending_runs: usize,
+    capacity: usize,
 }
 
 fn effective_worker_max_concurrent(manifest: &ResourceEnvelope<WorkerSpec>) -> usize {
@@ -5823,6 +7590,124 @@ fn worker_locality_name(locality: &WorkerLocality) -> &'static str {
     }
 }
 
+fn worker_provider_name(provider: WorkerProvider) -> &'static str {
+    match provider {
+        WorkerProvider::Ollama => "ollama",
+        WorkerProvider::Nvidia => "nvidia",
+        WorkerProvider::Moonshot => "moonshot",
+    }
+}
+
+fn worker_api_key_env_name(manifest: &ResourceEnvelope<WorkerSpec>) -> Option<&str> {
+    match manifest.spec.provider {
+        WorkerProvider::Ollama => manifest
+            .spec
+            .api_key_env
+            .as_deref()
+            .filter(|value| !value.trim().is_empty()),
+        WorkerProvider::Nvidia => Some(
+            manifest
+                .spec
+                .api_key_env
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("NVIDIA_API_KEY"),
+        ),
+        WorkerProvider::Moonshot => Some(
+            manifest
+                .spec
+                .api_key_env
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("MOONSHOT_API_KEY"),
+        ),
+    }
+}
+
+fn worker_has_required_credentials(manifest: &ResourceEnvelope<WorkerSpec>) -> bool {
+    worker_api_key_env_name(manifest).is_none_or(|key| {
+        env::var_os(key)
+            .and_then(|value| value.into_string().ok())
+            .is_some_and(|value| !value.trim().is_empty())
+    })
+}
+
+fn worker_admission_code_name(code: WorkerAdmissionCode) -> &'static str {
+    match code {
+        WorkerAdmissionCode::Ready => "ready",
+        WorkerAdmissionCode::CapacitySaturated => "capacity_saturated",
+        WorkerAdmissionCode::MemoryPressure => "memory_pressure",
+        WorkerAdmissionCode::GpuPressure => "gpu_pressure",
+        WorkerAdmissionCode::CredentialsMissing => "credentials_missing",
+        WorkerAdmissionCode::NoMatchingWorker => "no_matching_worker",
+        WorkerAdmissionCode::WaitingForNamedWorker => "waiting_for_named_worker",
+        WorkerAdmissionCode::RemoteFallback => "remote_fallback",
+    }
+}
+
+fn worker_admission_summary(code: WorkerAdmissionCode) -> &'static str {
+    match code {
+        WorkerAdmissionCode::Ready => "ready",
+        WorkerAdmissionCode::CapacitySaturated => "saturated",
+        WorkerAdmissionCode::MemoryPressure => "memory-pressure",
+        WorkerAdmissionCode::GpuPressure => "gpu-pressure",
+        WorkerAdmissionCode::CredentialsMissing => "credentials-missing",
+        WorkerAdmissionCode::NoMatchingWorker => "waiting",
+        WorkerAdmissionCode::WaitingForNamedWorker => "waiting",
+        WorkerAdmissionCode::RemoteFallback => "remote-fallback",
+    }
+}
+
+fn parse_capacity_override(var: &str) -> Option<u64> {
+    env::var(var).ok()?.trim().parse::<u64>().ok()
+}
+
+fn machine_capacity_snapshot() -> MachineCapacitySnapshot {
+    let memory_available_mib = parse_capacity_override("JARVISCTL_TEST_AVAILABLE_MEMORY_MIB")
+        .or_else(machine_memory_available_mib);
+    let gpu_memory_available_mib =
+        parse_capacity_override("JARVISCTL_TEST_AVAILABLE_GPU_MEMORY_MIB")
+            .or_else(machine_gpu_memory_available_mib);
+    MachineCapacitySnapshot {
+        memory_available_mib,
+        gpu_memory_available_mib,
+    }
+}
+
+fn machine_memory_available_mib() -> Option<u64> {
+    let mut system = System::new_with_specifics(
+        RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
+    );
+    system.refresh_memory();
+    let available = system.available_memory();
+    Some(available / 1024 / 1024)
+}
+
+fn machine_gpu_memory_available_mib() -> Option<u64> {
+    let output = ProcessCommand::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.total,memory.used",
+            "--format=csv,noheader,nounits",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split(',').map(str::trim);
+            let total = parts.next()?.parse::<u64>().ok()?;
+            let used = parts.next()?.parse::<u64>().ok()?;
+            Some(total.saturating_sub(used))
+        })
+        .max()
+}
+
 fn worker_labels_match_selector(
     labels: &BTreeMap<String, String>,
     selector: &LabelSelector,
@@ -5846,13 +7731,390 @@ fn worker_supports_required_capabilities(
     })
 }
 
+fn worker_matches_class(manifest: &ResourceEnvelope<WorkerSpec>, class_name: &str) -> bool {
+    let class_name = class_name.trim();
+    !class_name.is_empty()
+        && manifest
+            .spec
+            .classes
+            .iter()
+            .any(|candidate| candidate == class_name)
+}
+
+fn worker_matches_any_class(
+    manifest: &ResourceEnvelope<WorkerSpec>,
+    class_names: &[String],
+) -> bool {
+    class_names
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .any(|class_name| worker_matches_class(manifest, class_name))
+}
+
+fn trimmed_vec(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn merged_required_capabilities(request: &[String], service: Option<&[String]>) -> Vec<String> {
+    let mut merged = Vec::new();
+    for capability in service
+        .into_iter()
+        .flatten()
+        .chain(request.iter())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    {
+        if !merged
+            .iter()
+            .any(|existing: &String| existing == capability)
+        {
+            merged.push(capability.to_string());
+        }
+    }
+    merged
+}
+
+fn merged_preferred_providers(
+    request: &[WorkerProvider],
+    service: Option<&[WorkerProvider]>,
+) -> Vec<WorkerProvider> {
+    let mut merged = Vec::new();
+    for provider in request
+        .iter()
+        .copied()
+        .chain(service.into_iter().flatten().copied())
+    {
+        if !merged.contains(&provider) {
+            merged.push(provider);
+        }
+    }
+    merged
+}
+
+fn effective_class_policy(
+    request: &WorkerJobSpec,
+    service: Option<&ServiceSpec>,
+) -> (Option<String>, Vec<String>) {
+    let primary = request
+        .class_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            service.and_then(|service| {
+                service
+                    .class_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+        });
+    let fallbacks = if request.fallback_class_names.is_empty() {
+        service
+            .map(|service| trimmed_vec(&service.fallback_class_names))
+            .unwrap_or_default()
+    } else {
+        trimmed_vec(&request.fallback_class_names)
+    };
+    (primary, fallbacks)
+}
+
+fn provider_preference_rank(provider: WorkerProvider, preferred: &[WorkerProvider]) -> usize {
+    preferred
+        .iter()
+        .position(|candidate| *candidate == provider)
+        .unwrap_or(preferred.len())
+}
+
 fn worker_request_namespace(request: &WorkerJobSpec, control_namespace: &str) -> String {
     normalize_namespaced_resource_namespace(
         request
-            .resource_namespace
+            .service_namespace
             .as_deref()
+            .or(request.resource_namespace.as_deref())
             .or(Some(control_namespace)),
     )
+}
+
+fn worker_pool_loads(
+    worker_namespace: &str,
+    current_job: Option<(&str, &str, &JobControllerState)>,
+) -> anyhow::Result<BTreeMap<String, WorkerPoolLoad>> {
+    let mut loads: BTreeMap<String, WorkerPoolLoad> = BTreeMap::new();
+    for resource in load_manifests_by_kind(ResourceKind::Worker, Some(worker_namespace))? {
+        let ResourceManifest::Worker(worker) = resource else {
+            continue;
+        };
+        let Some(pool) = worker.spec.pool.as_ref().map(|value| value.trim()) else {
+            continue;
+        };
+        if pool.is_empty() {
+            continue;
+        }
+        let (active_runs, pending_runs) =
+            worker_run_counts(worker_namespace, &worker.metadata.name, current_job)?;
+        let entry = loads.entry(pool.to_string()).or_default();
+        entry.active_runs += active_runs;
+        entry.pending_runs += pending_runs;
+        entry.capacity += effective_worker_max_concurrent(&worker);
+    }
+    Ok(loads)
+}
+
+fn worker_pool_sort_key(candidate: &WorkerCandidate) -> (usize, usize, usize) {
+    match candidate.worker_pool.as_deref() {
+        Some(_) => (
+            candidate
+                .pool_active_runs
+                .saturating_add(candidate.pool_pending_runs),
+            candidate.pool_capacity,
+            candidate.pool_active_runs,
+        ),
+        None => (usize::MAX, usize::MAX, usize::MAX),
+    }
+}
+
+fn worker_selection_reason_prefix(
+    service_name: Option<&str>,
+    matched_class: Option<&str>,
+    fallback_class: bool,
+) -> Option<String> {
+    let mut qualifiers = Vec::new();
+    if let Some(service_name) = service_name {
+        qualifiers.push(format!("via service '{}'", service_name));
+    }
+    if let Some(class_name) = matched_class {
+        qualifiers.push(if fallback_class {
+            format!("using fallback class '{}'", class_name)
+        } else {
+            format!("for class '{}'", class_name)
+        });
+    }
+    if qualifiers.is_empty() {
+        None
+    } else {
+        Some(qualifiers.join(", "))
+    }
+}
+
+fn selection_reason(prefix: Option<&str>, base_reason: &str) -> String {
+    prefix
+        .map(|prefix| format!("{}: {}", prefix, base_reason))
+        .unwrap_or_else(|| base_reason.to_string())
+}
+
+fn waiting_reason(prefix: Option<&str>, base_reason: &str) -> String {
+    selection_reason(prefix, base_reason)
+}
+
+fn service_selection_namespace(request: &WorkerJobSpec, control_namespace: &str) -> String {
+    normalize_namespaced_resource_namespace(
+        request
+            .service_namespace
+            .as_deref()
+            .or(request.resource_namespace.as_deref())
+            .or(Some(control_namespace)),
+    )
+}
+
+fn evaluate_worker_admission(
+    manifest: &ResourceEnvelope<WorkerSpec>,
+    worker_namespace: &str,
+    current_job: Option<(&str, &str, &JobControllerState)>,
+    machine_capacity: &MachineCapacitySnapshot,
+) -> anyhow::Result<WorkerAdmissionEvaluation> {
+    let locality = effective_worker_locality(manifest);
+    let max_concurrent = effective_worker_max_concurrent(manifest);
+    let (active_runs, pending_runs) =
+        worker_run_counts(worker_namespace, &manifest.metadata.name, current_job)?;
+    let available_slots = max_concurrent.saturating_sub(active_runs);
+    let estimated_memory_mib = manifest.spec.memory_mib;
+    let estimated_gpu_memory_mib = manifest.spec.gpu_memory_mib;
+    let machine_memory_available_mib = (locality == WorkerLocality::Local)
+        .then_some(machine_capacity.memory_available_mib)
+        .flatten();
+    let machine_gpu_memory_available_mib = (locality == WorkerLocality::Local)
+        .then_some(machine_capacity.gpu_memory_available_mib)
+        .flatten();
+
+    let (admission_code, reason) = if !worker_has_required_credentials(manifest) {
+        let key = worker_api_key_env_name(manifest).unwrap_or("API_KEY");
+        (
+            WorkerAdmissionCode::CredentialsMissing,
+            format!(
+                "waiting for {} worker '{}' because env '{}' is not set",
+                worker_locality_name(&locality),
+                manifest.metadata.name,
+                key
+            ),
+        )
+    } else if available_slots == 0 {
+        (
+            WorkerAdmissionCode::CapacitySaturated,
+            format!(
+                "waiting for capacity on {} worker '{}' (active {}, max {})",
+                worker_locality_name(&locality),
+                manifest.metadata.name,
+                active_runs,
+                max_concurrent
+            ),
+        )
+    } else if locality == WorkerLocality::Local {
+        if let Some(required_memory_mib) = estimated_memory_mib {
+            match machine_memory_available_mib {
+                Some(available_memory_mib) if available_memory_mib < required_memory_mib => (
+                    WorkerAdmissionCode::MemoryPressure,
+                    format!(
+                        "waiting for local worker '{}' because it requires {} MiB RAM and the machine has {} MiB available",
+                        manifest.metadata.name, required_memory_mib, available_memory_mib
+                    ),
+                ),
+                None => (
+                    WorkerAdmissionCode::MemoryPressure,
+                    format!(
+                        "waiting for local worker '{}' because it requires {} MiB RAM and the machine memory state is unavailable",
+                        manifest.metadata.name, required_memory_mib
+                    ),
+                ),
+                _ => {
+                    if let Some(required_gpu_mib) = estimated_gpu_memory_mib {
+                        match machine_gpu_memory_available_mib {
+                            Some(available_gpu_mib) if available_gpu_mib < required_gpu_mib => (
+                                WorkerAdmissionCode::GpuPressure,
+                                format!(
+                                    "waiting for local worker '{}' because it requires {} MiB GPU memory and the machine has {} MiB available",
+                                    manifest.metadata.name, required_gpu_mib, available_gpu_mib
+                                ),
+                            ),
+                            None => (
+                                WorkerAdmissionCode::GpuPressure,
+                                format!(
+                                    "waiting for local worker '{}' because it requires {} MiB GPU memory and no GPU availability data was detected",
+                                    manifest.metadata.name, required_gpu_mib
+                                ),
+                            ),
+                            _ => (
+                                WorkerAdmissionCode::Ready,
+                                format!(
+                                    "admitted on local worker '{}' with {} slot(s) remaining",
+                                    manifest.metadata.name,
+                                    available_slots.saturating_sub(1)
+                                ),
+                            ),
+                        }
+                    } else {
+                        (
+                            WorkerAdmissionCode::Ready,
+                            format!(
+                                "admitted on local worker '{}' with {} slot(s) remaining",
+                                manifest.metadata.name,
+                                available_slots.saturating_sub(1)
+                            ),
+                        )
+                    }
+                }
+            }
+        } else if let Some(required_gpu_mib) = estimated_gpu_memory_mib {
+            match machine_gpu_memory_available_mib {
+                Some(available_gpu_mib) if available_gpu_mib < required_gpu_mib => (
+                    WorkerAdmissionCode::GpuPressure,
+                    format!(
+                        "waiting for local worker '{}' because it requires {} MiB GPU memory and the machine has {} MiB available",
+                        manifest.metadata.name, required_gpu_mib, available_gpu_mib
+                    ),
+                ),
+                None => (
+                    WorkerAdmissionCode::GpuPressure,
+                    format!(
+                        "waiting for local worker '{}' because it requires {} MiB GPU memory and no GPU availability data was detected",
+                        manifest.metadata.name, required_gpu_mib
+                    ),
+                ),
+                _ => (
+                    WorkerAdmissionCode::Ready,
+                    format!(
+                        "admitted on local worker '{}' with {} slot(s) remaining",
+                        manifest.metadata.name,
+                        available_slots.saturating_sub(1)
+                    ),
+                ),
+            }
+        } else {
+            (
+                WorkerAdmissionCode::Ready,
+                format!(
+                    "admitted on local worker '{}' with {} slot(s) remaining",
+                    manifest.metadata.name,
+                    available_slots.saturating_sub(1)
+                ),
+            )
+        }
+    } else {
+        (
+            WorkerAdmissionCode::Ready,
+            format!(
+                "admitted on {} worker '{}' with {} slot(s) remaining",
+                worker_locality_name(&locality),
+                manifest.metadata.name,
+                available_slots.saturating_sub(1)
+            ),
+        )
+    };
+
+    Ok(WorkerAdmissionEvaluation {
+        locality,
+        max_concurrent,
+        active_runs,
+        pending_runs,
+        available_slots,
+        admission_code,
+        reason,
+        estimated_memory_mib,
+        estimated_gpu_memory_mib,
+        machine_memory_available_mib,
+        machine_gpu_memory_available_mib,
+    })
+}
+
+fn is_worker_admissible(code: WorkerAdmissionCode) -> bool {
+    matches!(
+        code,
+        WorkerAdmissionCode::Ready | WorkerAdmissionCode::RemoteFallback
+    )
+}
+
+fn sort_worker_candidates(
+    candidates: &mut [WorkerCandidate],
+    preferred_providers: &[WorkerProvider],
+) {
+    candidates.sort_by(|left, right| {
+        provider_preference_rank(left.worker_provider, preferred_providers)
+            .cmp(&provider_preference_rank(
+                right.worker_provider,
+                preferred_providers,
+            ))
+            .then_with(|| worker_pool_sort_key(left).cmp(&worker_pool_sort_key(right)))
+            .then_with(|| {
+                right
+                    .evaluation
+                    .available_slots
+                    .cmp(&left.evaluation.available_slots)
+            })
+            .then_with(|| {
+                left.evaluation
+                    .active_runs
+                    .cmp(&right.evaluation.active_runs)
+            })
+            .then_with(|| left.worker_name.cmp(&right.worker_name))
+    });
 }
 
 fn count_worker_runs_in_state(
@@ -5924,14 +8186,28 @@ fn select_worker_for_job_run(
         .worker
         .as_ref()
         .ok_or_else(|| anyhow!("job '{}' has no worker request", manifest.metadata.name))?;
-    let worker_namespace = worker_request_namespace(request, manifest.namespace_key());
+    let mut worker_namespace = worker_request_namespace(request, manifest.namespace_key());
     let named_worker = request
         .name
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let selector = request.selector.as_ref();
+    let service_name = request
+        .service_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let intent = request
+        .intent
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(Some("task_offload"));
     let mut candidates = Vec::new();
+    let mut service_policy: Option<ServiceSpec> = None;
+    let mut matched_class: Option<String> = None;
+    let mut fallback_class = false;
 
     if let Some(name) = named_worker {
         if let Ok(ResourceManifest::Worker(worker)) =
@@ -5942,10 +8218,27 @@ fn select_worker_for_job_run(
             return Ok(WorkerSelection {
                 name: Some(name.to_string()),
                 namespace: Some(worker_namespace),
-                available_slots: 0,
+                service_name: service_name.map(ToOwned::to_owned),
+                intent: intent.map(ToOwned::to_owned),
+                selected_class: matched_class.clone(),
+                fallback_class,
+                locality: None,
+                admission_code: WorkerAdmissionCode::WaitingForNamedWorker,
                 reason: format!("waiting for named worker '{}'", name),
             });
         }
+    } else if let Some(service_name) = service_name {
+        let service_namespace = service_selection_namespace(request, manifest.namespace_key());
+        let (service, service_workers) = resolve_worker_candidates_for_service(
+            service_name,
+            Some(&service_namespace),
+            manifest.namespace_key(),
+            &manifest.metadata.labels,
+            intent,
+        )?;
+        worker_namespace = service_namespace;
+        service_policy = Some(service.spec);
+        candidates = service_workers;
     } else {
         for manifest in load_manifests_by_kind(ResourceKind::Worker, Some(&worker_namespace))? {
             let ResourceManifest::Worker(worker) = manifest else {
@@ -5958,120 +8251,319 @@ fn select_worker_for_job_run(
     if let Some(selector) = selector {
         candidates.retain(|worker| worker_labels_match_selector(&worker.metadata.labels, selector));
     }
-    if !request.required_capabilities.is_empty() {
-        candidates.retain(|worker| {
-            worker_supports_required_capabilities(worker, &request.required_capabilities)
-        });
+    let required_capabilities = merged_required_capabilities(
+        &request.required_capabilities,
+        service_policy
+            .as_ref()
+            .map(|service| service.required_capabilities.as_slice()),
+    );
+    if !required_capabilities.is_empty() {
+        candidates
+            .retain(|worker| worker_supports_required_capabilities(worker, &required_capabilities));
     }
+
+    let (effective_class_name, fallback_class_names) =
+        effective_class_policy(request, service_policy.as_ref());
+    let preferred_providers = merged_preferred_providers(
+        &request.preferred_providers,
+        service_policy
+            .as_ref()
+            .map(|service| service.preferred_providers.as_slice()),
+    );
+
+    if let Some(class_name) = effective_class_name.as_deref() {
+        let primary = candidates
+            .iter()
+            .filter(|worker| worker_matches_class(worker, class_name))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !primary.is_empty() {
+            matched_class = Some(class_name.to_string());
+            candidates = primary;
+        } else {
+            let mut fallback_candidates = None;
+            for fallback_name in &fallback_class_names {
+                let matches = candidates
+                    .iter()
+                    .filter(|worker| worker_matches_class(worker, fallback_name))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !matches.is_empty() {
+                    matched_class = Some(fallback_name.to_string());
+                    fallback_class = true;
+                    fallback_candidates = Some(matches);
+                    break;
+                }
+            }
+            if let Some(matches) = fallback_candidates {
+                candidates = matches;
+            } else {
+                let reason_prefix =
+                    worker_selection_reason_prefix(service_name, Some(class_name), false);
+                return Ok(WorkerSelection {
+                    name: None,
+                    namespace: Some(worker_namespace),
+                    service_name: service_name.map(ToOwned::to_owned),
+                    intent: intent.map(ToOwned::to_owned),
+                    selected_class: Some(class_name.to_string()),
+                    fallback_class: false,
+                    locality: None,
+                    admission_code: WorkerAdmissionCode::NoMatchingWorker,
+                    reason: waiting_reason(
+                        reason_prefix.as_deref(),
+                        &format!("waiting for a worker in class '{}'", class_name),
+                    ),
+                });
+            }
+        }
+    } else {
+        for fallback_name in &fallback_class_names {
+            let matches = candidates
+                .iter()
+                .filter(|worker| worker_matches_class(worker, fallback_name))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !matches.is_empty() {
+                matched_class = Some(fallback_name.to_string());
+                fallback_class = true;
+                candidates = matches;
+                break;
+            }
+        }
+    }
+
+    let reason_prefix =
+        worker_selection_reason_prefix(service_name, matched_class.as_deref(), fallback_class);
 
     if candidates.is_empty() {
         return Ok(WorkerSelection {
             name: named_worker.map(ToOwned::to_owned),
             namespace: Some(worker_namespace),
-            available_slots: 0,
-            reason: "waiting for a matching worker".to_string(),
+            service_name: service_name.map(ToOwned::to_owned),
+            intent: intent.map(ToOwned::to_owned),
+            selected_class: matched_class.clone(),
+            fallback_class,
+            locality: None,
+            admission_code: WorkerAdmissionCode::NoMatchingWorker,
+            reason: waiting_reason(reason_prefix.as_deref(), "waiting for a matching worker"),
         });
     }
 
+    let machine_capacity = machine_capacity_snapshot();
     let current_job = Some((
         manifest.namespace_key(),
         manifest.metadata.name.as_str(),
         state,
     ));
+    let pool_loads = worker_pool_loads(&worker_namespace, current_job)?;
     let mut scored = Vec::new();
     for worker in candidates {
-        let locality = effective_worker_locality(&worker);
-        let (active_runs, _pending_runs) =
-            worker_run_counts(&worker_namespace, &worker.metadata.name, current_job)?;
-        let max_concurrent = effective_worker_max_concurrent(&worker);
-        let available_slots = max_concurrent.saturating_sub(active_runs);
-        scored.push((
-            request.prefer_local && locality == WorkerLocality::Local,
-            available_slots,
-            active_runs,
-            max_concurrent,
-            worker.metadata.name.clone(),
-            worker_namespace.clone(),
-            locality,
-        ));
+        let evaluation =
+            evaluate_worker_admission(&worker, &worker_namespace, current_job, &machine_capacity)?;
+        let worker_pool = worker
+            .spec
+            .pool
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let pool_load = worker_pool
+            .as_ref()
+            .and_then(|pool| pool_loads.get(pool))
+            .cloned()
+            .unwrap_or_default();
+        scored.push(WorkerCandidate {
+            worker_name: worker.metadata.name.clone(),
+            worker_namespace: worker_namespace.clone(),
+            worker_provider: worker.spec.provider,
+            worker_pool,
+            pool_active_runs: pool_load.active_runs,
+            pool_pending_runs: pool_load.pending_runs,
+            pool_capacity: pool_load.capacity,
+            evaluation,
+        });
     }
-    scored.sort_by(|left, right| {
-        right
-            .0
-            .cmp(&left.0)
-            .then_with(|| right.1.cmp(&left.1))
-            .then_with(|| left.2.cmp(&right.2))
-            .then_with(|| left.4.cmp(&right.4))
-    });
-    let (
-        preferred_local,
-        available_slots,
-        active_runs,
-        max_concurrent,
-        worker_name,
-        worker_namespace,
-        locality,
-    ) = scored
+    let mut any_ready = scored
+        .iter()
+        .filter(|candidate| candidate.evaluation.admission_code == WorkerAdmissionCode::Ready)
+        .cloned()
+        .collect::<Vec<_>>();
+    sort_worker_candidates(&mut any_ready, &preferred_providers);
+
+    let prefer_local = request.prefer_local
+        || service_policy
+            .as_ref()
+            .map(|service| service.prefer_local)
+            .unwrap_or(false);
+
+    if prefer_local {
+        let mut local_ready = scored
+            .iter()
+            .filter(|candidate| {
+                candidate.evaluation.locality == WorkerLocality::Local
+                    && candidate.evaluation.admission_code == WorkerAdmissionCode::Ready
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        sort_worker_candidates(&mut local_ready, &preferred_providers);
+        if let Some(candidate) = local_ready.into_iter().next() {
+            return Ok(WorkerSelection {
+                name: Some(candidate.worker_name),
+                namespace: Some(candidate.worker_namespace),
+                service_name: service_name.map(ToOwned::to_owned),
+                intent: intent.map(ToOwned::to_owned),
+                selected_class: matched_class.clone(),
+                fallback_class,
+                locality: Some(candidate.evaluation.locality),
+                admission_code: WorkerAdmissionCode::Ready,
+                reason: selection_reason(reason_prefix.as_deref(), &candidate.evaluation.reason),
+            });
+        }
+
+        let local_blocked = scored
+            .iter()
+            .filter(|candidate| candidate.evaluation.locality == WorkerLocality::Local)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(mut candidate) = any_ready.into_iter().next() {
+            if !local_blocked.is_empty() && candidate.evaluation.locality != WorkerLocality::Local {
+                let mut blocked = local_blocked;
+                sort_worker_candidates(&mut blocked, &preferred_providers);
+                let fallback_detail = blocked
+                    .first()
+                    .map(|blocked| blocked.evaluation.reason.clone())
+                    .unwrap_or_else(|| "preferred local workers are unavailable".to_string());
+                candidate.evaluation.reason = format!(
+                    "admitted on {} worker '{}' because preferred local workers are not admissible: {}",
+                    worker_locality_name(&candidate.evaluation.locality),
+                    candidate.worker_name,
+                    fallback_detail
+                );
+                return Ok(WorkerSelection {
+                    name: Some(candidate.worker_name),
+                    namespace: Some(candidate.worker_namespace),
+                    service_name: service_name.map(ToOwned::to_owned),
+                    intent: intent.map(ToOwned::to_owned),
+                    selected_class: matched_class.clone(),
+                    fallback_class,
+                    locality: Some(candidate.evaluation.locality),
+                    admission_code: WorkerAdmissionCode::RemoteFallback,
+                    reason: selection_reason(
+                        reason_prefix.as_deref(),
+                        &candidate.evaluation.reason,
+                    ),
+                });
+            }
+            return Ok(WorkerSelection {
+                name: Some(candidate.worker_name),
+                namespace: Some(candidate.worker_namespace),
+                service_name: service_name.map(ToOwned::to_owned),
+                intent: intent.map(ToOwned::to_owned),
+                selected_class: matched_class.clone(),
+                fallback_class,
+                locality: Some(candidate.evaluation.locality),
+                admission_code: WorkerAdmissionCode::Ready,
+                reason: selection_reason(reason_prefix.as_deref(), &candidate.evaluation.reason),
+            });
+        }
+
+        let mut blocked = local_blocked;
+        if blocked.is_empty() {
+            blocked = scored;
+        }
+        sort_worker_candidates(&mut blocked, &preferred_providers);
+        let candidate = blocked
+            .into_iter()
+            .next()
+            .expect("at least one worker candidate exists");
+        return Ok(WorkerSelection {
+            name: Some(candidate.worker_name),
+            namespace: Some(candidate.worker_namespace),
+            service_name: service_name.map(ToOwned::to_owned),
+            intent: intent.map(ToOwned::to_owned),
+            selected_class: matched_class.clone(),
+            fallback_class,
+            locality: Some(candidate.evaluation.locality),
+            admission_code: candidate.evaluation.admission_code,
+            reason: selection_reason(reason_prefix.as_deref(), &candidate.evaluation.reason),
+        });
+    }
+
+    if let Some(candidate) = any_ready.into_iter().next() {
+        return Ok(WorkerSelection {
+            name: Some(candidate.worker_name),
+            namespace: Some(candidate.worker_namespace),
+            service_name: service_name.map(ToOwned::to_owned),
+            intent: intent.map(ToOwned::to_owned),
+            selected_class: matched_class.clone(),
+            fallback_class,
+            locality: Some(candidate.evaluation.locality),
+            admission_code: WorkerAdmissionCode::Ready,
+            reason: selection_reason(reason_prefix.as_deref(), &candidate.evaluation.reason),
+        });
+    }
+
+    sort_worker_candidates(&mut scored, &preferred_providers);
+    let candidate = scored
         .into_iter()
         .next()
         .expect("at least one worker candidate exists");
-    let reason = if available_slots > 0 {
-        format!(
-            "admitted on {} worker '{}' with {} slot(s) remaining",
-            worker_locality_name(&locality),
-            worker_name,
-            available_slots.saturating_sub(1)
-        )
-    } else {
-        format!(
-            "waiting for capacity on {} worker '{}' (active {}, max {})",
-            if preferred_local {
-                "preferred local"
-            } else {
-                worker_locality_name(&locality)
-            },
-            worker_name,
-            active_runs,
-            max_concurrent
-        )
-    };
     Ok(WorkerSelection {
-        name: Some(worker_name),
-        namespace: Some(worker_namespace),
-        available_slots,
-        reason,
+        name: Some(candidate.worker_name),
+        namespace: Some(candidate.worker_namespace),
+        service_name: service_name.map(ToOwned::to_owned),
+        intent: intent.map(ToOwned::to_owned),
+        selected_class: matched_class,
+        fallback_class,
+        locality: Some(candidate.evaluation.locality),
+        admission_code: candidate.evaluation.admission_code,
+        reason: selection_reason(reason_prefix.as_deref(), &candidate.evaluation.reason),
     })
 }
 
 fn worker_status(manifest: &ResourceEnvelope<WorkerSpec>) -> anyhow::Result<WorkerStatus> {
+    let machine_capacity = machine_capacity_snapshot();
+    let evaluation =
+        evaluate_worker_admission(manifest, manifest.namespace_key(), None, &machine_capacity)?;
     let loaded = match manifest.spec.provider {
-        WorkerProvider::Ollama => ollama_model_loaded(&manifest.spec.model)?,
+        WorkerProvider::Ollama if evaluation.locality == WorkerLocality::Local => {
+            ollama_model_loaded(&manifest.spec.model)?
+        }
+        WorkerProvider::Ollama | WorkerProvider::Nvidia | WorkerProvider::Moonshot => false,
     };
-    let locality = effective_worker_locality(manifest);
-    let max_concurrent = effective_worker_max_concurrent(manifest);
-    let (active_runs, pending_runs) =
-        worker_run_counts(manifest.namespace_key(), &manifest.metadata.name, None)?;
-    let available_slots = max_concurrent.saturating_sub(active_runs);
     Ok(WorkerStatus {
-        provider: "ollama".to_string(),
+        provider: worker_provider_name(manifest.spec.provider).to_string(),
         model: manifest.spec.model.clone(),
         endpoint: worker_endpoint(manifest),
-        locality: worker_locality_name(&locality).to_string(),
+        locality: worker_locality_name(&evaluation.locality).to_string(),
         role: manifest.spec.role.clone(),
         capabilities: manifest.spec.capabilities.clone(),
+        classes: manifest.spec.classes.clone(),
+        pool: manifest.spec.pool.clone(),
         output_mode: match effective_worker_output_mode(manifest) {
             WorkerOutputMode::Text => "text".to_string(),
             WorkerOutputMode::Json => "json".to_string(),
         },
-        max_concurrent,
-        active_runs,
-        pending_runs,
-        available_slots,
-        admission: if available_slots > 0 {
-            "ready".to_string()
+        max_concurrent: evaluation.max_concurrent,
+        active_runs: evaluation.active_runs,
+        pending_runs: evaluation.pending_runs,
+        available_slots: evaluation.available_slots,
+        admission: worker_admission_summary(evaluation.admission_code).to_string(),
+        admission_code: worker_admission_code_name(evaluation.admission_code).to_string(),
+        admission_reason: if evaluation.admission_code == WorkerAdmissionCode::Ready {
+            format!(
+                "{} worker '{}' is ready with {} slot(s) available",
+                worker_locality_name(&evaluation.locality),
+                manifest.metadata.name,
+                evaluation.available_slots
+            )
         } else {
-            "saturated".to_string()
+            evaluation.reason
         },
+        estimated_memory_mib: evaluation.estimated_memory_mib,
+        estimated_gpu_memory_mib: evaluation.estimated_gpu_memory_mib,
+        machine_memory_available_mib: evaluation.machine_memory_available_mib,
+        machine_gpu_memory_available_mib: evaluation.machine_gpu_memory_available_mib,
         loaded,
     })
 }
@@ -6092,6 +8584,8 @@ pub fn invoke_worker(
     };
     match worker.spec.provider {
         WorkerProvider::Ollama => invoke_ollama_worker(&worker, prompt),
+        WorkerProvider::Nvidia => invoke_openai_compatible_worker(&worker, prompt),
+        WorkerProvider::Moonshot => invoke_openai_compatible_worker(&worker, prompt),
     }
 }
 
@@ -6157,6 +8651,106 @@ fn invoke_ollama_worker(
     })
 }
 
+fn invoke_openai_compatible_worker(
+    manifest: &ResourceEnvelope<WorkerSpec>,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    let provider_name = worker_provider_name(manifest.spec.provider);
+    let key_env = worker_api_key_env_name(manifest).unwrap_or("API_KEY");
+    let api_key = env::var(key_env).with_context(|| {
+        format!(
+            "{} worker '{}' requires env '{}' to be set",
+            provider_name, manifest.metadata.name, key_env
+        )
+    })?;
+    ensure!(
+        !api_key.trim().is_empty(),
+        "{} worker '{}' requires env '{}' to be non-empty",
+        provider_name,
+        manifest.metadata.name,
+        key_env
+    );
+
+    let mut system_parts = Vec::new();
+    if let Some(system_prompt) = manifest
+        .spec
+        .system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        system_parts.push(system_prompt.to_string());
+    }
+    if matches!(
+        effective_worker_output_mode(manifest),
+        WorkerOutputMode::Json
+    ) {
+        system_parts.push(
+            "Return only valid JSON with no markdown fences, no commentary, and no surrounding prose."
+                .to_string(),
+        );
+    }
+
+    let mut messages = Vec::new();
+    if !system_parts.is_empty() {
+        messages.push(json!({
+            "role": "system",
+            "content": system_parts.join("\n\n"),
+        }));
+    }
+    messages.push(json!({
+        "role": "user",
+        "content": prompt.trim(),
+    }));
+
+    let mut payload = serde_json::Map::from_iter([
+        ("model".to_string(), json!(manifest.spec.model)),
+        ("messages".to_string(), serde_json::Value::Array(messages)),
+        ("stream".to_string(), json!(false)),
+    ]);
+    if let Some(temperature) = manifest.spec.temperature {
+        payload.insert("temperature".to_string(), json!(temperature));
+    }
+    if let Some(top_p) = manifest.spec.top_p {
+        payload.insert("top_p".to_string(), json!(top_p));
+    }
+    if let Some(frequency_penalty) = manifest.spec.frequency_penalty {
+        payload.insert("frequency_penalty".to_string(), json!(frequency_penalty));
+    }
+    if let Some(presence_penalty) = manifest.spec.presence_penalty {
+        payload.insert("presence_penalty".to_string(), json!(presence_penalty));
+    }
+    if let Some(num_predict) = manifest.spec.num_predict {
+        payload.insert("max_tokens".to_string(), json!(num_predict));
+    }
+
+    let url = openai_compatible_worker_request_url(manifest);
+    let mut response = ureq::post(&url)
+        .header("Authorization", &format!("Bearer {}", api_key.trim()))
+        .header("Accept", "application/json")
+        .content_type("application/json")
+        .send_json(serde_json::Value::Object(payload))
+        .with_context(|| {
+            format!(
+                "failed to reach {} worker endpoint '{}'",
+                provider_name, url
+            )
+        })?;
+    let body: serde_json::Value = response
+        .body_mut()
+        .read_json()
+        .with_context(|| format!("failed to decode {} worker response", provider_name))?;
+    let text = openai_compatible_response_text(&body)?.trim().to_string();
+    Ok(match effective_worker_output_mode(manifest) {
+        WorkerOutputMode::Text => text,
+        WorkerOutputMode::Json => serde_json::to_string_pretty(
+            &serde_json::from_str::<serde_json::Value>(&text)
+                .context("worker declared json output but returned invalid JSON")?,
+        )
+        .context("failed to pretty-print worker JSON output")?,
+    })
+}
+
 fn ollama_model_loaded(model: &str) -> anyhow::Result<bool> {
     let output = ProcessCommand::new("ollama")
         .arg("ps")
@@ -6178,11 +8772,73 @@ fn worker_endpoint(manifest: &ResourceEnvelope<WorkerSpec>) -> String {
         .spec
         .endpoint
         .clone()
-        .unwrap_or_else(default_ollama_endpoint)
+        .unwrap_or_else(|| default_worker_endpoint(manifest.spec.provider))
+}
+
+fn default_worker_endpoint(provider: WorkerProvider) -> String {
+    match provider {
+        WorkerProvider::Ollama => default_ollama_endpoint(),
+        WorkerProvider::Nvidia => default_nvidia_endpoint(),
+        WorkerProvider::Moonshot => default_moonshot_endpoint(),
+    }
 }
 
 fn default_ollama_endpoint() -> String {
     "http://127.0.0.1:11434".to_string()
+}
+
+fn default_nvidia_endpoint() -> String {
+    "https://integrate.api.nvidia.com/v1/chat/completions".to_string()
+}
+
+fn default_moonshot_endpoint() -> String {
+    "https://api.moonshot.cn/v1/chat/completions".to_string()
+}
+
+fn openai_compatible_worker_request_url(manifest: &ResourceEnvelope<WorkerSpec>) -> String {
+    let endpoint = worker_endpoint(manifest);
+    if endpoint.ends_with("/chat/completions") {
+        endpoint
+    } else {
+        format!("{}/chat/completions", endpoint.trim_end_matches('/'))
+    }
+}
+
+fn openai_compatible_response_text(body: &serde_json::Value) -> anyhow::Result<String> {
+    let content = body
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .ok_or_else(|| {
+            anyhow!("OpenAI-compatible worker response was missing choices[0].message.content")
+        })?;
+    match content {
+        serde_json::Value::String(text) => Ok(text.clone()),
+        serde_json::Value::Array(parts) => {
+            let combined = parts
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .or_else(|| {
+                            part.get("content")
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToOwned::to_owned)
+                        })
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            ensure!(
+                !combined.trim().is_empty(),
+                "OpenAI-compatible worker response returned an empty message content array"
+            );
+            Ok(combined)
+        }
+        _ => bail!("OpenAI-compatible worker response returned unsupported message content"),
+    }
 }
 
 fn effective_worker_output_mode(manifest: &ResourceEnvelope<WorkerSpec>) -> WorkerOutputMode {
@@ -6211,16 +8867,19 @@ fn describe_status(manifest: &ResourceManifest) -> anyhow::Result<serde_json::Va
         ResourceManifest::NetworkPolicy(network_policy) => Ok(serde_json::to_value(
             network_policy_status(network_policy)?,
         )?),
-        ResourceManifest::ConfigMap(config_map) => Ok(json!({
-            "entries": config_map.spec.data.len(),
-            "keys": config_map.spec.data.keys().cloned().collect::<Vec<_>>(),
-        })),
-        ResourceManifest::Secret(secret) => Ok(json!({
-            "keys": secret.spec.string_data.keys().cloned().collect::<Vec<_>>(),
-        })),
-        ResourceManifest::Volume(volume) => Ok(json!({
-            "paths": volume.spec.paths,
-        })),
+        ResourceManifest::ConfigMap(config_map) => Ok(serde_json::to_value(ConfigMapStatus {
+            entries: config_map.spec.data.len(),
+            keys: config_map.spec.data.keys().cloned().collect::<Vec<_>>(),
+            access_policy: resource_access_policy_status(&config_map.spec.access_policy),
+        })?),
+        ResourceManifest::Secret(secret) => Ok(serde_json::to_value(SecretStatus {
+            keys: secret.spec.string_data.keys().cloned().collect::<Vec<_>>(),
+            access_policy: resource_access_policy_status(&secret.spec.access_policy),
+        })?),
+        ResourceManifest::Volume(volume) => Ok(serde_json::to_value(VolumeStatus {
+            paths: volume.spec.paths.clone(),
+            access_policy: resource_access_policy_status(&volume.spec.access_policy),
+        })?),
         ResourceManifest::Worker(worker) => Ok(serde_json::to_value(worker_status(worker)?)?),
     }
 }
@@ -6229,6 +8888,9 @@ fn service_matches_session(
     manifest: &ResourceEnvelope<ServiceSpec>,
     session: &NativeSessionMetadata,
 ) -> bool {
+    if effective_service_target_kind(&manifest.spec) != ServiceTargetKind::Runtime {
+        return false;
+    }
     if !session.agents.iter().any(|agent| agent.running) {
         return false;
     }
@@ -6243,6 +8905,131 @@ fn service_matches_session(
         .selector
         .iter()
         .all(|(key, value)| context.labels.get(key) == Some(value))
+}
+
+fn effective_service_target_kind(spec: &ServiceSpec) -> ServiceTargetKind {
+    spec.target_kind.clone().unwrap_or_default()
+}
+
+fn service_allows_intent(spec: &ServiceSpec, intent: Option<&str>) -> bool {
+    if spec.allowed_intents.is_empty() {
+        return true;
+    }
+    intent
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| spec.allowed_intents.iter().any(|allowed| allowed == value))
+        .unwrap_or(false)
+}
+
+fn service_allows_source_workload(
+    spec: &ServiceSpec,
+    control_namespace: &str,
+    workload_labels: &BTreeMap<String, String>,
+) -> bool {
+    access_policy_allows_workload(&spec.access_policy, control_namespace, workload_labels)
+}
+
+fn worker_matches_service(
+    manifest: &ResourceEnvelope<ServiceSpec>,
+    worker: &ResourceEnvelope<WorkerSpec>,
+) -> bool {
+    if effective_service_target_kind(&manifest.spec) != ServiceTargetKind::Worker {
+        return false;
+    }
+    if worker.namespace_key() != manifest.namespace_key() {
+        return false;
+    }
+    if !manifest
+        .spec
+        .selector
+        .iter()
+        .all(|(key, value)| worker.metadata.labels.get(key) == Some(value))
+    {
+        return false;
+    }
+    if !manifest.spec.required_capabilities.is_empty()
+        && !worker_supports_required_capabilities(worker, &manifest.spec.required_capabilities)
+    {
+        return false;
+    }
+    let mut accepted_classes = Vec::new();
+    if let Some(class_name) = manifest
+        .spec
+        .class_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        accepted_classes.push(class_name.to_string());
+    }
+    accepted_classes.extend(trimmed_vec(&manifest.spec.fallback_class_names));
+    if !accepted_classes.is_empty() && !worker_matches_any_class(worker, &accepted_classes) {
+        return false;
+    }
+    true
+}
+
+fn worker_provider_labels(preferred_providers: &[WorkerProvider]) -> Vec<String> {
+    preferred_providers
+        .iter()
+        .map(|provider| worker_provider_name(*provider).to_string())
+        .collect()
+}
+
+fn worker_matches_service_class_policy(
+    worker: &ResourceEnvelope<WorkerSpec>,
+    primary_class: Option<&str>,
+    fallback_classes: &[String],
+) -> bool {
+    if let Some(primary_class) = primary_class
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if worker_matches_class(worker, primary_class)
+            || worker_matches_any_class(worker, fallback_classes)
+        {
+            return true;
+        }
+        return false;
+    }
+    if fallback_classes.is_empty() {
+        return true;
+    }
+    worker_matches_any_class(worker, fallback_classes)
+}
+
+fn worker_matches_service_runtime_policy(
+    service: &ResourceEnvelope<ServiceSpec>,
+    worker: &ResourceEnvelope<WorkerSpec>,
+) -> bool {
+    if !worker_matches_service(service, worker) {
+        return false;
+    }
+    if !worker_matches_service_class_policy(
+        worker,
+        service.spec.class_name.as_deref(),
+        &service.spec.fallback_class_names,
+    ) {
+        return false;
+    }
+    true
+}
+
+fn load_workers_for_service(
+    manifest: &ResourceEnvelope<ServiceSpec>,
+    namespace: &str,
+) -> anyhow::Result<Vec<ResourceEnvelope<WorkerSpec>>> {
+    let mut workers = Vec::new();
+    for resource in load_manifests_by_kind(ResourceKind::Worker, Some(namespace))? {
+        let ResourceManifest::Worker(worker) = resource else {
+            continue;
+        };
+        if worker_matches_service_runtime_policy(manifest, &worker) {
+            workers.push(worker);
+        }
+    }
+    Ok(workers)
 }
 
 fn ensure_message_flow_allowed(
@@ -6691,7 +9478,7 @@ fn save_service_route_state(
     }
     let raw =
         serde_json::to_string_pretty(state).context("failed to encode service route state")?;
-    fs::write(&path, raw).with_context(|| format!("failed to write '{}'", path.display()))
+    atomic_write_string(&path, &raw)
 }
 
 impl ResourceKind {
@@ -6870,6 +9657,9 @@ fn now_epoch_ms() -> u128 {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc::Receiver;
     use std::sync::{Mutex, OnceLock};
 
     fn home_env_lock() -> &'static Mutex<()> {
@@ -6911,11 +9701,101 @@ mod tests {
         }
     }
 
+    struct TempEnvVarGuard {
+        key: &'static str,
+        original_value: Option<OsString>,
+    }
+
+    impl TempEnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original_value = env::var_os(key);
+            unsafe {
+                env::set_var(key, value);
+            }
+            Self {
+                key,
+                original_value,
+            }
+        }
+    }
+
+    impl Drop for TempEnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original_value {
+                Some(value) => unsafe {
+                    env::set_var(self.key, value);
+                },
+                None => unsafe {
+                    env::remove_var(self.key);
+                },
+            }
+        }
+    }
+
     fn write_text_file(path: &Path, contents: &str) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, contents).unwrap();
+    }
+
+    fn spawn_json_response_server(
+        response_body: serde_json::Value,
+    ) -> (String, Receiver<String>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut received = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let mut header_end = None;
+            let mut content_length = 0_usize;
+
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                if read == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buffer[..read]);
+                if header_end.is_none() {
+                    header_end = received
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|index| index + 4);
+                    if let Some(end) = header_end {
+                        let headers = String::from_utf8_lossy(&received[..end]);
+                        content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                (name.eq_ignore_ascii_case("content-length"))
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                    }
+                }
+                if let Some(end) = header_end {
+                    if received.len() >= end + content_length {
+                        break;
+                    }
+                }
+            }
+
+            tx.send(String::from_utf8_lossy(&received).into_owned())
+                .unwrap();
+
+            let body = serde_json::to_string(&response_body).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+        (address, rx, handle)
     }
 
     #[test]
@@ -7065,6 +9945,24 @@ spec:
 
     #[test]
     fn job_status_includes_structured_worker_run_details() {
+        save_manifest(&ResourceManifest::Worker(ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Worker".to_string(),
+            metadata: ResourceMetadata {
+                name: "qwen-junior".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: WorkerSpec {
+                provider: WorkerProvider::Ollama,
+                model: "qwen3:8b".to_string(),
+                locality: Some(WorkerLocality::Local),
+                ..WorkerSpec::default()
+            },
+        }))
+        .unwrap();
+
         let manifest = ResourceEnvelope {
             api_version: API_VERSION.to_string(),
             kind: "Job".to_string(),
@@ -7093,7 +9991,13 @@ spec:
                 backend: JobRunBackend::Worker,
                 worker_name: Some("qwen-junior".to_string()),
                 worker_namespace: Some("workers-lab".to_string()),
+                service_name: Some("junior-svc".to_string()),
+                intent: Some("task_offload".to_string()),
+                selected_class: Some("junior-code".to_string()),
+                fallback_class: true,
+                worker_locality: Some(WorkerLocality::Local),
                 admission_state: Some(JobRunAdmissionState::Granted),
+                admission_code: Some(WorkerAdmissionCode::Ready),
                 admission_reason: Some("admitted on local worker 'qwen-junior'".to_string()),
                 last_active_epoch_ms: Some(1_000),
                 completed_at_epoch_ms: Some(2_000),
@@ -7110,9 +10014,868 @@ spec:
         assert_eq!(status.run_details[0].backend, "worker");
         assert_eq!(status.run_details[0].worker.as_deref(), Some("qwen-junior"));
         assert_eq!(
+            status.run_details[0].worker_provider.as_deref(),
+            Some("ollama")
+        );
+        assert_eq!(
+            status.run_details[0].worker_model.as_deref(),
+            Some("qwen3:8b")
+        );
+        assert_eq!(
+            status.run_details[0].service_name.as_deref(),
+            Some("junior-svc")
+        );
+        assert_eq!(
+            status.run_details[0].intent.as_deref(),
+            Some("task_offload")
+        );
+        assert_eq!(
+            status.run_details[0].selected_class.as_deref(),
+            Some("junior-code")
+        );
+        assert!(status.run_details[0].fallback_class);
+        assert_eq!(
+            status.run_details[0].worker_locality.as_deref(),
+            Some("local")
+        );
+        assert_eq!(
+            status.run_details[0].admission_code.as_deref(),
+            Some("ready")
+        );
+        assert!(!status.run_details[0].events.is_empty());
+        assert_eq!(status.conditions.len(), 3);
+        assert!(!status.events.is_empty());
+        assert_eq!(
             status.run_details[0].artifact_path.as_deref(),
             Some("/tmp/worker-job-artifact.out")
         );
+    }
+
+    #[test]
+    fn cron_job_status_includes_history_conditions_and_events() {
+        let _lock = home_env_lock().lock().unwrap();
+        let _home = TempHomeGuard::new("jarvisctl-cronjob-status-history");
+
+        let manifest = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "CronJob".to_string(),
+            metadata: ResourceMetadata {
+                name: "hourly-worker".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: CronJobSpec {
+                schedule: "* * * * *".to_string(),
+                job_template: JobTemplateSpec {
+                    spec: JobSpec {
+                        worker: Some(WorkerJobSpec {
+                            name: Some("qwen-junior".to_string()),
+                            prompt: "Return strict JSON only.".to_string(),
+                            ..WorkerJobSpec::default()
+                        }),
+                        ..JobSpec::default()
+                    },
+                },
+                ..CronJobSpec::default()
+            },
+        };
+        let child_job_name = "hourly-worker-1700000000".to_string();
+        let child_job = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Job".to_string(),
+            metadata: ResourceMetadata {
+                name: child_job_name.clone(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::from([(
+                    "jarvisctl.io/cronjob".to_string(),
+                    "hourly-worker".to_string(),
+                )]),
+                annotations: BTreeMap::new(),
+            },
+            spec: JobSpec {
+                worker: Some(WorkerJobSpec {
+                    name: Some("qwen-junior".to_string()),
+                    prompt: "Return strict JSON only.".to_string(),
+                    ..WorkerJobSpec::default()
+                }),
+                ..JobSpec::default()
+            },
+        };
+        save_manifest(&ResourceManifest::Job(child_job)).unwrap();
+        save_job_controller_state(
+            "workers-lab",
+            &child_job_name,
+            &JobControllerState {
+                runs: vec![JobRunState {
+                    name: "run-0".to_string(),
+                    runtime_namespace: "workers-lab--hourly-worker--j0".to_string(),
+                    created_at_epoch_ms: 1_700_000_000_000,
+                    backend: JobRunBackend::Worker,
+                    worker_name: Some("qwen-junior".to_string()),
+                    worker_namespace: Some("workers-lab".to_string()),
+                    service_name: None,
+                    intent: None,
+                    selected_class: None,
+                    fallback_class: false,
+                    worker_locality: None,
+                    admission_state: Some(JobRunAdmissionState::Granted),
+                    admission_code: Some(WorkerAdmissionCode::Ready),
+                    admission_reason: Some("admitted on local worker 'qwen-junior'".to_string()),
+                    last_active_epoch_ms: Some(1_700_000_000_100),
+                    completed_at_epoch_ms: Some(1_700_000_000_200),
+                    artifact_path: Some("/tmp/hourly-worker.out".to_string()),
+                    output_path: None,
+                    last_error: None,
+                    status: JobRunPhase::Succeeded,
+                }],
+            },
+        )
+        .unwrap();
+        save_cron_job_controller_state(
+            "workers-lab",
+            "hourly-worker",
+            &CronJobControllerState {
+                last_schedule_epoch_ms: Some(1_700_000_000_000),
+                jobs: vec![child_job_name],
+            },
+        )
+        .unwrap();
+
+        let status = cron_job_status(&manifest).unwrap();
+        assert_eq!(status.successful_jobs, 1);
+        assert_eq!(status.failed_jobs, 0);
+        assert_eq!(status.history.len(), 1);
+        assert_eq!(status.history[0].phase, "succeeded");
+        assert!(status.history[0].worker_backed);
+        assert_eq!(status.history[0].workers, vec!["qwen-junior".to_string()]);
+        assert_eq!(status.conditions.len(), 3);
+        assert!(!status.events.is_empty());
+    }
+
+    #[test]
+    fn worker_status_reports_memory_pressure_for_local_worker() {
+        let _lock = home_env_lock().lock().unwrap();
+        let _home = TempHomeGuard::new("jarvisctl-worker-status-memory");
+        let _memory = TempEnvVarGuard::set("JARVISCTL_TEST_AVAILABLE_MEMORY_MIB", "512");
+
+        let manifest = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Worker".to_string(),
+            metadata: ResourceMetadata {
+                name: "qwen-junior".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: WorkerSpec {
+                model: "qwen3:8b".to_string(),
+                locality: Some(WorkerLocality::Local),
+                memory_mib: Some(1024),
+                ..WorkerSpec::default()
+            },
+        };
+
+        let evaluation =
+            evaluate_worker_admission(&manifest, "workers-lab", None, &machine_capacity_snapshot())
+                .unwrap();
+
+        assert_eq!(
+            evaluation.admission_code,
+            WorkerAdmissionCode::MemoryPressure
+        );
+        assert_eq!(evaluation.machine_memory_available_mib, Some(512));
+        assert_eq!(evaluation.estimated_memory_mib, Some(1024));
+    }
+
+    #[test]
+    fn worker_status_reports_missing_credentials_for_nvidia_worker() {
+        let _lock = home_env_lock().lock().unwrap();
+        let _home = TempHomeGuard::new("jarvisctl-worker-status-nvidia-creds");
+        let _api_key = TempEnvVarGuard::set("NVIDIA_API_KEY", "");
+
+        let manifest = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Worker".to_string(),
+            metadata: ResourceMetadata {
+                name: "nemotron-mini".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: WorkerSpec {
+                provider: WorkerProvider::Nvidia,
+                model: "nvidia/nemotron-mini-4b-instruct".to_string(),
+                ..WorkerSpec::default()
+            },
+        };
+
+        let status = worker_status(&manifest).unwrap();
+        assert_eq!(status.provider, "nvidia");
+        assert_eq!(status.admission, "credentials-missing");
+        assert_eq!(status.admission_code, "credentials_missing");
+        assert!(status.admission_reason.contains("NVIDIA_API_KEY"));
+    }
+
+    #[test]
+    fn worker_status_reports_missing_credentials_for_moonshot_worker() {
+        let _lock = home_env_lock().lock().unwrap();
+        let _home = TempHomeGuard::new("jarvisctl-worker-status-moonshot-creds");
+        let _api_key = TempEnvVarGuard::set("MOONSHOT_API_KEY", "");
+
+        let manifest = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Worker".to_string(),
+            metadata: ResourceMetadata {
+                name: "kimi-junior".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: WorkerSpec {
+                provider: WorkerProvider::Moonshot,
+                model: "moonshotai/kimi-k2-instruct".to_string(),
+                ..WorkerSpec::default()
+            },
+        };
+
+        let status = worker_status(&manifest).unwrap();
+        assert_eq!(status.provider, "moonshot");
+        assert_eq!(
+            status.endpoint,
+            "https://api.moonshot.cn/v1/chat/completions"
+        );
+        assert_eq!(status.admission, "credentials-missing");
+        assert_eq!(status.admission_code, "credentials_missing");
+        assert!(status.admission_reason.contains("MOONSHOT_API_KEY"));
+    }
+
+    #[test]
+    fn invoke_worker_supports_nvidia_openai_compatible_endpoint() {
+        let _lock = home_env_lock().lock().unwrap();
+        let _home = TempHomeGuard::new("jarvisctl-worker-nvidia-invoke");
+        let _api_key = TempEnvVarGuard::set("NVIDIA_API_KEY", "test-nvidia-token");
+        let (endpoint, rx, handle) = spawn_json_response_server(json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "{\"result\":\"ok\",\"lane\":\"routing\"}"
+                    }
+                }
+            ]
+        }));
+
+        let worker = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Worker".to_string(),
+            metadata: ResourceMetadata {
+                name: "nemotron-mini".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: WorkerSpec {
+                provider: WorkerProvider::Nvidia,
+                model: "nvidia/nemotron-mini-4b-instruct".to_string(),
+                endpoint: Some(format!("{}/v1", endpoint)),
+                output_mode: Some(WorkerOutputMode::Json),
+                temperature: Some(0.2),
+                top_p: Some(0.7),
+                num_predict: Some(64),
+                ..WorkerSpec::default()
+            },
+        };
+        save_manifest(&ResourceManifest::Worker(worker)).unwrap();
+
+        let output = invoke_worker(
+            "nemotron-mini",
+            Some("workers-lab"),
+            "Return strict JSON with keys result and lane.",
+        )
+        .unwrap();
+        let request = rx.recv().unwrap();
+        handle.join().unwrap();
+        let request_lower = request.to_lowercase();
+        let request_body = request
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("request body is present");
+        let request_json: serde_json::Value = serde_json::from_str(request_body).unwrap();
+
+        assert_eq!(
+            output,
+            "{\n  \"lane\": \"routing\",\n  \"result\": \"ok\"\n}"
+        );
+        assert!(
+            request.contains("POST /v1/chat/completions HTTP/1.1"),
+            "{request}"
+        );
+        assert!(
+            request_lower.contains("authorization: bearer test-nvidia-token"),
+            "{request}"
+        );
+        assert_eq!(
+            request_json
+                .get("model")
+                .and_then(serde_json::Value::as_str),
+            Some("nvidia/nemotron-mini-4b-instruct")
+        );
+        assert_eq!(
+            request_json
+                .get("stream")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            request_json
+                .get("max_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(64)
+        );
+        assert!(request_json.get("top_p").is_some());
+        assert_eq!(
+            request_json
+                .get("messages")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|messages| messages.first())
+                .and_then(|message| message.get("role"))
+                .and_then(serde_json::Value::as_str),
+            Some("system")
+        );
+    }
+
+    #[test]
+    fn worker_selection_prefers_remote_when_local_is_blocked_by_memory_pressure() {
+        let _lock = home_env_lock().lock().unwrap();
+        let _home = TempHomeGuard::new("jarvisctl-worker-remote-fallback");
+        let _memory = TempEnvVarGuard::set("JARVISCTL_TEST_AVAILABLE_MEMORY_MIB", "512");
+
+        let local_worker = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Worker".to_string(),
+            metadata: ResourceMetadata {
+                name: "local-junior".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::from([("lane".to_string(), "junior".to_string())]),
+                annotations: BTreeMap::new(),
+            },
+            spec: WorkerSpec {
+                model: "qwen3:8b".to_string(),
+                locality: Some(WorkerLocality::Local),
+                capabilities: vec!["vault".to_string()],
+                max_concurrent: Some(1),
+                memory_mib: Some(1024),
+                ..WorkerSpec::default()
+            },
+        };
+        let remote_worker = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Worker".to_string(),
+            metadata: ResourceMetadata {
+                name: "remote-junior".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::from([("lane".to_string(), "junior".to_string())]),
+                annotations: BTreeMap::new(),
+            },
+            spec: WorkerSpec {
+                model: "qwen3:8b".to_string(),
+                endpoint: Some("http://127.0.0.1:18081".to_string()),
+                locality: Some(WorkerLocality::Remote),
+                capabilities: vec!["vault".to_string()],
+                max_concurrent: Some(1),
+                ..WorkerSpec::default()
+            },
+        };
+        save_manifest(&ResourceManifest::Worker(local_worker)).unwrap();
+        save_manifest(&ResourceManifest::Worker(remote_worker)).unwrap();
+
+        let job = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Job".to_string(),
+            metadata: ResourceMetadata {
+                name: "summarize-docs".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: JobSpec {
+                worker: Some(WorkerJobSpec {
+                    selector: Some(LabelSelector {
+                        match_labels: BTreeMap::from([("lane".to_string(), "junior".to_string())]),
+                    }),
+                    required_capabilities: vec!["vault".to_string()],
+                    prefer_local: true,
+                    prompt: "Return strict JSON only.".to_string(),
+                    ..WorkerJobSpec::default()
+                }),
+                ..JobSpec::default()
+            },
+        };
+
+        let selection = select_worker_for_job_run(&job, &JobControllerState::default()).unwrap();
+        assert_eq!(selection.name.as_deref(), Some("remote-junior"));
+        assert_eq!(selection.namespace.as_deref(), Some("workers-lab"));
+        assert_eq!(
+            selection.admission_code,
+            WorkerAdmissionCode::RemoteFallback
+        );
+        assert!(
+            selection
+                .reason
+                .contains("preferred local workers are not admissible"),
+            "{}",
+            selection.reason
+        );
+        assert!(
+            selection.reason.contains("requires 1024 MiB RAM"),
+            "{}",
+            selection.reason
+        );
+    }
+
+    #[test]
+    fn worker_selection_uses_service_class_fallback_and_pool_balance() {
+        let _lock = home_env_lock().lock().unwrap();
+        let _home = TempHomeGuard::new("jarvisctl-worker-service-class-fallback");
+
+        let service = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Service".to_string(),
+            metadata: ResourceMetadata {
+                name: "junior-svc".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: ServiceSpec {
+                selector: BTreeMap::from([("lane".to_string(), "junior".to_string())]),
+                target_kind: Some(ServiceTargetKind::Worker),
+                class_name: Some("junior-routing".to_string()),
+                fallback_class_names: vec!["junior-code".to_string()],
+                allowed_intents: vec!["task_offload".to_string()],
+                ..ServiceSpec::default()
+            },
+        };
+        save_manifest(&ResourceManifest::Service(service)).unwrap();
+
+        let helper_a = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Worker".to_string(),
+            metadata: ResourceMetadata {
+                name: "helper-a".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::from([("lane".to_string(), "junior".to_string())]),
+                annotations: BTreeMap::new(),
+            },
+            spec: WorkerSpec {
+                model: "qwen3:8b".to_string(),
+                locality: Some(WorkerLocality::Remote),
+                pool: Some("pool-a".to_string()),
+                classes: vec!["ops".to_string()],
+                max_concurrent: Some(2),
+                ..WorkerSpec::default()
+            },
+        };
+        let code_a = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Worker".to_string(),
+            metadata: ResourceMetadata {
+                name: "code-a".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::from([("lane".to_string(), "junior".to_string())]),
+                annotations: BTreeMap::new(),
+            },
+            spec: WorkerSpec {
+                model: "qwen3:8b".to_string(),
+                locality: Some(WorkerLocality::Remote),
+                pool: Some("pool-a".to_string()),
+                classes: vec!["junior-code".to_string()],
+                max_concurrent: Some(2),
+                ..WorkerSpec::default()
+            },
+        };
+        let code_b = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Worker".to_string(),
+            metadata: ResourceMetadata {
+                name: "code-b".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::from([("lane".to_string(), "junior".to_string())]),
+                annotations: BTreeMap::new(),
+            },
+            spec: WorkerSpec {
+                model: "qwen3:8b".to_string(),
+                locality: Some(WorkerLocality::Remote),
+                pool: Some("pool-b".to_string()),
+                classes: vec!["junior-code".to_string()],
+                max_concurrent: Some(2),
+                ..WorkerSpec::default()
+            },
+        };
+        save_manifest(&ResourceManifest::Worker(helper_a)).unwrap();
+        save_manifest(&ResourceManifest::Worker(code_a)).unwrap();
+        save_manifest(&ResourceManifest::Worker(code_b)).unwrap();
+
+        let existing_job = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Job".to_string(),
+            metadata: ResourceMetadata {
+                name: "existing-load".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: JobSpec {
+                worker: Some(WorkerJobSpec {
+                    name: Some("helper-a".to_string()),
+                    prompt: "noop".to_string(),
+                    ..WorkerJobSpec::default()
+                }),
+                ..JobSpec::default()
+            },
+        };
+        save_manifest(&ResourceManifest::Job(existing_job)).unwrap();
+        save_job_controller_state(
+            "workers-lab",
+            "existing-load",
+            &JobControllerState {
+                runs: vec![JobRunState {
+                    name: "run-0".to_string(),
+                    runtime_namespace: "workers-lab--existing-load--j0".to_string(),
+                    created_at_epoch_ms: 1_000,
+                    backend: JobRunBackend::Worker,
+                    worker_name: Some("helper-a".to_string()),
+                    worker_namespace: Some("workers-lab".to_string()),
+                    service_name: None,
+                    intent: None,
+                    selected_class: None,
+                    fallback_class: false,
+                    worker_locality: None,
+                    admission_state: Some(JobRunAdmissionState::Granted),
+                    admission_code: Some(WorkerAdmissionCode::Ready),
+                    admission_reason: Some("busy".to_string()),
+                    last_active_epoch_ms: Some(1_100),
+                    completed_at_epoch_ms: None,
+                    artifact_path: None,
+                    output_path: None,
+                    last_error: None,
+                    status: JobRunPhase::Active,
+                }],
+            },
+        )
+        .unwrap();
+
+        let job = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Job".to_string(),
+            metadata: ResourceMetadata {
+                name: "route-docs".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: JobSpec {
+                worker: Some(WorkerJobSpec {
+                    service_name: Some("junior-svc".to_string()),
+                    prompt: "strict json".to_string(),
+                    ..WorkerJobSpec::default()
+                }),
+                ..JobSpec::default()
+            },
+        };
+
+        let selection = select_worker_for_job_run(&job, &JobControllerState::default()).unwrap();
+        assert_eq!(selection.name.as_deref(), Some("code-b"));
+        assert_eq!(selection.namespace.as_deref(), Some("workers-lab"));
+        assert!(
+            selection.reason.contains("via service 'junior-svc'"),
+            "{}",
+            selection.reason
+        );
+        assert!(
+            selection.reason.contains("fallback class 'junior-code'"),
+            "{}",
+            selection.reason
+        );
+    }
+
+    #[test]
+    fn worker_selection_prefers_service_provider_order() {
+        let _lock = home_env_lock().lock().unwrap();
+        let _home = TempHomeGuard::new("jarvisctl-worker-service-provider-order");
+        let _api_key = TempEnvVarGuard::set("NVIDIA_API_KEY", "provider-order-token");
+
+        let service = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Service".to_string(),
+            metadata: ResourceMetadata {
+                name: "code-svc".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: ServiceSpec {
+                selector: BTreeMap::from([("lane".to_string(), "code".to_string())]),
+                target_kind: Some(ServiceTargetKind::Worker),
+                class_name: Some("junior-code".to_string()),
+                required_capabilities: vec!["json".to_string()],
+                preferred_providers: vec![WorkerProvider::Nvidia, WorkerProvider::Ollama],
+                allowed_intents: vec!["code_task".to_string()],
+                ..ServiceSpec::default()
+            },
+        };
+        save_manifest(&ResourceManifest::Service(service)).unwrap();
+
+        let local_worker = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Worker".to_string(),
+            metadata: ResourceMetadata {
+                name: "local-code".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::from([("lane".to_string(), "code".to_string())]),
+                annotations: BTreeMap::new(),
+            },
+            spec: WorkerSpec {
+                provider: WorkerProvider::Ollama,
+                model: "qwen2.5-coder:3b".to_string(),
+                locality: Some(WorkerLocality::Local),
+                classes: vec!["junior-code".to_string()],
+                capabilities: vec!["json".to_string(), "code".to_string()],
+                max_concurrent: Some(1),
+                ..WorkerSpec::default()
+            },
+        };
+        let remote_worker = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Worker".to_string(),
+            metadata: ResourceMetadata {
+                name: "remote-kimi".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::from([("lane".to_string(), "code".to_string())]),
+                annotations: BTreeMap::new(),
+            },
+            spec: WorkerSpec {
+                provider: WorkerProvider::Nvidia,
+                model: "moonshotai/kimi-k2-instruct".to_string(),
+                locality: Some(WorkerLocality::Remote),
+                classes: vec!["junior-code".to_string()],
+                capabilities: vec!["json".to_string(), "code".to_string()],
+                max_concurrent: Some(1),
+                ..WorkerSpec::default()
+            },
+        };
+        save_manifest(&ResourceManifest::Worker(local_worker)).unwrap();
+        save_manifest(&ResourceManifest::Worker(remote_worker)).unwrap();
+
+        let job = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Job".to_string(),
+            metadata: ResourceMetadata {
+                name: "code-task".to_string(),
+                namespace: Some("workers-lab".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: JobSpec {
+                worker: Some(WorkerJobSpec {
+                    service_name: Some("code-svc".to_string()),
+                    intent: Some("code_task".to_string()),
+                    prompt: "strict json".to_string(),
+                    ..WorkerJobSpec::default()
+                }),
+                ..JobSpec::default()
+            },
+        };
+
+        let selection = select_worker_for_job_run(&job, &JobControllerState::default()).unwrap();
+        assert_eq!(selection.name.as_deref(), Some("remote-kimi"));
+        assert_eq!(selection.namespace.as_deref(), Some("workers-lab"));
+        assert_eq!(selection.selected_class.as_deref(), Some("junior-code"));
+    }
+
+    #[test]
+    fn worker_service_access_policy_denies_untrusted_job_namespace() {
+        let _lock = home_env_lock().lock().unwrap();
+        let _home = TempHomeGuard::new("jarvisctl-worker-service-access-policy");
+
+        let service = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Service".to_string(),
+            metadata: ResourceMetadata {
+                name: "restricted-svc".to_string(),
+                namespace: Some("trusted-ns".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: ServiceSpec {
+                selector: BTreeMap::from([("lane".to_string(), "junior".to_string())]),
+                target_kind: Some(ServiceTargetKind::Worker),
+                allowed_intents: vec!["task_offload".to_string()],
+                access_policy: ResourceAccessPolicy {
+                    allowed_namespaces: vec!["trusted-ns".to_string()],
+                    workload_selector: None,
+                },
+                ..ServiceSpec::default()
+            },
+        };
+        let worker = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Worker".to_string(),
+            metadata: ResourceMetadata {
+                name: "trusted-worker".to_string(),
+                namespace: Some("trusted-ns".to_string()),
+                labels: BTreeMap::from([("lane".to_string(), "junior".to_string())]),
+                annotations: BTreeMap::new(),
+            },
+            spec: WorkerSpec {
+                model: "qwen3:8b".to_string(),
+                locality: Some(WorkerLocality::Remote),
+                ..WorkerSpec::default()
+            },
+        };
+        save_manifest(&ResourceManifest::Service(service)).unwrap();
+        save_manifest(&ResourceManifest::Worker(worker)).unwrap();
+
+        let job = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Job".to_string(),
+            metadata: ResourceMetadata {
+                name: "cross-namespace".to_string(),
+                namespace: Some("other-ns".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: JobSpec {
+                worker: Some(WorkerJobSpec {
+                    service_name: Some("restricted-svc".to_string()),
+                    service_namespace: Some("trusted-ns".to_string()),
+                    prompt: "strict json".to_string(),
+                    ..WorkerJobSpec::default()
+                }),
+                ..JobSpec::default()
+            },
+        };
+
+        let error = select_worker_for_job_run(&job, &JobControllerState::default()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("denies source workload in namespace 'other-ns'"),
+            "{}",
+            error
+        );
+    }
+
+    #[test]
+    fn config_map_bindings_apply_prefix_and_access_policy() {
+        let _lock = home_env_lock().lock().unwrap();
+        let _home = TempHomeGuard::new("jarvisctl-configmap-access-policy");
+
+        let config_map = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "ConfigMap".to_string(),
+            metadata: ResourceMetadata {
+                name: "runtime-env".to_string(),
+                namespace: Some("team-alpha".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: ConfigMapSpec {
+                data: BTreeMap::from([("MODE".to_string(), "strict".to_string())]),
+                access_policy: ResourceAccessPolicy {
+                    allowed_namespaces: vec!["team-alpha".to_string()],
+                    workload_selector: Some(LabelSelector {
+                        match_labels: BTreeMap::from([("lane".to_string(), "junior".to_string())]),
+                    }),
+                },
+            },
+        };
+        save_manifest(&ResourceManifest::ConfigMap(config_map)).unwrap();
+
+        let values = load_config_map_values(
+            "team-alpha",
+            &[EnvBindingRef::Ref(NamedEnvBindingRef {
+                name: "runtime-env".to_string(),
+                optional: false,
+                prefix: Some("APP_".to_string()),
+            })],
+            &BTreeMap::from([("lane".to_string(), "junior".to_string())]),
+        )
+        .unwrap();
+        assert_eq!(
+            values
+                .get("runtime-env:APP_")
+                .and_then(|entry| entry.get("APP_MODE"))
+                .map(String::as_str),
+            Some("strict")
+        );
+
+        let error = load_config_map_values(
+            "team-alpha",
+            &[EnvBindingRef::Name("runtime-env".to_string())],
+            &BTreeMap::from([("lane".to_string(), "senior".to_string())]),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("configmap 'team-alpha/runtime-env' is not allowed for this workload"),
+            "{}",
+            error
+        );
+    }
+
+    #[test]
+    fn deployment_status_exposes_template_binding_metadata() {
+        let _lock = home_env_lock().lock().unwrap();
+        let _home = TempHomeGuard::new("jarvisctl-deployment-binding-status");
+
+        let deployment = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Deployment".to_string(),
+            metadata: ResourceMetadata {
+                name: "planner".to_string(),
+                namespace: Some("team-alpha".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: DeploymentSpec {
+                replicas: 0,
+                template: DeploymentTemplateSpec {
+                    task_note: "/tmp/demo.md".to_string(),
+                    config_maps: vec![EnvBindingRef::Ref(NamedEnvBindingRef {
+                        name: "planner-config".to_string(),
+                        optional: false,
+                        prefix: Some("CFG_".to_string()),
+                    })],
+                    secrets: vec![EnvBindingRef::Ref(NamedEnvBindingRef {
+                        name: "planner-secret".to_string(),
+                        optional: true,
+                        prefix: None,
+                    })],
+                    volumes: vec![VolumeBindingRef::Ref(NamedVolumeBindingRef {
+                        name: "shared-data".to_string(),
+                        optional: false,
+                        paths: vec!["/workspace/out".to_string()],
+                    })],
+                    ..DeploymentTemplateSpec::default()
+                },
+                ..DeploymentSpec::default()
+            },
+        };
+
+        validate_deployment(&deployment).unwrap();
+        let status = deployment_status(&deployment).unwrap();
+        assert_eq!(status.config_maps.len(), 1);
+        assert_eq!(status.config_maps[0].name, "planner-config");
+        assert_eq!(status.config_maps[0].prefix.as_deref(), Some("CFG_"));
+        assert!(!status.config_maps[0].optional);
+        assert_eq!(status.secrets.len(), 1);
+        assert_eq!(status.secrets[0].name, "planner-secret");
+        assert!(status.secrets[0].optional);
+        assert_eq!(status.volumes.len(), 1);
+        assert_eq!(status.volumes[0].name, "shared-data");
+        assert_eq!(status.volumes[0].paths, vec!["/workspace/out".to_string()]);
     }
 
     #[test]
@@ -7345,6 +11108,8 @@ spec:
         );
         assert_eq!(clean_status.source_revision, head);
         assert!(!clean_status.source_dirty);
+        assert_eq!(clean_status.conditions.len(), 3);
+        assert!(!clean_status.events.is_empty());
 
         write_text_file(
             &repo_dir.join("manifests/deployment.yaml"),
@@ -7363,6 +11128,18 @@ spec:
         let dirty_status = application_status(&application).unwrap();
         assert_eq!(dirty_status.source_type, "git");
         assert!(dirty_status.source_dirty);
+        assert!(
+            dirty_status
+                .conditions
+                .iter()
+                .any(|condition| condition.condition_type == "Synced")
+        );
+        assert!(
+            dirty_status
+                .events
+                .iter()
+                .any(|event| event.event_type == "application_drift")
+        );
     }
 
     #[test]

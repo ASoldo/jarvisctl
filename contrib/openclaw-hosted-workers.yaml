@@ -1,0 +1,103 @@
+apiVersion: jarvisctl.io/v1alpha1
+kind: Namespace
+metadata:
+  name: openclaw
+spec:
+  description: Hosted worker lanes and routing services for bounded agent offload.
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Worker
+metadata:
+  name: nemotron-routing
+  namespace: openclaw
+  labels:
+    lane: hosted
+    role: routing
+spec:
+  provider: nvidia
+  model: nvidia/nemotron-mini-4b-instruct
+  locality: remote
+  apiKeyEnv: NVIDIA_NEMOTRON_API_KEY
+  pool: nvidia-routing
+  classes:
+    - junior-routing
+  capabilities:
+    - routing
+    - triage
+    - json
+  maxConcurrent: 2
+  outputMode: json
+  temperature: 0.2
+  topP: 0.7
+  numPredict: 256
+  systemPrompt: |
+    You are a bounded routing worker.
+    Return strict JSON only with no markdown fences or extra commentary.
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Worker
+metadata:
+  name: kimi-code
+  namespace: openclaw
+  labels:
+    lane: hosted
+    role: code
+spec:
+  provider: nvidia
+  model: moonshotai/kimi-k2-instruct
+  locality: remote
+  apiKeyEnv: NVIDIA_KIMI_API_KEY
+  pool: nvidia-kimi
+  classes:
+    - junior-code
+  capabilities:
+    - code
+    - reasoning
+    - json
+  maxConcurrent: 2
+  outputMode: json
+  temperature: 0.1
+  topP: 0.7
+  numPredict: 512
+  systemPrompt: |
+    You are a bounded coding worker.
+    Return strict JSON only with no markdown fences or extra commentary.
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Service
+metadata:
+  name: routing-svc
+  namespace: openclaw
+spec:
+  targetKind: worker
+  selector:
+    lane: hosted
+  className: junior-routing
+  fallbackClassNames:
+    - junior-code
+  requiredCapabilities:
+    - json
+  preferredProviders:
+    - nvidia
+  allowedIntents:
+    - route_task
+    - task_offload
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Service
+metadata:
+  name: code-svc
+  namespace: openclaw
+spec:
+  targetKind: worker
+  selector:
+    lane: hosted
+  className: junior-code
+  requiredCapabilities:
+    - code
+    - json
+  preferredProviders:
+    - nvidia
+  allowedIntents:
+    - code_task
+    - task_offload

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -953,8 +954,13 @@ fn launch_record_matches_session(
 }
 
 fn read_session_meta(path: &Path) -> Option<SessionMetaEnvelope> {
-    let raw = fs::read_to_string(path).ok()?;
-    let first_line = raw.lines().next()?;
+    let file = fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut first_line = String::new();
+    if reader.read_line(&mut first_line).ok()? == 0 {
+        return None;
+    }
+    let first_line = first_line.trim_end_matches(['\r', '\n']);
     serde_json::from_str(first_line).ok()
 }
 
