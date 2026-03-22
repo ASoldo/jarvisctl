@@ -1,0 +1,468 @@
+apiVersion: jarvisctl.io/v1alpha1
+kind: Namespace
+metadata:
+  name: openclaw
+spec:
+  description: Curated NVIDIA Build free-endpoint lanes for bounded OpenClaw offload.
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Worker
+metadata:
+  name: kimi-code
+  namespace: openclaw
+  labels:
+    stability: stable
+    lane: code
+    role: code
+spec:
+  provider: nvidia
+  model: moonshotai/kimi-k2-instruct
+  locality: remote
+  apiKeySecretRef:
+    name: nvidia-build
+    key: apiKey
+  pool: nvidia-code
+  classes:
+    - junior-code
+  capabilities:
+    - code
+    - reasoning
+    - json
+  maxConcurrent: 2
+  outputMode: json
+  temperature: 0.1
+  topP: 0.7
+  numPredict: 768
+  systemPrompt: |
+    You are a bounded coding worker.
+    Return strict JSON only with no markdown fences or extra commentary.
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Worker
+metadata:
+  name: devstral-code
+  namespace: openclaw
+  labels:
+    stability: experimental
+    lane: code
+    role: code
+spec:
+  provider: nvidia
+  model: mistralai/devstral-2-123b-instruct-2512
+  locality: remote
+  apiKeySecretRef:
+    name: nvidia-build
+    key: apiKey
+  pool: nvidia-code
+  classes:
+    - mid-code
+  capabilities:
+    - code
+    - reasoning
+    - json
+    - long-context
+  maxConcurrent: 2
+  outputMode: json
+  temperature: 0.1
+  topP: 0.8
+  numPredict: 1024
+  systemPrompt: |
+    You are a bounded mid-tier code worker.
+    Return strict JSON only with no markdown fences or extra commentary.
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Worker
+metadata:
+  name: qwen-heavy-code
+  namespace: openclaw
+  labels:
+    stability: experimental
+    lane: code
+    role: code
+spec:
+  provider: nvidia
+  model: qwen/qwen3-coder-480b-a35b-instruct
+  locality: remote
+  apiKeySecretRef:
+    name: nvidia-build
+    key: apiKey
+  pool: nvidia-heavy-code
+  classes:
+    - heavy-code
+  capabilities:
+    - code
+    - reasoning
+    - browser-use
+    - json
+    - long-context
+  maxConcurrent: 1
+  outputMode: json
+  temperature: 0.1
+  topP: 0.8
+  numPredict: 1536
+  systemPrompt: |
+    You are a bounded heavy coding worker for difficult code-generation tasks.
+    Return strict JSON only with no markdown fences or extra commentary.
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Worker
+metadata:
+  name: nemotron-routing
+  namespace: openclaw
+  labels:
+    stability: stable
+    lane: route
+    role: routing
+spec:
+  provider: nvidia
+  model: nvidia/nemotron-mini-4b-instruct
+  locality: remote
+  apiKeySecretRef:
+    name: nvidia-build
+    key: apiKey
+  pool: nvidia-routing
+  classes:
+    - junior-routing
+  capabilities:
+    - routing
+    - triage
+    - tool-use
+    - json
+  maxConcurrent: 2
+  outputMode: json
+  temperature: 0.2
+  topP: 0.7
+  numPredict: 256
+  systemPrompt: |
+    You are a bounded routing worker.
+    Return strict JSON only with no markdown fences or extra commentary.
+    When a schema shows choices like "a|b|c", pick exactly one allowed value.
+    Never echo the union string itself.
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Worker
+metadata:
+  name: glm-routing
+  namespace: openclaw
+  labels:
+    stability: experimental
+    lane: route
+    role: routing-exp
+spec:
+  provider: nvidia
+  model: z-ai/glm4.7
+  locality: remote
+  apiKeySecretRef:
+    name: nvidia-build
+    key: apiKey
+  pool: nvidia-routing-exp
+  classes:
+    - experimental-routing
+  capabilities:
+    - routing
+    - triage
+    - tool-use
+    - json
+  maxConcurrent: 2
+  outputMode: json
+  temperature: 0.1
+  topP: 0.7
+  numPredict: 512
+  systemPrompt: |
+    You are an experimental routing worker.
+    Return strict JSON only with no markdown fences or extra commentary.
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Worker
+metadata:
+  name: step-planner
+  namespace: openclaw
+  labels:
+    stability: experimental
+    lane: plan
+    role: planner-exp
+spec:
+  provider: nvidia
+  model: stepfun-ai/step-3-5-flash
+  locality: remote
+  apiKeySecretRef:
+    name: nvidia-build
+    key: apiKey
+  pool: nvidia-planning-exp
+  classes:
+    - experimental-planner
+  capabilities:
+    - planning
+    - reasoning
+    - agentic
+    - json
+  maxConcurrent: 2
+  outputMode: json
+  temperature: 0.1
+  topP: 0.7
+  numPredict: 768
+  systemPrompt: |
+    You are an experimental planning worker.
+    Return strict JSON only with no markdown fences or extra commentary.
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Worker
+metadata:
+  name: deepseek-reasoner
+  namespace: openclaw
+  labels:
+    stability: experimental
+    lane: reason
+    role: reasoning-exp
+spec:
+  provider: nvidia
+  model: deepseek-ai/deepseek-v3.1-terminus
+  locality: remote
+  apiKeySecretRef:
+    name: nvidia-build
+    key: apiKey
+  pool: nvidia-reasoning-exp
+  classes:
+    - experimental-reasoning
+  capabilities:
+    - reasoning
+    - tool-use
+    - json
+    - long-context
+  maxConcurrent: 2
+  outputMode: json
+  temperature: 0.1
+  topP: 0.7
+  numPredict: 1024
+  systemPrompt: |
+    You are an experimental reasoning worker.
+    Return strict JSON only with no markdown fences or extra commentary.
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Worker
+metadata:
+  name: phi-flash-reasoner
+  namespace: openclaw
+  labels:
+    stability: experimental
+    lane: reason
+    role: reasoning-exp
+spec:
+  provider: nvidia
+  model: microsoft/phi-4-mini-flash-reasoning
+  locality: remote
+  apiKeySecretRef:
+    name: nvidia-build
+    key: apiKey
+  pool: nvidia-reasoning-exp
+  classes:
+    - experimental-reasoning
+  capabilities:
+    - reasoning
+    - json
+    - low-latency
+  maxConcurrent: 2
+  outputMode: json
+  temperature: 0
+  topP: 0.7
+  numPredict: 384
+  systemPrompt: |
+    You are an experimental lightweight reasoning worker.
+    Return strict JSON only with no markdown fences or extra commentary.
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Worker
+metadata:
+  name: safety-guard
+  namespace: openclaw
+  labels:
+    stability: experimental
+    lane: safety
+    role: safety-exp
+spec:
+  provider: nvidia
+  model: nvidia/llama-3.1-nemotron-safety-guard-8b-v3
+  locality: remote
+  apiKeySecretRef:
+    name: nvidia-build
+    key: apiKey
+  pool: nvidia-safety-exp
+  classes:
+    - experimental-safety
+  capabilities:
+    - safety
+    - moderation
+    - json
+  maxConcurrent: 2
+  outputMode: json
+  temperature: 0
+  topP: 0.7
+  numPredict: 256
+  systemPrompt: |
+    You are an experimental safety worker.
+    Return strict JSON only with no markdown fences or extra commentary.
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Worker
+metadata:
+  name: safety-policy
+  namespace: openclaw
+  labels:
+    stability: experimental
+    lane: safety
+    role: safety-exp
+spec:
+  provider: nvidia
+  model: nvidia/nemotron-content-safety-reasoning-4b
+  locality: remote
+  apiKeySecretRef:
+    name: nvidia-build
+    key: apiKey
+  pool: nvidia-safety-exp
+  classes:
+    - experimental-policy
+  capabilities:
+    - safety
+    - policy
+    - reasoning
+    - json
+  maxConcurrent: 2
+  outputMode: json
+  temperature: 0
+  topP: 0.7
+  numPredict: 256
+  systemPrompt: |
+    You are an experimental policy-check worker.
+    Return strict JSON only with no markdown fences or extra commentary.
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Service
+metadata:
+  name: routing-svc
+  namespace: openclaw
+spec:
+  targetKind: worker
+  selector:
+    stability: stable
+    role: routing
+  className: junior-routing
+  fallbackClassNames:
+    - junior-code
+  requiredCapabilities:
+    - json
+  preferredProviders:
+    - nvidia
+  allowedIntents:
+    - route_task
+    - task_offload
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Service
+metadata:
+  name: planning-exp-svc
+  namespace: openclaw
+spec:
+  targetKind: worker
+  selector:
+    stability: experimental
+    role: planner-exp
+  className: experimental-planner
+  fallbackClassNames:
+    - experimental-reasoning
+  requiredCapabilities:
+    - planning
+    - json
+  preferredProviders:
+    - nvidia
+  allowedIntents:
+    - planning_task
+    - task_offload
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Service
+metadata:
+  name: reasoning-exp-svc
+  namespace: openclaw
+spec:
+  targetKind: worker
+  selector:
+    stability: experimental
+    role: reasoning-exp
+  className: experimental-reasoning
+  fallbackClassNames:
+    - experimental-planner
+    - junior-code
+  requiredCapabilities:
+    - reasoning
+    - json
+  preferredProviders:
+    - nvidia
+  allowedIntents:
+    - reasoning_task
+    - review_task
+    - task_offload
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Service
+metadata:
+  name: code-svc
+  namespace: openclaw
+spec:
+  targetKind: worker
+  selector:
+    stability: stable
+    role: code
+  className: junior-code
+  requiredCapabilities:
+    - code
+    - json
+  preferredProviders:
+    - nvidia
+  allowedIntents:
+    - code_task
+    - task_offload
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Service
+metadata:
+  name: heavy-code-exp-svc
+  namespace: openclaw
+spec:
+  targetKind: worker
+  selector:
+    stability: experimental
+    role: code
+  className: heavy-code
+  fallbackClassNames:
+    - mid-code
+    - junior-code
+  requiredCapabilities:
+    - code
+    - json
+  preferredProviders:
+    - nvidia
+  allowedIntents:
+    - heavy_code_task
+    - code_task
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Service
+metadata:
+  name: safety-exp-svc
+  namespace: openclaw
+spec:
+  targetKind: worker
+  selector:
+    stability: experimental
+    role: safety-exp
+  className: experimental-safety
+  fallbackClassNames:
+    - experimental-policy
+  requiredCapabilities:
+    - safety
+    - json
+  preferredProviders:
+    - nvidia
+  allowedIntents:
+    - safety_task
+    - review_task

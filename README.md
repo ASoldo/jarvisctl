@@ -276,6 +276,51 @@ For GUI-launched operators like the Obsidian plugin, prefer `spec.apiKeySecretRe
 Third-party models served through NVIDIA Build, such as `moonshotai/kimi-k2-instruct`, still use `provider: nvidia` because the endpoint and credential are NVIDIA-managed. Use `provider: moonshot` only when you are calling Moonshot's own API directly.
 For a concrete hosted-lane setup, see [contrib/openclaw-hosted-workers.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-hosted-workers.yaml). It defines a small `openclaw` namespace with NVIDIA-backed `routing-svc` and `code-svc` worker services over Nemotron and Kimi using secret-backed credentials. Pair it with [contrib/openclaw-hosted-secrets.example.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-hosted-secrets.example.yaml) to create the `Secret` resources those workers expect.
 
+The NVIDIA Build free-endpoint catalog currently shows 94 preview/free models under the `nim_type_preview` filter, but not all of them fit `jarvisctl`'s current bounded text/json worker contract. For that reason the OpenClaw preset separates **stable hot-path lanes** from **experimental catalog lanes**. See [contrib/openclaw-nvidia-free-endpoints.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-nvidia-free-endpoints.yaml) with its matching [contrib/openclaw-nvidia-build-secret.example.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-nvidia-build-secret.example.yaml).
+
+Stable services in that preset:
+
+* `routing-svc`: `nvidia/nemotron-mini-4b-instruct`
+* `code-svc`: `moonshotai/kimi-k2-instruct`
+
+Experimental services in that preset:
+
+* `planning-exp-svc`: `stepfun-ai/step-3-5-flash`
+* `reasoning-exp-svc`: `deepseek-ai/deepseek-v3.1-terminus` with `microsoft/phi-4-mini-flash-reasoning`
+* `heavy-code-exp-svc`: `qwen/qwen3-coder-480b-a35b-instruct` with `mistralai/devstral-2-123b-instruct-2512`
+* `safety-exp-svc`: `nvidia/llama-3.1-nemotron-safety-guard-8b-v3` with `nvidia/nemotron-content-safety-reasoning-4b`
+
+The preset also tags workers with `metadata.labels.stability: stable|experimental`, and the stable services select only `stability: stable` workers. That keeps the hot path narrow in the UI and at runtime:
+
+* `routing-svc` resolves only the proven routing lane
+* `code-svc` resolves only the proven Kimi coding lane
+* `*-exp-svc` resources are explicit opt-in lanes for scorecards, probes, and manual evaluation
+
+Typical bootstrap:
+
+```bash
+jarvisctl apply \
+  -f contrib/openclaw-nvidia-build-secret.example.yaml \
+  -f contrib/openclaw-nvidia-free-endpoints.yaml
+
+jarvisctl get workers -n openclaw --output table
+jarvisctl get services -n openclaw --output table
+```
+
+Then run the probe pack:
+
+```bash
+jarvisctl apply -f contrib/openclaw-nvidia-free-endpoint-probes.yaml
+jarvisctl get jobs -n openclaw --output table
+jarvisctl describe job code-titlecase -n openclaw --output json
+```
+
+This is the intended OpenClaw split:
+
+* Codex / OpenAI: primary orchestrator, final reviewer, high-ambiguity work
+* NVIDIA Build free endpoints: bounded offload lanes for predictable routing and code, with broader catalog lanes kept behind explicit experimental services until scorecards prove them
+* Ollama local workers: cheapest deterministic lanes when the task is narrow enough and the machine has headroom
+
 ### Define a hosted NVIDIA or Moonshot worker
 
 ```yaml
@@ -311,18 +356,19 @@ metadata:
   name: kimi-code
   namespace: workers-lab
 spec:
-  provider: moonshot
+  provider: nvidia
   model: moonshotai/kimi-k2-instruct
   locality: remote
   apiKeySecretRef:
-    name: hosted-llm-creds
-    key: moonshotApiKey
-  pool: moonshot-code
+    name: nvidia-build
+    key: apiKey
+  pool: nvidia-code
   classes:
     - junior-code
   capabilities:
     - code
     - reasoning
+    - json
   maxConcurrent: 2
   outputMode: json
   temperature: 0.1
@@ -333,6 +379,7 @@ spec:
 ```
 
 For hosted workers, either provide `apiKeySecretRef` or make sure the API key env var is present in the process environment that runs `jarvisctl`. If the credential source is missing, the scheduler will surface `admission_code: credentials_missing` instead of attempting a request.
+For a multi-lane free-endpoint scorecard setup, see [contrib/openclaw-nvidia-free-endpoint-probes.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-nvidia-free-endpoint-probes.yaml). It layers route and code probes on top of the stable services, plus an explicit planning probe for the experimental planner lane.
 
 ### Run a worker-backed Job
 

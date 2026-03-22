@@ -1,0 +1,162 @@
+apiVersion: jarvisctl.io/v1alpha1
+kind: Job
+metadata:
+  name: plan-titlecase
+  namespace: openclaw
+spec:
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  worker:
+    serviceName: planning-exp-svc
+    serviceNamespace: openclaw
+    intent: planning_task
+    timeoutSeconds: 180
+    outputPath: /tmp/openclaw-plan-titlecase.json
+    validation:
+      shellCommand: |
+        python3 - <<'PY'
+        import json, os, sys
+        path = os.environ["JARVIS_WORKER_OUTPUT_PATH"]
+        payload = json.load(open(path, "r", encoding="utf-8"))
+        checklist = payload.get("checklist") or []
+        services = set(payload.get("services") or [])
+        if len(checklist) < 3:
+            print(f"plan scorecard failed: checklist too short ({len(checklist)})")
+            sys.exit(1)
+        if "code-svc" not in services:
+            print(f"plan scorecard failed: services={sorted(services)!r}")
+            sys.exit(1)
+        print("plan scorecard passed")
+        PY
+      failJobOnFailure: false
+    prompt: |
+      Return strict JSON only with this schema:
+      {"goal":"string","checklist":["string"],"services":["string"],"confidence":number}
+
+      Build a short execution plan for generating and validating a JavaScript helper named
+      titleCaseSlug that converts slug-like text into title-cased words.
+
+      Rules:
+      - Return 3 to 5 checklist items.
+      - Include only service names from this set: ["routing-svc","planning-exp-svc","reasoning-exp-svc","code-svc","heavy-code-exp-svc","safety-exp-svc"].
+      - Include "code-svc" in services.
+      - confidence must be a float between 0 and 1.
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Job
+metadata:
+  name: route-titlecase
+  namespace: openclaw
+spec:
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  worker:
+    serviceName: routing-svc
+    serviceNamespace: openclaw
+    intent: route_task
+    timeoutSeconds: 120
+    outputPath: /tmp/openclaw-route-titlecase.json
+    validation:
+      shellCommand: |
+        python3 - <<'PY'
+        import json, os, sys
+        path = os.environ["JARVIS_WORKER_OUTPUT_PATH"]
+        payload = json.load(open(path, "r", encoding="utf-8"))
+        lane = payload.get("lane")
+        if lane not in {"junior-code", "mid-code"}:
+            print(f"route scorecard failed: lane={lane!r}")
+            sys.exit(1)
+        print(f"route scorecard passed with lane={lane}")
+        PY
+      failJobOnFailure: false
+    prompt: |
+      Return strict JSON only with this schema:
+      {"lane":"junior-code|mid-code|heavy-code","services":["string"],"confidence":number,"reason":"string"}
+
+      Route this bounded task:
+      "Write a JavaScript function titleCaseSlug(value) that turns slug-like text into title-cased words."
+
+      Rules:
+      - Choose exactly one lane value from the schema.
+      - Include only service names from this set: ["code-svc","heavy-code-exp-svc","reasoning-exp-svc"].
+      - confidence must be a float between 0 and 1.
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Job
+metadata:
+  name: code-titlecase
+  namespace: openclaw
+spec:
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  worker:
+    serviceName: code-svc
+    serviceNamespace: openclaw
+    intent: code_task
+    timeoutSeconds: 180
+    outputPath: /tmp/openclaw-code-titlecase.json
+    validation:
+      shellCommand: |
+        node <<'JS'
+        const fs = require('fs');
+        const vm = require('vm');
+
+        const path = process.env.JARVIS_WORKER_OUTPUT_PATH;
+        const payload = JSON.parse(fs.readFileSync(path, 'utf8'));
+
+        if (payload.language !== 'javascript') {
+          throw new Error(`language=${JSON.stringify(payload.language)}`);
+        }
+        if (payload.entrypoint !== 'titleCaseSlug') {
+          throw new Error(`entrypoint=${JSON.stringify(payload.entrypoint)}`);
+        }
+        if (typeof payload.code !== 'string' || payload.code.trim() === '') {
+          throw new Error('code missing');
+        }
+
+        const context = {};
+        vm.createContext(context);
+        new vm.Script(`${payload.code}\nthis.__fn__ = ${payload.entrypoint};`).runInContext(context);
+
+        if (typeof context.__fn__ !== 'function') {
+          throw new Error('entrypoint not callable');
+        }
+
+        const cases = new Map([
+          ['hello-world', 'Hello World'],
+          ['jarvis_ctl-demo', 'Jarvis Ctl Demo'],
+          ['already Clean', 'Already Clean'],
+        ]);
+
+        for (const [raw, expected] of cases) {
+          const actual = context.__fn__(raw);
+          if (actual !== expected) {
+            throw new Error(`titleCaseSlug failed: ${JSON.stringify(raw)} -> ${JSON.stringify(actual)} expected ${JSON.stringify(expected)}`);
+          }
+        }
+
+        console.log('titleCaseSlug scorecard passed');
+        JS
+      failJobOnFailure: true
+    prompt: |
+      Return strict JSON only with this schema:
+      {"language":"javascript","entrypoint":"string","code":"string"}
+
+      Write a JavaScript function named titleCaseSlug(value) that converts slug-like
+      and mixed-separator text into title-cased words separated by single spaces.
+
+      Requirements:
+      - The function name must be exactly `titleCaseSlug`.
+      - Treat dashes, underscores, and runs of whitespace as separators.
+      - Trim surrounding whitespace.
+      - Collapse repeated separators.
+      - Capitalize the first letter of each resulting word and lowercase the rest.
+      - Return a plain string.
+
+      The function must satisfy these examples:
+      - "hello-world" -> "Hello World"
+      - "jarvis_ctl-demo" -> "Jarvis Ctl Demo"
+      - "already Clean" -> "Already Clean"
