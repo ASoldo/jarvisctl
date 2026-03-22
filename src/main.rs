@@ -36,13 +36,14 @@ use codex_app::{
     tell_codex_app_with_mode,
 };
 use control_plane::{
-    ControlPlaneOutput, ControlPlaneResourceKindArg, WorkerOffloadRequest, apply_kustomization,
-    apply_manifests, authorize_runtime_message, invoke_worker, offload_worker_task,
-    pause_deployment_rollout, render_application_diff_output, render_describe_output,
-    render_get_output, render_rollout_history_output, render_rollout_status_output,
-    resolve_service_target, resolve_service_target_for_message, restart_deployment_rollout,
-    resume_deployment_rollout, serve_worker_run, sync_application_resource,
-    undo_deployment_rollout, wait_for_rollout_status_output,
+    ControlPlaneOutput, ControlPlaneResourceKindArg, KubernetesRenderOutput, WorkerOffloadRequest,
+    apply_kubernetes_resources, apply_kustomization, apply_manifests, authorize_runtime_message,
+    invoke_worker, offload_worker_task, pause_deployment_rollout, render_application_diff_output,
+    render_describe_output, render_get_output, render_kubernetes_resources,
+    render_rollout_history_output, render_rollout_status_output, resolve_service_target,
+    resolve_service_target_for_message, restart_deployment_rollout, resume_deployment_rollout,
+    serve_worker_run, sync_application_resource, undo_deployment_rollout,
+    wait_for_rollout_status_output,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use native::{
@@ -304,6 +305,12 @@ enum Command {
     Worker {
         #[command(subcommand)]
         command: WorkerCommand,
+    },
+
+    /// Render or apply supported resources onto a Kubernetes cluster
+    Kube {
+        #[command(subcommand)]
+        command: KubeCommand,
     },
 
     /// Open a ratatui session dashboard
@@ -583,6 +590,36 @@ enum WorkerCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum KubeCommand {
+    /// Render supported jarvisctl resources as native Kubernetes manifests
+    Render {
+        #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
+        file: Vec<PathBuf>,
+
+        #[arg(short = 'k', long = "kustomize", value_hint = ValueHint::DirPath)]
+        kustomize: Option<PathBuf>,
+
+        #[arg(long, value_enum, default_value_t = KubernetesRenderOutput::Yaml)]
+        output: KubernetesRenderOutput,
+    },
+
+    /// Apply supported jarvisctl resources onto the active Kubernetes cluster
+    Apply {
+        #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
+        file: Vec<PathBuf>,
+
+        #[arg(short = 'k', long = "kustomize", value_hint = ValueHint::DirPath)]
+        kustomize: Option<PathBuf>,
+
+        #[arg(long)]
+        context: Option<String>,
+
+        #[arg(long = "dry-run-server", default_value_t = false)]
+        dry_run_server: bool,
+    },
+}
+
 #[instrument]
 fn main() -> ExitCode {
     // Initialize structured logging with environment override
@@ -719,6 +756,7 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         Command::Rollout { command } => rollout_command(command),
         Command::Application { command } => application_command(command),
         Command::Worker { command } => worker_command(command),
+        Command::Kube { command } => kube_command(command),
         Command::Dashboard {
             backend,
             refresh_ms,
@@ -1133,6 +1171,41 @@ fn worker_command(command: WorkerCommand) -> Result<(), JarvisError> {
                     );
                 }
             }
+            Ok(())
+        }
+    }
+}
+
+fn kube_command(command: KubeCommand) -> Result<(), JarvisError> {
+    match command {
+        KubeCommand::Render {
+            file,
+            kustomize,
+            output,
+        } => {
+            println!(
+                "{}",
+                render_kubernetes_resources(&file, kustomize.as_deref(), output)
+                    .map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        KubeCommand::Apply {
+            file,
+            kustomize,
+            context,
+            dry_run_server,
+        } => {
+            println!(
+                "{}",
+                apply_kubernetes_resources(
+                    &file,
+                    kustomize.as_deref(),
+                    context.as_deref(),
+                    dry_run_server,
+                )
+                .map_err(JarvisError::from)?
+            );
             Ok(())
         }
     }

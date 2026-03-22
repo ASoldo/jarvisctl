@@ -1,0 +1,94 @@
+apiVersion: jarvisctl.io/v1alpha1
+kind: Job
+metadata:
+  name: route-titlecase
+  namespace: openclaw
+spec:
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  worker:
+    serviceName: routing-svc
+    serviceNamespace: openclaw
+    intent: route_task
+    timeoutSeconds: 180
+    outputPath: /tmp/route-titlecase.json
+    validation:
+      shellCommand: |
+        python3 - <<'PY'
+        import json, os
+        path = os.environ["JARVIS_WORKER_OUTPUT_PATH"]
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+
+        lane = payload.get("lane")
+        confidence = float(payload.get("confidence") or 0.0)
+        if lane != "junior-code":
+            raise SystemExit(f"expected junior-code lane, got {lane!r}")
+        if confidence < 0.6:
+            raise SystemExit(f"confidence too low: {confidence}")
+
+        print(f"route titlecase scorecard passed with lane={lane} confidence={confidence}")
+        PY
+      failJobOnFailure: true
+    prompt: |
+      Return strict JSON only with schema {"lane":"junior-code|mid-code|heavy-code","confidence":number,"reason":"string"}.
+      Decide lane for task: write a JavaScript function normalizeTitleCase(input) that converts slug-like text into title-cased words separated by single spaces.
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Job
+metadata:
+  name: code-slugify
+  namespace: openclaw
+spec:
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  worker:
+    serviceName: code-svc
+    serviceNamespace: openclaw
+    intent: code_task
+    timeoutSeconds: 180
+    outputPath: /tmp/openclaw-code-validated.json
+    validation:
+      shellCommand: |
+        python3 - <<'PY'
+        import json
+        import os
+
+        path = os.environ["JARVIS_WORKER_OUTPUT_PATH"]
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+
+        namespace = {}
+        exec(payload["code"], namespace)
+        fn = namespace[payload["entrypoint"]]
+
+        cases = {
+            "Hello, World!": "hello-world",
+            "  Multi   Space  ": "multi-space",
+            "Already---Slugged": "already-slugged",
+            "snake_case name": "snake-case-name",
+        }
+
+        for raw, expected in cases.items():
+            actual = fn(raw)
+            if actual != expected:
+                raise SystemExit(
+                    f"slug scorecard failed: {raw!r} -> {actual!r} expected {expected!r}"
+                )
+
+        print("slug scorecard passed")
+        PY
+      failJobOnFailure: true
+    prompt: |
+      Return strict JSON only with this schema:
+      {"language":"python","entrypoint":"string","code":"string"}
+
+      Write a Python function named normalize_slug(value: str) -> str that:
+      - lowercases input
+      - trims surrounding whitespace
+      - removes punctuation other than spaces, underscores, and dashes
+      - converts spaces and underscores to single dashes
+      - collapses repeated dashes
+      - strips leading and trailing dashes

@@ -9,6 +9,7 @@ use crate::native::{
 };
 use crate::ticket::slugify;
 use anyhow::{Context, anyhow, bail, ensure};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
 use clap::ValueEnum;
 use cron::Schedule;
@@ -34,6 +35,12 @@ const WORKER_RUN_STARTUP_GRACE_MS: u128 = 2_000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum ControlPlaneOutput {
     Table,
+    Json,
+    Yaml,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum KubernetesRenderOutput {
     Json,
     Yaml,
 }
@@ -970,6 +977,20 @@ enum ResourceManifest {
     Worker(ResourceEnvelope<WorkerSpec>),
 }
 
+#[derive(Debug, Clone)]
+struct KubernetesCompilation {
+    manifests: Vec<serde_json::Value>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct KubernetesResolvedWorker {
+    worker: ResourceEnvelope<WorkerSpec>,
+    service_name: Option<String>,
+    selected_class: Option<String>,
+    fallback_class: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct ResourceSummary {
     kind: String,
@@ -1634,6 +1655,1114 @@ pub fn apply_kustomization(path: &Path) -> anyhow::Result<Vec<String>> {
     }
     messages.extend(reconcile_control_plane()?);
     Ok(messages)
+}
+
+pub fn render_kubernetes_resources(
+    files: &[PathBuf],
+    kustomize: Option<&Path>,
+    output: KubernetesRenderOutput,
+) -> anyhow::Result<String> {
+    let manifests = load_source_manifests(files, kustomize)?;
+    let compiled = compile_kubernetes_manifests(&manifests)?;
+    ensure!(
+        !compiled.manifests.is_empty(),
+        "no Kubernetes resources were generated from the provided jarvisctl manifests"
+    );
+    match output {
+        KubernetesRenderOutput::Json => serde_json::to_string_pretty(&compiled.manifests)
+            .context("failed to encode Kubernetes manifests"),
+        KubernetesRenderOutput::Yaml => render_kubernetes_yaml_documents(&compiled.manifests),
+    }
+}
+
+pub fn apply_kubernetes_resources(
+    files: &[PathBuf],
+    kustomize: Option<&Path>,
+    kubectl_context: Option<&str>,
+    dry_run_server: bool,
+) -> anyhow::Result<String> {
+    let manifests = load_source_manifests(files, kustomize)?;
+    let compiled = compile_kubernetes_manifests(&manifests)?;
+    ensure!(
+        !compiled.manifests.is_empty(),
+        "no Kubernetes resources were generated from the provided jarvisctl manifests"
+    );
+
+    let mut messages = Vec::new();
+    let namespace_manifests = compiled
+        .manifests
+        .iter()
+        .filter(|manifest| {
+            manifest.get("kind").and_then(serde_json::Value::as_str) == Some("Namespace")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let namespaced_manifests = compiled
+        .manifests
+        .iter()
+        .filter(|manifest| {
+            manifest.get("kind").and_then(serde_json::Value::as_str) != Some("Namespace")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut dry_run_mode = if dry_run_server { Some("server") } else { None };
+    if dry_run_server {
+        let missing_namespaces = namespaced_manifests
+            .iter()
+            .filter_map(|manifest| {
+                manifest
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("namespace"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .filter(|namespace| !kubernetes_namespace_exists(kubectl_context, namespace))
+            .collect::<Vec<_>>();
+        if !missing_namespaces.is_empty() {
+            dry_run_mode = Some("client");
+            messages.push(format!(
+                "server dry-run downgraded to client dry-run because these target namespaces do not exist yet: {}",
+                missing_namespaces.join(", ")
+            ));
+        }
+    }
+
+    if !namespace_manifests.is_empty() {
+        if let Some(output) =
+            kubectl_apply_rendered_documents(&namespace_manifests, kubectl_context, dry_run_mode)?
+        {
+            messages.push(output);
+        }
+    }
+    if !namespaced_manifests.is_empty() {
+        if let Some(output) =
+            kubectl_apply_rendered_documents(&namespaced_manifests, kubectl_context, dry_run_mode)?
+        {
+            messages.push(output);
+        }
+    }
+    if !compiled.warnings.is_empty() {
+        messages.push(format!(
+            "compiler warnings:\n{}",
+            compiled
+                .warnings
+                .iter()
+                .map(|warning| format!("- {}", warning))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    Ok(messages.join("\n"))
+}
+
+fn load_source_manifests(
+    files: &[PathBuf],
+    kustomize: Option<&Path>,
+) -> anyhow::Result<Vec<ResourceManifest>> {
+    match (files.is_empty(), kustomize) {
+        (false, None) => {
+            let mut manifests = Vec::new();
+            for path in files {
+                let raw = fs::read_to_string(path)
+                    .with_context(|| format!("failed to read manifest '{}'", path.display()))?;
+                let mut parsed = parse_manifest_documents(&raw)?;
+                resolve_manifest_relative_paths(
+                    &mut parsed,
+                    path.parent().unwrap_or_else(|| Path::new(".")),
+                );
+                manifests.extend(parsed);
+            }
+            Ok(manifests)
+        }
+        (true, Some(path)) => render_source_path(path, None, &BTreeMap::new()),
+        (false, Some(_)) => bail!("use either --file or --kustomize, not both"),
+        (true, None) => bail!("provide at least one --file or one --kustomize path"),
+    }
+}
+
+fn render_kubernetes_yaml_documents(manifests: &[serde_json::Value]) -> anyhow::Result<String> {
+    let mut rendered = Vec::new();
+    for manifest in manifests {
+        rendered
+            .push(serde_yaml::to_string(manifest).context("failed to encode Kubernetes manifest")?);
+    }
+    Ok(rendered.join("---\n"))
+}
+
+fn kubectl_apply_rendered_documents(
+    manifests: &[serde_json::Value],
+    kubectl_context: Option<&str>,
+    dry_run_mode: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    if manifests.is_empty() {
+        return Ok(None);
+    }
+    let rendered = render_kubernetes_yaml_documents(manifests)?;
+    let mut command = ProcessCommand::new("kubectl");
+    if let Some(context) = kubectl_context
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        command.arg("--context").arg(context);
+    }
+    command.arg("apply").arg("-f").arg("-");
+    if let Some(mode) = dry_run_mode {
+        command.arg(format!("--dry-run={mode}"));
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn kubectl apply")?;
+    use std::io::Write as _;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| anyhow!("failed to open kubectl stdin"))?
+        .write_all(rendered.as_bytes())
+        .context("failed to stream rendered manifests to kubectl")?;
+    let output = child
+        .wait_with_output()
+        .context("failed while waiting for kubectl apply")?;
+    if !output.status.success() {
+        bail!(
+            "kubectl apply failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut chunks = Vec::new();
+    let stdout = String::from_utf8(output.stdout).context("kubectl returned non-utf8 stdout")?;
+    let stderr = String::from_utf8(output.stderr).context("kubectl returned non-utf8 stderr")?;
+    if !stdout.trim().is_empty() {
+        chunks.push(stdout.trim().to_string());
+    }
+    if !stderr.trim().is_empty() {
+        chunks.push(stderr.trim().to_string());
+    }
+    Ok((!chunks.is_empty()).then(|| chunks.join("\n")))
+}
+
+fn kubernetes_namespace_exists(kubectl_context: Option<&str>, namespace: &str) -> bool {
+    let mut command = ProcessCommand::new("kubectl");
+    if let Some(context) = kubectl_context
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        command.arg("--context").arg(context);
+    }
+    command
+        .args(["get", "namespace", namespace, "-o", "name"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn compile_kubernetes_manifests(
+    manifests: &[ResourceManifest],
+) -> anyhow::Result<KubernetesCompilation> {
+    let mut rendered = Vec::new();
+    let mut warnings = Vec::new();
+    for manifest in manifests {
+        match manifest {
+            ResourceManifest::Namespace(namespace) => {
+                rendered.push(kubernetes_namespace_value(namespace));
+            }
+            ResourceManifest::ConfigMap(config_map) => {
+                rendered.push(kubernetes_config_map_value(config_map));
+            }
+            ResourceManifest::Secret(secret) => {
+                rendered.push(kubernetes_secret_value(secret));
+            }
+            ResourceManifest::NetworkPolicy(policy) => {
+                rendered.push(kubernetes_network_policy_value(policy));
+            }
+            ResourceManifest::Worker(worker) => {
+                rendered.push(kubernetes_worker_info_value(worker)?);
+            }
+            ResourceManifest::Service(service) => {
+                if effective_service_target_kind(&service.spec) == ServiceTargetKind::Worker {
+                    rendered.push(kubernetes_worker_service_info_value(service)?);
+                } else {
+                    warnings.push(format!(
+                        "skipped runtime Service '{}/{}' because Kubernetes service ports are not defined in jarvisctl manifests yet",
+                        service.namespace_key(),
+                        service.metadata.name
+                    ));
+                }
+            }
+            ResourceManifest::Job(job) => {
+                if let Some(value) = kubernetes_job_value(job, manifests)? {
+                    rendered.push(value);
+                } else {
+                    warnings.push(format!(
+                        "skipped Job '{}/{}' because only worker-backed jobs currently compile to Kubernetes",
+                        job.namespace_key(),
+                        job.metadata.name
+                    ));
+                }
+            }
+            ResourceManifest::CronJob(cron_job) => {
+                if let Some(value) = kubernetes_cron_job_value(cron_job, manifests)? {
+                    rendered.push(value);
+                } else {
+                    warnings.push(format!(
+                        "skipped CronJob '{}/{}' because only worker-backed cron jobs currently compile to Kubernetes",
+                        cron_job.namespace_key(),
+                        cron_job.metadata.name
+                    ));
+                }
+            }
+            ResourceManifest::Deployment(deployment) => warnings.push(format!(
+                "skipped Deployment '{}/{}' because Kubernetes pod-template rendering is not implemented yet",
+                deployment.namespace_key(),
+                deployment.metadata.name
+            )),
+            ResourceManifest::ReplicaSet(replica_set) => warnings.push(format!(
+                "skipped ReplicaSet '{}/{}' because ReplicaSets are controller-generated local rollout history",
+                replica_set.namespace_key(),
+                replica_set.metadata.name
+            )),
+            ResourceManifest::Application(application) => warnings.push(format!(
+                "skipped Application '{}/{}' because GitOps Applications do not map directly to a single Kubernetes object",
+                application.namespace_key(),
+                application.metadata.name
+            )),
+            ResourceManifest::Volume(volume) => warnings.push(format!(
+                "skipped Volume '{}/{}' because jarvisctl Volume resources do not yet declare a Kubernetes storage class or claim template",
+                volume.namespace_key(),
+                volume.metadata.name
+            )),
+        }
+    }
+    Ok(KubernetesCompilation {
+        manifests: rendered,
+        warnings,
+    })
+}
+
+fn kubernetes_metadata_value(
+    metadata: &ResourceMetadata,
+    cluster_scoped: bool,
+    extra_labels: BTreeMap<String, String>,
+    extra_annotations: BTreeMap<String, String>,
+    explicit_name: Option<String>,
+) -> serde_json::Value {
+    let mut labels = metadata.labels.clone();
+    labels.extend(extra_labels);
+    let mut annotations = metadata.annotations.clone();
+    annotations.extend(extra_annotations);
+    let mut value = serde_json::Map::new();
+    value.insert(
+        "name".to_string(),
+        json!(explicit_name.unwrap_or_else(|| metadata.name.clone())),
+    );
+    if !cluster_scoped {
+        value.insert(
+            "namespace".to_string(),
+            json!(normalize_namespaced_resource_namespace(
+                metadata.namespace.as_deref()
+            )),
+        );
+    }
+    if !labels.is_empty() {
+        value.insert("labels".to_string(), json!(labels));
+    }
+    if !annotations.is_empty() {
+        value.insert("annotations".to_string(), json!(annotations));
+    }
+    serde_json::Value::Object(value)
+}
+
+fn kubernetes_namespace_value(manifest: &ResourceEnvelope<NamespaceSpec>) -> serde_json::Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": kubernetes_metadata_value(
+            &manifest.metadata,
+            true,
+            BTreeMap::from([("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string())]),
+            BTreeMap::new(),
+            None,
+        ),
+    })
+}
+
+fn kubernetes_config_map_value(manifest: &ResourceEnvelope<ConfigMapSpec>) -> serde_json::Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": kubernetes_metadata_value(
+            &manifest.metadata,
+            false,
+            BTreeMap::from([("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string())]),
+            BTreeMap::new(),
+            None,
+        ),
+        "data": manifest.spec.data,
+    })
+}
+
+fn kubernetes_secret_value(manifest: &ResourceEnvelope<SecretSpec>) -> serde_json::Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "type": "Opaque",
+        "metadata": kubernetes_metadata_value(
+            &manifest.metadata,
+            false,
+            BTreeMap::from([("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string())]),
+            BTreeMap::new(),
+            None,
+        ),
+        "stringData": manifest.spec.string_data,
+    })
+}
+
+fn kubernetes_network_policy_value(
+    manifest: &ResourceEnvelope<NetworkPolicySpec>,
+) -> serde_json::Value {
+    json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": kubernetes_metadata_value(
+            &manifest.metadata,
+            false,
+            BTreeMap::from([("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string())]),
+            BTreeMap::new(),
+            None,
+        ),
+        "spec": {
+            "podSelector": manifest.spec.pod_selector,
+            "policyTypes": effective_network_policy_types(&manifest.spec),
+            "ingress": manifest.spec.ingress,
+            "egress": manifest.spec.egress,
+        }
+    })
+}
+
+fn kubernetes_worker_info_value(
+    manifest: &ResourceEnvelope<WorkerSpec>,
+) -> anyhow::Result<serde_json::Value> {
+    let config_map_name = format!("jarvisctl-worker-{}", slugify(&manifest.metadata.name));
+    let mut data = BTreeMap::new();
+    data.insert(
+        "provider".to_string(),
+        worker_provider_name(manifest.spec.provider).to_string(),
+    );
+    data.insert("model".to_string(), manifest.spec.model.clone());
+    data.insert("endpoint".to_string(), worker_endpoint(manifest));
+    data.insert(
+        "locality".to_string(),
+        worker_locality_name(&effective_worker_locality(manifest)).to_string(),
+    );
+    if let Some(role) = manifest.spec.role.as_ref() {
+        data.insert("role".to_string(), role.clone());
+    }
+    if let Some(pool) = manifest.spec.pool.as_ref() {
+        data.insert("pool".to_string(), pool.clone());
+    }
+    if !manifest.spec.classes.is_empty() {
+        data.insert("classes".to_string(), manifest.spec.classes.join(","));
+    }
+    if !manifest.spec.capabilities.is_empty() {
+        data.insert(
+            "capabilities".to_string(),
+            manifest.spec.capabilities.join(","),
+        );
+    }
+    if let Some(prompt) = manifest.spec.system_prompt.as_ref() {
+        data.insert("systemPrompt".to_string(), prompt.clone());
+    }
+    Ok(json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": kubernetes_metadata_value(
+            &manifest.metadata,
+            false,
+            BTreeMap::from([
+                ("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string()),
+                ("jarvisctl.io/resource-kind".to_string(), "Worker".to_string()),
+            ]),
+            BTreeMap::from([
+                ("jarvisctl.io/source-kind".to_string(), "Worker".to_string()),
+                ("jarvisctl.io/source-name".to_string(), manifest.metadata.name.clone()),
+            ]),
+            Some(config_map_name),
+        ),
+        "data": data,
+    }))
+}
+
+fn kubernetes_worker_service_info_value(
+    manifest: &ResourceEnvelope<ServiceSpec>,
+) -> anyhow::Result<serde_json::Value> {
+    let config_map_name = format!("jarvisctl-service-{}", slugify(&manifest.metadata.name));
+    let mut data = BTreeMap::new();
+    data.insert("targetKind".to_string(), "worker".to_string());
+    data.insert(
+        "strategy".to_string(),
+        match manifest.spec.strategy {
+            ServiceRoutingStrategy::FirstReady => "first_ready".to_string(),
+            ServiceRoutingStrategy::RoundRobin => "round_robin".to_string(),
+        },
+    );
+    if let Some(class_name) = manifest.spec.class_name.as_ref() {
+        data.insert("className".to_string(), class_name.clone());
+    }
+    if !manifest.spec.fallback_class_names.is_empty() {
+        data.insert(
+            "fallbackClassNames".to_string(),
+            manifest.spec.fallback_class_names.join(","),
+        );
+    }
+    if !manifest.spec.required_capabilities.is_empty() {
+        data.insert(
+            "requiredCapabilities".to_string(),
+            manifest.spec.required_capabilities.join(","),
+        );
+    }
+    if !manifest.spec.preferred_providers.is_empty() {
+        data.insert(
+            "preferredProviders".to_string(),
+            manifest
+                .spec
+                .preferred_providers
+                .iter()
+                .map(|provider| worker_provider_name(*provider))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    data.insert(
+        "preferLocal".to_string(),
+        if manifest.spec.prefer_local {
+            "true"
+        } else {
+            "false"
+        }
+        .to_string(),
+    );
+    data.insert(
+        "selector".to_string(),
+        serde_json::to_string(&manifest.spec.selector)
+            .context("failed to encode worker service selector")?,
+    );
+    Ok(json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": kubernetes_metadata_value(
+            &manifest.metadata,
+            false,
+            BTreeMap::from([
+                ("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string()),
+                ("jarvisctl.io/resource-kind".to_string(), "Service".to_string()),
+            ]),
+            BTreeMap::from([
+                ("jarvisctl.io/source-kind".to_string(), "Service".to_string()),
+                ("jarvisctl.io/source-name".to_string(), manifest.metadata.name.clone()),
+            ]),
+            Some(config_map_name),
+        ),
+        "data": data,
+    }))
+}
+
+fn kubernetes_job_value(
+    manifest: &ResourceEnvelope<JobSpec>,
+    sources: &[ResourceManifest],
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let Some(worker_request) = manifest.spec.worker.as_ref() else {
+        return Ok(None);
+    };
+    let resolved =
+        resolve_kubernetes_worker_request(worker_request, manifest.namespace_key(), sources)?;
+    let job_spec = kubernetes_worker_job_spec_value(
+        &manifest.metadata,
+        manifest.namespace_key(),
+        worker_request,
+        &resolved,
+        manifest.spec.backoff_limit,
+        manifest.spec.parallelism,
+        manifest.spec.completions,
+        manifest.spec.suspend,
+    )?;
+    Ok(Some(json!({
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": kubernetes_metadata_value(
+            &manifest.metadata,
+            false,
+            BTreeMap::from([("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string())]),
+            BTreeMap::new(),
+            None,
+        ),
+        "spec": job_spec,
+    })))
+}
+
+fn kubernetes_cron_job_value(
+    manifest: &ResourceEnvelope<CronJobSpec>,
+    sources: &[ResourceManifest],
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let Some(worker_request) = manifest.spec.job_template.spec.worker.as_ref() else {
+        return Ok(None);
+    };
+    let resolved =
+        resolve_kubernetes_worker_request(worker_request, manifest.namespace_key(), sources)?;
+    let job_template_spec = kubernetes_worker_job_spec_value(
+        &manifest.metadata,
+        manifest.namespace_key(),
+        worker_request,
+        &resolved,
+        manifest.spec.job_template.spec.backoff_limit,
+        manifest.spec.job_template.spec.parallelism,
+        manifest.spec.job_template.spec.completions,
+        manifest.spec.job_template.spec.suspend,
+    )?;
+    Ok(Some(json!({
+        "apiVersion": "batch/v1",
+        "kind": "CronJob",
+        "metadata": kubernetes_metadata_value(
+            &manifest.metadata,
+            false,
+            BTreeMap::from([("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string())]),
+            BTreeMap::new(),
+            None,
+        ),
+        "spec": {
+            "schedule": manifest.spec.schedule,
+            "suspend": manifest.spec.suspend,
+            "concurrencyPolicy": match manifest.spec.concurrency_policy {
+                CronJobConcurrencyPolicy::Allow => "Allow",
+                CronJobConcurrencyPolicy::Forbid => "Forbid",
+                CronJobConcurrencyPolicy::Replace => "Replace",
+            },
+            "successfulJobsHistoryLimit": manifest.spec.successful_jobs_history_limit,
+            "failedJobsHistoryLimit": manifest.spec.failed_jobs_history_limit,
+            "jobTemplate": {
+                "spec": job_template_spec
+            }
+        }
+    })))
+}
+
+fn kubernetes_worker_job_spec_value(
+    metadata: &ResourceMetadata,
+    control_namespace: &str,
+    worker_request: &WorkerJobSpec,
+    resolved: &KubernetesResolvedWorker,
+    backoff_limit: usize,
+    parallelism: usize,
+    completions: usize,
+    suspend: bool,
+) -> anyhow::Result<serde_json::Value> {
+    let worker = &resolved.worker;
+    let job_namespace = normalize_namespaced_resource_namespace(Some(control_namespace));
+    let pod_name = slugify(&metadata.name);
+    let mut job_labels = metadata.labels.clone();
+    job_labels.insert("jarvisctl.io/kube-compiled".to_string(), "true".to_string());
+    job_labels.insert(
+        "jarvisctl.io/worker".to_string(),
+        worker.metadata.name.clone(),
+    );
+    job_labels.insert(
+        "jarvisctl.io/provider".to_string(),
+        worker_provider_name(worker.spec.provider).to_string(),
+    );
+    if let Some(service_name) = resolved.service_name.as_ref() {
+        job_labels.insert("jarvisctl.io/service".to_string(), service_name.clone());
+    }
+    if let Some(class_name) = resolved.selected_class.as_ref() {
+        job_labels.insert("jarvisctl.io/class".to_string(), class_name.clone());
+    }
+    let pod_labels = job_labels.clone();
+
+    let mut container_env = vec![
+        json!({"name": "JARVIS_PROVIDER", "value": worker_provider_name(worker.spec.provider)}),
+        json!({"name": "JARVIS_WORKER_NAME", "value": worker.metadata.name}),
+        json!({"name": "JARVIS_WORKER_MODEL", "value": worker.spec.model}),
+        json!({"name": "JARVIS_WORKER_URL", "value": worker_endpoint(worker)}),
+        json!({"name": "JARVIS_OUTPUT_MODE", "value": match effective_worker_output_mode(worker) {
+            WorkerOutputMode::Text => "text",
+            WorkerOutputMode::Json => "json",
+        }}),
+        json!({"name": "JARVIS_PROMPT_B64", "value": BASE64_STANDARD.encode(worker_request.prompt.as_bytes())}),
+    ];
+    if let Some(system_prompt) = worker.spec.system_prompt.as_deref() {
+        container_env.push(json!({
+            "name": "JARVIS_SYSTEM_PROMPT_B64",
+            "value": BASE64_STANDARD.encode(system_prompt.as_bytes())
+        }));
+    }
+    if let Some(service_name) = resolved.service_name.as_ref() {
+        container_env.push(json!({"name": "JARVIS_SERVICE_NAME", "value": service_name}));
+    }
+    if let Some(class_name) = resolved.selected_class.as_ref() {
+        container_env.push(json!({"name": "JARVIS_SELECTED_CLASS", "value": class_name}));
+    }
+    if resolved.fallback_class {
+        container_env.push(json!({"name": "JARVIS_FALLBACK_CLASS", "value": "true"}));
+    }
+    if let Some(intent) = worker_request
+        .intent
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        container_env.push(json!({"name": "JARVIS_INTENT", "value": intent}));
+    }
+    if let Some(output_path) = worker_request
+        .output_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        container_env.push(json!({"name": "JARVIS_WORKER_OUTPUT_PATH", "value": output_path}));
+    }
+    if let Some(temperature) = worker.spec.temperature {
+        container_env.push(json!({"name": "JARVIS_TEMPERATURE", "value": temperature.to_string()}));
+    }
+    if let Some(top_p) = worker.spec.top_p {
+        container_env.push(json!({"name": "JARVIS_TOP_P", "value": top_p.to_string()}));
+    }
+    if let Some(frequency_penalty) = worker.spec.frequency_penalty {
+        container_env.push(
+            json!({"name": "JARVIS_FREQUENCY_PENALTY", "value": frequency_penalty.to_string()}),
+        );
+    }
+    if let Some(presence_penalty) = worker.spec.presence_penalty {
+        container_env.push(
+            json!({"name": "JARVIS_PRESENCE_PENALTY", "value": presence_penalty.to_string()}),
+        );
+    }
+    if let Some(num_predict) = worker.spec.num_predict {
+        container_env.push(json!({"name": "JARVIS_MAX_TOKENS", "value": num_predict.to_string()}));
+    }
+    if let Some(timeout_seconds) = worker_request.timeout_seconds {
+        container_env
+            .push(json!({"name": "JARVIS_TIMEOUT_SECONDS", "value": timeout_seconds.to_string()}));
+    }
+    if let Some(validation) = worker_request.validation.as_ref()
+        && let Some(shell_command) = validation
+            .shell_command
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        container_env.push(json!({
+            "name": "JARVIS_VALIDATION_COMMAND_B64",
+            "value": BASE64_STANDARD.encode(shell_command.as_bytes())
+        }));
+        container_env.push(json!({
+            "name": "JARVIS_VALIDATION_FAIL_ON_FAILURE",
+            "value": if validation.fail_job_on_failure { "true" } else { "false" }
+        }));
+    }
+    if matches!(
+        worker.spec.provider,
+        WorkerProvider::Nvidia | WorkerProvider::Moonshot
+    ) {
+        let secret_ref = worker_api_key_secret_ref(worker).ok_or_else(|| {
+            anyhow!(
+                "worker '{}/{}' needs spec.apiKeySecretRef to compile into a Kubernetes job",
+                worker.namespace_key(),
+                worker.metadata.name
+            )
+        })?;
+        ensure!(
+            secret_ref.namespace == job_namespace,
+            "worker '{}/{}' references secret '{}/{}' outside job namespace '{}'; cross-namespace secret refs are not supported in Kubernetes jobs",
+            worker.namespace_key(),
+            worker.metadata.name,
+            secret_ref.namespace,
+            secret_ref.name,
+            job_namespace
+        );
+        container_env.push(json!({
+            "name": "JARVIS_WORKER_API_KEY",
+            "valueFrom": {
+                "secretKeyRef": {
+                    "name": secret_ref.name,
+                    "key": secret_ref.key
+                }
+            }
+        }));
+    }
+
+    Ok(json!({
+        "parallelism": parallelism,
+        "completions": completions,
+        "backoffLimit": backoff_limit,
+        "suspend": suspend,
+        "template": {
+            "metadata": {
+                "labels": pod_labels
+            },
+            "spec": {
+                "restartPolicy": "Never",
+                "containers": [{
+                    "name": format!("{}-worker", pod_name),
+                    "image": "python:3.12-alpine",
+                    "imagePullPolicy": "IfNotPresent",
+                    "command": ["python", "-c", kubernetes_worker_runner_script()],
+                    "env": container_env,
+                }]
+            }
+        }
+    }))
+}
+
+fn resolve_kubernetes_worker_request(
+    request: &WorkerJobSpec,
+    control_namespace: &str,
+    manifests: &[ResourceManifest],
+) -> anyhow::Result<KubernetesResolvedWorker> {
+    let named_worker = request
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let selector = request.selector.as_ref();
+    let service_name = request
+        .service_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let intent = request
+        .intent
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(Some("task_offload"));
+    let mut worker_namespace = worker_request_namespace(request, control_namespace);
+    let mut candidates = Vec::new();
+    let mut service_policy: Option<ServiceSpec> = None;
+    let mut matched_class: Option<String> = None;
+    let mut fallback_class = false;
+
+    if let Some(name) = named_worker {
+        let worker = manifest_workers_in_namespace(manifests, &worker_namespace)
+            .into_iter()
+            .find(|worker| worker.metadata.name == name)
+            .ok_or_else(|| {
+                anyhow!(
+                    "worker '{}/{}' was not present in the provided manifests",
+                    worker_namespace,
+                    name
+                )
+            })?;
+        candidates.push(worker);
+    } else if let Some(service_name) = service_name {
+        let service_namespace = service_selection_namespace(request, control_namespace);
+        let service = manifest_services_in_namespace(manifests, &service_namespace)
+            .into_iter()
+            .find(|service| service.metadata.name == service_name)
+            .ok_or_else(|| {
+                anyhow!(
+                    "service '{}/{}' was not present in the provided manifests",
+                    service_namespace,
+                    service_name
+                )
+            })?;
+        ensure!(
+            effective_service_target_kind(&service.spec) == ServiceTargetKind::Worker,
+            "service '{}/{}' does not target workers",
+            service.namespace_key(),
+            service.metadata.name
+        );
+        ensure!(
+            service_allows_intent(&service.spec, intent),
+            "service '{}/{}' does not allow intent '{}'",
+            service.namespace_key(),
+            service.metadata.name,
+            intent.unwrap_or("task_offload")
+        );
+        worker_namespace = service_namespace;
+        candidates = manifest_workers_in_namespace(manifests, &worker_namespace)
+            .into_iter()
+            .filter(|worker| worker_matches_service_runtime_policy(&service, worker))
+            .collect();
+        service_policy = Some(service.spec);
+    } else {
+        candidates = manifest_workers_in_namespace(manifests, &worker_namespace);
+    }
+
+    if let Some(selector) = selector {
+        candidates.retain(|worker| worker_labels_match_selector(&worker.metadata.labels, selector));
+    }
+    let required_capabilities = merged_required_capabilities(
+        &request.required_capabilities,
+        service_policy
+            .as_ref()
+            .map(|service| service.required_capabilities.as_slice()),
+    );
+    if !required_capabilities.is_empty() {
+        candidates
+            .retain(|worker| worker_supports_required_capabilities(worker, &required_capabilities));
+    }
+
+    let (effective_class_name, fallback_class_names) =
+        effective_class_policy(request, service_policy.as_ref());
+    let preferred_providers = merged_preferred_providers(
+        &request.preferred_providers,
+        service_policy
+            .as_ref()
+            .map(|service| service.preferred_providers.as_slice()),
+    );
+
+    if let Some(class_name) = effective_class_name.as_deref() {
+        let primary = candidates
+            .iter()
+            .filter(|worker| worker_matches_class(worker, class_name))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !primary.is_empty() {
+            matched_class = Some(class_name.to_string());
+            candidates = primary;
+        } else {
+            for fallback_name in &fallback_class_names {
+                let matches = candidates
+                    .iter()
+                    .filter(|worker| worker_matches_class(worker, fallback_name))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !matches.is_empty() {
+                    matched_class = Some(fallback_name.to_string());
+                    fallback_class = true;
+                    candidates = matches;
+                    break;
+                }
+            }
+        }
+    } else {
+        for fallback_name in &fallback_class_names {
+            let matches = candidates
+                .iter()
+                .filter(|worker| worker_matches_class(worker, fallback_name))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !matches.is_empty() {
+                matched_class = Some(fallback_name.to_string());
+                fallback_class = true;
+                candidates = matches;
+                break;
+            }
+        }
+    }
+
+    ensure!(
+        !candidates.is_empty(),
+        "no worker from the provided manifests matched the Kubernetes job request in namespace '{}'",
+        worker_namespace
+    );
+    sort_static_kubernetes_workers(
+        &mut candidates,
+        &preferred_providers,
+        request.prefer_local
+            || service_policy
+                .as_ref()
+                .map(|service| service.prefer_local)
+                .unwrap_or(false),
+    );
+    Ok(KubernetesResolvedWorker {
+        worker: candidates.remove(0),
+        service_name: service_name.map(ToOwned::to_owned),
+        selected_class: matched_class,
+        fallback_class,
+    })
+}
+
+fn manifest_workers_in_namespace(
+    manifests: &[ResourceManifest],
+    namespace: &str,
+) -> Vec<ResourceEnvelope<WorkerSpec>> {
+    manifests
+        .iter()
+        .filter_map(|manifest| match manifest {
+            ResourceManifest::Worker(worker) if worker.namespace_key() == namespace => {
+                Some(worker.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn manifest_services_in_namespace(
+    manifests: &[ResourceManifest],
+    namespace: &str,
+) -> Vec<ResourceEnvelope<ServiceSpec>> {
+    manifests
+        .iter()
+        .filter_map(|manifest| match manifest {
+            ResourceManifest::Service(service) if service.namespace_key() == namespace => {
+                Some(service.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn sort_static_kubernetes_workers(
+    candidates: &mut [ResourceEnvelope<WorkerSpec>],
+    preferred_providers: &[WorkerProvider],
+    prefer_local: bool,
+) {
+    candidates.sort_by(|left, right| {
+        let left_locality = effective_worker_locality(left);
+        let right_locality = effective_worker_locality(right);
+        if prefer_local {
+            (left_locality != WorkerLocality::Local).cmp(&(right_locality != WorkerLocality::Local))
+        } else {
+            std::cmp::Ordering::Equal
+        }
+        .then_with(|| {
+            provider_preference_rank(left.spec.provider, preferred_providers).cmp(
+                &provider_preference_rank(right.spec.provider, preferred_providers),
+            )
+        })
+        .then_with(|| left.metadata.name.cmp(&right.metadata.name))
+    });
+}
+
+fn kubernetes_worker_runner_script() -> String {
+    r#"
+import base64
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+
+def decode_b64(name: str) -> str:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return ""
+    return base64.b64decode(raw.encode("utf-8")).decode("utf-8")
+
+def maybe_float(name: str):
+    value = os.environ.get(name, "").strip()
+    return float(value) if value else None
+
+def maybe_int(name: str):
+    value = os.environ.get(name, "").strip()
+    return int(value) if value else None
+
+provider = os.environ.get("JARVIS_PROVIDER", "nvidia").strip()
+endpoint = os.environ["JARVIS_WORKER_URL"].strip()
+model = os.environ["JARVIS_WORKER_MODEL"].strip()
+output_mode = os.environ.get("JARVIS_OUTPUT_MODE", "text").strip() or "text"
+prompt = decode_b64("JARVIS_PROMPT_B64").strip()
+system_prompt = decode_b64("JARVIS_SYSTEM_PROMPT_B64").strip()
+validation_command = decode_b64("JARVIS_VALIDATION_COMMAND_B64").strip()
+fail_on_validation = os.environ.get("JARVIS_VALIDATION_FAIL_ON_FAILURE", "false").strip().lower() == "true"
+output_path = os.environ.get("JARVIS_WORKER_OUTPUT_PATH", "").strip() or "/tmp/jarvisctl-output.txt"
+
+if provider == "ollama":
+    final_prompt = f"{system_prompt}\n\nTask:\n{prompt}".strip() if system_prompt else prompt
+    payload = {"model": model, "prompt": final_prompt, "stream": False}
+    temperature = maybe_float("JARVIS_TEMPERATURE")
+    max_tokens = maybe_int("JARVIS_MAX_TOKENS")
+    if temperature is not None or max_tokens is not None:
+        options = {}
+        if temperature is not None:
+            options["temperature"] = temperature
+        if max_tokens is not None:
+            options["num_predict"] = max_tokens
+        payload["options"] = options
+    if output_mode == "json":
+        payload["format"] = "json"
+    url = endpoint.rstrip("/") + "/api/generate"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=maybe_int("JARVIS_TIMEOUT_SECONDS") or 180) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    text = body["response"].strip()
+else:
+    system_parts = []
+    if system_prompt:
+        system_parts.append(system_prompt)
+    if output_mode == "json":
+        system_parts.append("Return only valid JSON with no markdown fences, no commentary, and no surrounding prose.")
+    messages = []
+    if system_parts:
+        messages.append({"role": "system", "content": "\n\n".join(system_parts)})
+    messages.append({"role": "user", "content": prompt})
+    payload = {"model": model, "messages": messages, "stream": False}
+    for env_name, payload_key in [
+        ("JARVIS_TEMPERATURE", "temperature"),
+        ("JARVIS_TOP_P", "top_p"),
+        ("JARVIS_FREQUENCY_PENALTY", "frequency_penalty"),
+        ("JARVIS_PRESENCE_PENALTY", "presence_penalty"),
+    ]:
+        value = maybe_float(env_name)
+        if value is not None:
+            payload[payload_key] = value
+    max_tokens = maybe_int("JARVIS_MAX_TOKENS")
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+    url = endpoint if endpoint.endswith("/chat/completions") else endpoint.rstrip("/") + "/chat/completions"
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    api_key = os.environ.get("JARVIS_WORKER_API_KEY", "").strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=maybe_int("JARVIS_TIMEOUT_SECONDS") or 180) as response:
+        body = json.loads(response.read().decode("utf-8"))
+    content = body["choices"][0]["message"]["content"]
+    if isinstance(content, str):
+        text = content.strip()
+    elif isinstance(content, list):
+        text = "".join(
+            part.get("text", "") or part.get("content", "")
+            for part in content
+            if isinstance(part, dict)
+        ).strip()
+    else:
+        raise SystemExit("unsupported OpenAI-compatible worker response content")
+
+if output_mode == "json":
+    text = json.dumps(json.loads(text), indent=2, sort_keys=True)
+
+with open(output_path, "w", encoding="utf-8") as handle:
+    handle.write(text)
+    if not text.endswith("\n"):
+        handle.write("\n")
+
+print(text)
+
+if validation_command:
+    env = os.environ.copy()
+    env["JARVIS_WORKER_OUTPUT_PATH"] = output_path
+    result = subprocess.run(
+        ["/bin/sh", "-lc", validation_command],
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    if result.returncode != 0 and fail_on_validation:
+        sys.exit(result.returncode)
+"#
+    .trim()
+    .to_string()
 }
 
 pub fn render_get_output(
@@ -12391,5 +13520,109 @@ spec:
             replica_set_runtime_namespaces("app-revision-lab", "app-rollout", 2, 1),
             vec!["app-revision-lab--app-rollout--rev2--r0".to_string()]
         );
+    }
+
+    #[test]
+    fn kubernetes_compiler_resolves_worker_service_into_job() {
+        let manifests = parse_manifest_documents(
+            r#"apiVersion: jarvisctl.io/v1alpha1
+kind: Namespace
+metadata:
+  name: openclaw-kube
+spec: {}
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Secret
+metadata:
+  name: nvidia-build
+  namespace: openclaw-kube
+spec:
+  stringData:
+    apiKey: test-token
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Worker
+metadata:
+  name: kimi-routing
+  namespace: openclaw-kube
+  labels:
+    role: routing
+    stability: stable
+spec:
+  provider: nvidia
+  model: moonshotai/kimi-k2-instruct
+  apiKeySecretRef:
+    name: nvidia-build
+    key: apiKey
+  classes:
+    - junior-routing
+  capabilities:
+    - routing
+    - json
+  outputMode: json
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Service
+metadata:
+  name: routing-svc
+  namespace: openclaw-kube
+spec:
+  targetKind: worker
+  selector:
+    role: routing
+    stability: stable
+  className: junior-routing
+  requiredCapabilities:
+    - json
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Job
+metadata:
+  name: route-titlecase
+  namespace: openclaw-kube
+spec:
+  worker:
+    serviceName: routing-svc
+    serviceNamespace: openclaw-kube
+    prompt: Return strict JSON only.
+"#,
+        )
+        .unwrap();
+
+        let compiled = compile_kubernetes_manifests(&manifests).unwrap();
+        let job = compiled
+            .manifests
+            .iter()
+            .find(|manifest| {
+                manifest.get("kind").and_then(serde_json::Value::as_str) == Some("Job")
+                    && manifest
+                        .get("metadata")
+                        .and_then(|metadata| metadata.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("route-titlecase")
+            })
+            .expect("compiled job manifest");
+        let env = job["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .expect("job env array");
+        let worker_name = env
+            .iter()
+            .find(|entry| {
+                entry.get("name").and_then(serde_json::Value::as_str) == Some("JARVIS_WORKER_NAME")
+            })
+            .and_then(|entry| entry.get("value"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(worker_name, Some("kimi-routing"));
+        let secret_name = env
+            .iter()
+            .find(|entry| {
+                entry.get("name").and_then(serde_json::Value::as_str)
+                    == Some("JARVIS_WORKER_API_KEY")
+            })
+            .and_then(|entry| entry.get("valueFrom"))
+            .and_then(|value| value.get("secretKeyRef"))
+            .and_then(|value| value.get("name"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(secret_name, Some("nvidia-build"));
     }
 }

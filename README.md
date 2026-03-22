@@ -278,6 +278,38 @@ For a concrete hosted-lane setup, see [contrib/openclaw-hosted-workers.yaml](fil
 
 The NVIDIA Build free-endpoint catalog currently shows 94 preview/free models under the `nim_type_preview` filter, but not all of them fit `jarvisctl`'s current bounded text/json worker contract. For that reason the OpenClaw preset separates **stable hot-path lanes** from **experimental catalog lanes**. See [contrib/openclaw-nvidia-free-endpoints.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-nvidia-free-endpoints.yaml) with its matching [contrib/openclaw-nvidia-build-secret.example.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-nvidia-build-secret.example.yaml).
 
+### Render or apply onto Kubernetes
+
+```bash
+jarvisctl kube render \
+  -f contrib/openclaw-nvidia-build-secret.example.yaml \
+  -f contrib/openclaw-nvidia-free-endpoints.yaml \
+  -f contrib/openclaw-kubernetes-smoke.yaml
+
+jarvisctl kube apply \
+  -f contrib/openclaw-nvidia-build-secret.example.yaml \
+  -f contrib/openclaw-nvidia-free-endpoints.yaml \
+  -f contrib/openclaw-kubernetes-smoke.yaml \
+  --context archiebald-k3s
+```
+
+`jarvisctl kube render` compiles a supported subset of `jarvisctl` resources into native Kubernetes YAML. Right now that includes:
+
+* `Namespace -> v1/Namespace`
+* `ConfigMap -> v1/ConfigMap`
+* `Secret -> v1/Secret`
+* `NetworkPolicy -> networking.k8s.io/v1/NetworkPolicy`
+* `Job(spec.worker) -> batch/v1/Job`
+* `CronJob(spec.jobTemplate.spec.worker) -> batch/v1/CronJob`
+* `Worker -> v1/ConfigMap` metadata surface for cluster inspection
+* `Service(targetKind=worker) -> v1/ConfigMap` routing metadata surface for cluster inspection
+
+Worker-backed Kubernetes jobs execute inside the cluster and call the selected worker endpoint directly. For hosted NVIDIA lanes this means the K3s pod makes the `chat/completions` request itself using the referenced Kubernetes `Secret`, while `jarvisctl` still does the service-to-worker routing decision at compile time.
+
+`jarvisctl kube apply --dry-run-server` automatically falls back to a client dry run when the rendered namespace does not exist yet, because Kubernetes cannot perform a server-side dry run for namespaced objects inside a namespace that has not actually been created.
+
+For the current OpenClaw cluster smoke on this machine, use [contrib/openclaw-kubernetes-smoke.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-kubernetes-smoke.yaml) together with [contrib/openclaw-nvidia-free-endpoints.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-nvidia-free-endpoints.yaml) and [contrib/openclaw-nvidia-build-secret.example.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-nvidia-build-secret.example.yaml). The stable cluster hot path remains `routing-svc -> kimi-routing` and `code-svc -> kimi-code`.
+
 Stable services in that preset:
 
 * `routing-svc`: `moonshotai/kimi-k2-instruct`
