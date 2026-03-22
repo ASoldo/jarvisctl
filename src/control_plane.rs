@@ -29,6 +29,7 @@ use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 const API_VERSION: &str = "jarvisctl.io/v1alpha1";
 const JOB_COMPLETION_GRACE_MS: u128 = 5_000;
+const WORKER_RUN_STARTUP_GRACE_MS: u128 = 2_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum ControlPlaneOutput {
@@ -4239,6 +4240,41 @@ fn save_worker_run_completion(
     atomic_write_string(&path, &raw)
 }
 
+fn worker_run_launch_needs_recovery(run: &JobRunState, manifest_exists: bool, now: u128) -> bool {
+    if run.backend != JobRunBackend::Worker || run.status != JobRunPhase::Active || !manifest_exists
+    {
+        return false;
+    }
+    let last_attempt_epoch_ms = run.last_active_epoch_ms.unwrap_or(run.created_at_epoch_ms);
+    now.saturating_sub(last_attempt_epoch_ms) >= WORKER_RUN_STARTUP_GRACE_MS
+}
+
+fn recover_unconsumed_worker_run_launch(
+    control_namespace: &str,
+    job_name: &str,
+    run: &mut JobRunState,
+    now: u128,
+) -> anyhow::Result<()> {
+    let manifest_path =
+        worker_run_manifest_path(control_namespace, job_name, &run.runtime_namespace)?;
+    if !worker_run_launch_needs_recovery(run, manifest_path.exists(), now) {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("failed to read '{}'", manifest_path.display()))?;
+    let launch: WorkerRunLaunchManifest =
+        serde_json::from_str(&raw).context("failed to parse worker-run manifest")?;
+    spawn_worker_run(launch)?;
+    run.last_active_epoch_ms = Some(now);
+    let suffix = "launch manifest was still present; requeued worker helper";
+    run.admission_reason = Some(match run.admission_reason.as_deref() {
+        Some(existing) if existing.contains(suffix) => existing.to_string(),
+        Some(existing) if !existing.trim().is_empty() => format!("{existing}; {suffix}"),
+        _ => suffix.to_string(),
+    });
+    Ok(())
+}
+
 fn spawn_worker_run(manifest: WorkerRunLaunchManifest) -> anyhow::Result<()> {
     let manifest_path = worker_run_manifest_path(
         &manifest.control_namespace,
@@ -7594,6 +7630,12 @@ fn refreshed_job_state(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<J
                 }
             }
             JobRunBackend::Worker => {
+                recover_unconsumed_worker_run_launch(
+                    manifest.namespace_key(),
+                    &manifest.metadata.name,
+                    run,
+                    now,
+                )?;
                 if let Some(completion) = load_worker_run_completion(
                     manifest.namespace_key(),
                     &manifest.metadata.name,
@@ -10351,6 +10393,43 @@ spec:
 
         let phase = job_run_phase(None, Some(&completion), JobRunPhase::Active, 1_000, 2_000);
         assert_eq!(phase, JobRunPhase::Succeeded);
+    }
+
+    #[test]
+    fn worker_run_launch_needs_recovery_for_stale_active_manifest() {
+        let run = JobRunState {
+            name: "run-0".to_string(),
+            runtime_namespace: "workers-lab--recover-demo--j0".to_string(),
+            created_at_epoch_ms: 1_000,
+            backend: JobRunBackend::Worker,
+            worker_name: Some("qwen-junior".to_string()),
+            worker_namespace: Some("workers-lab".to_string()),
+            service_name: None,
+            intent: None,
+            selected_class: None,
+            fallback_class: false,
+            worker_locality: Some(WorkerLocality::Remote),
+            admission_state: Some(JobRunAdmissionState::Granted),
+            admission_code: Some(WorkerAdmissionCode::Ready),
+            validation_state: None,
+            validation_message: None,
+            validation_enforced: false,
+            admission_reason: Some("admitted".to_string()),
+            last_active_epoch_ms: Some(1_000),
+            completed_at_epoch_ms: None,
+            artifact_path: None,
+            output_path: None,
+            last_error: None,
+            status: JobRunPhase::Active,
+        };
+
+        assert!(worker_run_launch_needs_recovery(
+            &run,
+            true,
+            1_000 + WORKER_RUN_STARTUP_GRACE_MS
+        ));
+        assert!(!worker_run_launch_needs_recovery(&run, false, 9_999));
+        assert!(!worker_run_launch_needs_recovery(&run, true, 1_000 + 1_000));
     }
 
     #[test]
