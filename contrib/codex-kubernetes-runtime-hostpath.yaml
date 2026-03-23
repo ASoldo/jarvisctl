@@ -1,0 +1,65 @@
+# Edit the host paths below for your machine before applying.
+#
+# This is the current single-node proof shape:
+# - a baked jarvisctl + Codex runtime image
+# - a hostPath-mounted repo workspace
+# - hostPath-mounted Codex auth/session directories
+# - a runtime Service that jarvisctl can reach via `kube runtime ...`
+#
+# Typical local image flow on a k3s machine:
+#   docker build -f contrib/Dockerfile.kube-runtime -t jarvisctl-kube-runtime:dev .
+#   docker save jarvisctl-kube-runtime:dev | sudo k3s ctr images import -
+#   jarvisctl kube apply -f contrib/codex-kubernetes-runtime-hostpath.yaml --context <context>
+
+apiVersion: jarvisctl.io/v1alpha1
+kind: Namespace
+metadata:
+  name: runtime-lab
+spec: {}
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Deployment
+metadata:
+  name: codex-runtime
+  namespace: runtime-lab
+spec:
+  replicas: 1
+  agents: 1
+  driver: app_server
+  template:
+    # Replace this with your ticket note.
+    task_note: /home/rootster/documents/codex/Tickets/openclaw-runtime-offload-smoke.md
+    # This working directory must match the workspaceHostPath / workspaceMountPath pair below.
+    working_directory: /home/rootster/documents/jarvisctl
+    operator_message: |
+      Start, acknowledge briefly that this Kubernetes-hosted runtime is ready, and then remain parked for operator follow-up.
+    labels:
+      app: codex-runtime
+      lane: codex
+    kubernetes:
+      image: docker.io/library/jarvisctl-kube-runtime:dev
+      imagePullPolicy: Never
+      controlPort: 47999
+      workspaceHostPath: /home/rootster/documents/jarvisctl
+      workspaceMountPath: /home/rootster/documents/jarvisctl
+      env:
+        HOME: /home/rootster
+        PATH: /usr/local/bin:/usr/bin:/bin
+      hostPathMounts:
+        - hostPath: /home/rootster/.codex
+          mountPath: /home/rootster/.codex
+        - hostPath: /home/rootster/documents/codex
+          mountPath: /home/rootster/documents/codex
+        - hostPath: /home/rootster/.jarvis
+          mountPath: /home/rootster/.jarvis
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Service
+metadata:
+  name: runtime-svc
+  namespace: runtime-lab
+spec:
+  targetKind: runtime
+  selector:
+    app: codex-runtime
+    lane: codex

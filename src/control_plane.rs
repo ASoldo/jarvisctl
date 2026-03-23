@@ -1,6 +1,7 @@
 use crate::SessionBackend;
 use crate::codex::{
-    CodexLaunchOptions, CodexRuntimeDriver, enrich_native_sessions, launch_codex_ticket,
+    CodexLaunchOptions, CodexRuntimeDriver, codex_app_manifest_from_prepared,
+    enrich_native_sessions, launch_codex_ticket, prepare_codex_ticket_launch,
 };
 use crate::codex_app::{collect_codex_app_sessions, delete_codex_app_session};
 use crate::native::{
@@ -27,10 +28,13 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
+use tracing::error;
 
 const API_VERSION: &str = "jarvisctl.io/v1alpha1";
 const JOB_COMPLETION_GRACE_MS: u128 = 5_000;
 const WORKER_RUN_STARTUP_GRACE_MS: u128 = 2_000;
+const DEFAULT_KUBERNETES_RUNTIME_IMAGE: &str = "node:25-bookworm-slim";
+const DEFAULT_KUBERNETES_RUNTIME_CONTROL_PORT: u16 = 47832;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum ControlPlaneOutput {
@@ -611,6 +615,62 @@ pub struct DeploymentTemplateSpec {
     pub volumes: Vec<VolumeBindingRef>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubernetes: Option<KubernetesRuntimeSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct KubernetesHostPathMount {
+    #[serde(rename = "hostPath")]
+    pub host_path: String,
+    #[serde(rename = "mountPath")]
+    pub mount_path: String,
+    #[serde(default, rename = "readOnly", skip_serializing_if = "is_false")]
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct KubernetesRuntimeSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    #[serde(
+        default,
+        rename = "imagePullPolicy",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub image_pull_policy: Option<String>,
+    #[serde(
+        default,
+        rename = "serviceAccountName",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub service_account_name: Option<String>,
+    #[serde(
+        default,
+        rename = "controlPort",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub control_port: Option<u16>,
+    #[serde(
+        default,
+        rename = "workspaceHostPath",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workspace_host_path: Option<String>,
+    #[serde(
+        default,
+        rename = "workspaceMountPath",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workspace_mount_path: Option<String>,
+    #[serde(
+        default,
+        rename = "hostPathMounts",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub host_path_mounts: Vec<KubernetesHostPathMount>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1888,9 +1948,11 @@ fn compile_kubernetes_manifests(
             ResourceManifest::Service(service) => {
                 if effective_service_target_kind(&service.spec) == ServiceTargetKind::Worker {
                     rendered.push(kubernetes_worker_service_info_value(service)?);
+                } else if let Some(value) = kubernetes_runtime_service_value(service, manifests)? {
+                    rendered.push(value);
                 } else {
                     warnings.push(format!(
-                        "skipped runtime Service '{}/{}' because Kubernetes service ports are not defined in jarvisctl manifests yet",
+                        "skipped runtime Service '{}/{}' because no matching Kubernetes runtime Deployment exposed a control port",
                         service.namespace_key(),
                         service.metadata.name
                     ));
@@ -1918,11 +1980,17 @@ fn compile_kubernetes_manifests(
                     ));
                 }
             }
-            ResourceManifest::Deployment(deployment) => warnings.push(format!(
-                "skipped Deployment '{}/{}' because Kubernetes pod-template rendering is not implemented yet",
-                deployment.namespace_key(),
-                deployment.metadata.name
-            )),
+            ResourceManifest::Deployment(deployment) => {
+                if let Some(values) = kubernetes_deployment_values(deployment, manifests)? {
+                    rendered.extend(values);
+                } else {
+                    warnings.push(format!(
+                        "skipped Deployment '{}/{}' because spec.template.kubernetes is not set",
+                        deployment.namespace_key(),
+                        deployment.metadata.name
+                    ));
+                }
+            }
             ResourceManifest::ReplicaSet(replica_set) => warnings.push(format!(
                 "skipped ReplicaSet '{}/{}' because ReplicaSets are controller-generated local rollout history",
                 replica_set.namespace_key(),
@@ -2250,6 +2318,532 @@ fn kubernetes_cron_job_value(
             }
         }
     })))
+}
+
+fn kubernetes_deployment_values(
+    manifest: &ResourceEnvelope<DeploymentSpec>,
+    sources: &[ResourceManifest],
+) -> anyhow::Result<Option<Vec<serde_json::Value>>> {
+    let Some(_) = manifest.spec.template.kubernetes.as_ref() else {
+        return Ok(None);
+    };
+    ensure!(
+        manifest.spec.agents == 1,
+        "Deployment '{}/{}' currently compiles to Kubernetes only with spec.agents = 1",
+        manifest.namespace_key(),
+        manifest.metadata.name
+    );
+    ensure!(
+        manifest.spec.replicas <= 1,
+        "Deployment '{}/{}' currently compiles to Kubernetes only with spec.replicas <= 1",
+        manifest.namespace_key(),
+        manifest.metadata.name
+    );
+    ensure!(
+        manifest
+            .spec
+            .driver
+            .unwrap_or(CodexRuntimeDriver::AppServer)
+            == CodexRuntimeDriver::AppServer,
+        "Deployment '{}/{}' currently compiles to Kubernetes only with the app_server driver",
+        manifest.namespace_key(),
+        manifest.metadata.name
+    );
+
+    let namespace_defaults = namespace_defaults_from_sources(manifest.namespace_key(), sources);
+    let template = resolved_deployment_template(manifest, &namespace_defaults);
+    let runtime = template
+        .kubernetes
+        .as_ref()
+        .ok_or_else(|| anyhow!("deployment template lost kubernetes runtime during resolution"))?;
+    let working_directory = template
+        .working_directory
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "Deployment '{}/{}' needs spec.template.working_directory or Namespace default_working_directory for Kubernetes runtime rendering",
+                manifest.namespace_key(),
+                manifest.metadata.name
+            )
+        })?;
+    if let Some(workspace_mount_path) = runtime.workspace_mount_path.as_deref() {
+        ensure!(
+            workspace_mount_path == working_directory,
+            "Deployment '{}/{}' must keep kubernetes.workspaceMountPath equal to spec.template.working_directory for the current hostPath-based Kubernetes runtime proof",
+            manifest.namespace_key(),
+            manifest.metadata.name
+        );
+    }
+    if let Some(workspace_host_path) = runtime.workspace_host_path.as_deref() {
+        ensure!(
+            workspace_host_path == working_directory,
+            "Deployment '{}/{}' must keep kubernetes.workspaceHostPath equal to spec.template.working_directory for the current hostPath-based Kubernetes runtime proof",
+            manifest.namespace_key(),
+            manifest.metadata.name
+        );
+    }
+
+    let control_namespace = manifest.namespace_key().to_string();
+    let control_port = runtime
+        .control_port
+        .unwrap_or(DEFAULT_KUBERNETES_RUNTIME_CONTROL_PORT);
+    let pod_labels = kubernetes_runtime_pod_labels(manifest);
+    let deployment_metadata_labels = pod_labels.clone();
+    let launch_config_map_name =
+        format!("{}-codex-launch", slugify(&manifest.metadata.name)).to_string();
+
+    let prepared = prepare_codex_ticket_launch(&CodexLaunchOptions {
+        backend: SessionBackend::Native,
+        driver: CodexRuntimeDriver::AppServer,
+        task_note: PathBuf::from(&template.task_note),
+        namespace: Some(manifest.metadata.name.clone()),
+        agents: manifest.spec.agents,
+        agent: "agent0".to_string(),
+        fresh_session: true,
+        resume_session_id: None,
+        working_directory: Some(PathBuf::from(working_directory)),
+        prompt_file: None,
+        operator_message: template.operator_message.clone(),
+        images: template.images.iter().map(PathBuf::from).collect(),
+        environment: runtime.env.clone(),
+        context_overlay: RuntimeContextMetadata {
+            control_namespace: Some(control_namespace.clone()),
+            deployment: Some(manifest.metadata.name.clone()),
+            labels: pod_labels.clone(),
+            config_maps: template
+                .config_maps
+                .iter()
+                .map(|reference| env_binding_name(reference).to_string())
+                .collect(),
+            secrets: template
+                .secrets
+                .iter()
+                .map(|reference| env_binding_name(reference).to_string())
+                .collect(),
+            volumes: template
+                .volumes
+                .iter()
+                .map(|reference| volume_binding_name(reference).to_string())
+                .collect(),
+            ..RuntimeContextMetadata::default()
+        },
+        extra_runtime_args: Vec::new(),
+        startup_delay_ms: manifest.spec.startup_delay_ms.unwrap_or(1500),
+        command: template.command.clone(),
+    })?;
+    let launch_manifest = codex_app_manifest_from_prepared(&prepared);
+    let launch_manifest_raw = serde_json::to_string_pretty(&launch_manifest)
+        .context("failed to encode Kubernetes Codex launch manifest")?;
+
+    let (extra_volumes, extra_volume_mounts) =
+        kubernetes_runtime_host_path_volumes(&template, runtime, sources, &control_namespace)?;
+    let env_from = kubernetes_runtime_env_from(&template);
+    let image = runtime
+        .image
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(DEFAULT_KUBERNETES_RUNTIME_IMAGE);
+    let image_pull_policy = runtime
+        .image_pull_policy
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("IfNotPresent");
+    let home_dir = runtime
+        .env
+        .get("HOME")
+        .cloned()
+        .unwrap_or_else(|| "/home/rootster".to_string());
+    let path_value = runtime
+        .env
+        .get("PATH")
+        .cloned()
+        .unwrap_or_else(|| format!("{home_dir}/.local/bin:/usr/local/bin:/usr/bin:/bin"));
+    let mut container_env = vec![
+        json!({"name": "HOME", "value": home_dir}),
+        json!({"name": "PATH", "value": path_value}),
+        json!({"name": "JARVISCTL_CODEX_APP_TCP_HOST", "value": "0.0.0.0"}),
+        json!({"name": "JARVISCTL_CODEX_APP_TCP_PORT", "value": control_port.to_string()}),
+        json!({"name": "JARVIS_KUBERNETES_RUNTIME", "value": "true"}),
+    ];
+    for (key, value) in &runtime.env {
+        if key == "HOME" || key == "PATH" {
+            continue;
+        }
+        container_env.push(json!({"name": key, "value": value}));
+    }
+
+    let mut volumes = vec![json!({
+        "name": "codex-launch-manifest",
+        "configMap": {
+            "name": launch_config_map_name,
+            "items": [{
+                "key": "launch-manifest.json",
+                "path": "launch-manifest.json",
+            }]
+        }
+    })];
+    volumes.extend(extra_volumes);
+
+    let mut volume_mounts = vec![json!({
+        "name": "codex-launch-manifest",
+        "mountPath": "/etc/jarvisctl/launch-manifest.json",
+        "subPath": "launch-manifest.json",
+        "readOnly": true,
+    })];
+    volume_mounts.extend(extra_volume_mounts);
+
+    let mut container = json!({
+        "name": "codex-runtime",
+        "image": image,
+        "imagePullPolicy": image_pull_policy,
+        "command": ["/bin/sh", "-lc", "exec jarvisctl codex-app-session-serve --manifest /etc/jarvisctl/launch-manifest.json"],
+        "env": container_env,
+        "ports": [{
+            "name": "control",
+            "containerPort": control_port,
+            "protocol": "TCP",
+        }],
+        "volumeMounts": volume_mounts,
+        "workingDir": working_directory,
+        "startupProbe": {
+            "tcpSocket": {
+                "port": control_port,
+            },
+            "periodSeconds": 2,
+            "timeoutSeconds": 1,
+            "failureThreshold": 60,
+        },
+        "readinessProbe": {
+            "tcpSocket": {
+                "port": control_port,
+            },
+            "periodSeconds": 2,
+            "timeoutSeconds": 1,
+            "failureThreshold": 15,
+        },
+    });
+    if !env_from.is_empty() {
+        container["envFrom"] = json!(env_from);
+    }
+
+    let mut pod_spec = json!({
+        "restartPolicy": "Always",
+        "containers": [container],
+        "volumes": volumes,
+    });
+    if let Some(service_account_name) = runtime
+        .service_account_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        pod_spec["serviceAccountName"] = json!(service_account_name);
+    }
+
+    Ok(Some(vec![
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": kubernetes_metadata_value(
+                &manifest.metadata,
+                false,
+                BTreeMap::from([
+                    ("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string()),
+                    ("jarvisctl.io/resource-kind".to_string(), "CodexLaunchManifest".to_string()),
+                    ("jarvisctl.io/runtime-namespace".to_string(), manifest.metadata.name.clone()),
+                ]),
+                BTreeMap::from([
+                    ("jarvisctl.io/source-kind".to_string(), "Deployment".to_string()),
+                    ("jarvisctl.io/source-name".to_string(), manifest.metadata.name.clone()),
+                ]),
+                Some(launch_config_map_name.clone()),
+            ),
+            "data": {
+                "launch-manifest.json": launch_manifest_raw,
+            }
+        }),
+        json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": kubernetes_metadata_value(
+                &manifest.metadata,
+                false,
+                BTreeMap::from([
+                    ("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string()),
+                    ("jarvisctl.io/runtime-driver".to_string(), "codex-app".to_string()),
+                    ("jarvisctl.io/runtime-namespace".to_string(), manifest.metadata.name.clone()),
+                ]),
+                BTreeMap::new(),
+                None,
+            ),
+            "spec": {
+                "replicas": manifest.spec.replicas,
+                "selector": {
+                    "matchLabels": pod_labels,
+                },
+                "template": {
+                    "metadata": {
+                        "labels": deployment_metadata_labels,
+                    },
+                    "spec": pod_spec,
+                }
+            }
+        }),
+    ]))
+}
+
+fn kubernetes_runtime_service_value(
+    manifest: &ResourceEnvelope<ServiceSpec>,
+    sources: &[ResourceManifest],
+) -> anyhow::Result<Option<serde_json::Value>> {
+    let targets = kubernetes_runtime_service_targets(manifest, sources)?;
+    let Some(target) = targets.first() else {
+        return Ok(None);
+    };
+    ensure!(
+        targets.len() == 1,
+        "runtime Service '{}/{}' matched multiple runtime deployments: {:?}",
+        manifest.namespace_key(),
+        manifest.metadata.name,
+        targets
+            .iter()
+            .map(|deployment| deployment.metadata.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    let control_port = target
+        .spec
+        .template
+        .kubernetes
+        .as_ref()
+        .and_then(|runtime| runtime.control_port)
+        .unwrap_or(DEFAULT_KUBERNETES_RUNTIME_CONTROL_PORT);
+    Ok(Some(json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": kubernetes_metadata_value(
+            &manifest.metadata,
+            false,
+            BTreeMap::from([
+                ("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string()),
+                (
+                    "jarvisctl.io/runtime-deployment".to_string(),
+                    target.metadata.name.clone(),
+                ),
+            ]),
+            BTreeMap::from([
+                ("jarvisctl.io/source-kind".to_string(), "Service".to_string()),
+                ("jarvisctl.io/source-name".to_string(), manifest.metadata.name.clone()),
+            ]),
+            None,
+        ),
+        "spec": {
+            "selector": manifest.spec.selector,
+            "ports": [{
+                "name": "control",
+                "port": control_port,
+                "targetPort": control_port,
+                "protocol": "TCP",
+            }]
+        }
+    })))
+}
+
+fn kubernetes_runtime_service_targets<'a>(
+    manifest: &ResourceEnvelope<ServiceSpec>,
+    sources: &'a [ResourceManifest],
+) -> anyhow::Result<Vec<&'a ResourceEnvelope<DeploymentSpec>>> {
+    let mut matched_targets = Vec::new();
+    for source in sources {
+        let ResourceManifest::Deployment(deployment) = source else {
+            continue;
+        };
+        if deployment.namespace_key() != manifest.namespace_key() {
+            continue;
+        }
+        let Some(_) = deployment.spec.template.kubernetes.as_ref() else {
+            continue;
+        };
+        if !selector_matches_labels(
+            &manifest.spec.selector,
+            &kubernetes_runtime_pod_labels(deployment),
+        ) {
+            continue;
+        }
+        matched_targets.push(deployment);
+    }
+    Ok(matched_targets)
+}
+
+fn selector_matches_labels(
+    selector: &BTreeMap<String, String>,
+    labels: &BTreeMap<String, String>,
+) -> bool {
+    selector
+        .iter()
+        .all(|(key, value)| labels.get(key) == Some(value))
+}
+
+fn kubernetes_runtime_pod_labels(
+    manifest: &ResourceEnvelope<DeploymentSpec>,
+) -> BTreeMap<String, String> {
+    let mut labels = manifest.metadata.labels.clone();
+    labels.extend(manifest.spec.template.labels.clone());
+    labels.insert(
+        "app.kubernetes.io/name".to_string(),
+        manifest.metadata.name.clone(),
+    );
+    labels.insert(
+        "jarvisctl.io/runtime-driver".to_string(),
+        "codex-app".to_string(),
+    );
+    labels.insert(
+        "jarvisctl.io/runtime-namespace".to_string(),
+        manifest.metadata.name.clone(),
+    );
+    labels.insert(
+        "jarvisctl.io/control-namespace".to_string(),
+        manifest.namespace_key().to_string(),
+    );
+    labels
+}
+
+fn namespace_defaults_from_sources(
+    control_namespace: &str,
+    sources: &[ResourceManifest],
+) -> NamespaceSpec {
+    sources
+        .iter()
+        .find_map(|manifest| match manifest {
+            ResourceManifest::Namespace(namespace)
+                if namespace.metadata.name == control_namespace =>
+            {
+                Some(namespace.spec.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn kubernetes_runtime_env_from(template: &DeploymentTemplateSpec) -> Vec<serde_json::Value> {
+    let mut env_from = Vec::new();
+    for reference in &template.config_maps {
+        let mut entry = json!({
+            "configMapRef": {
+                "name": env_binding_name(reference),
+                "optional": env_binding_optional(reference),
+            }
+        });
+        if let Some(prefix) = env_binding_prefix(reference) {
+            entry["prefix"] = json!(prefix);
+        }
+        env_from.push(entry);
+    }
+    for reference in &template.secrets {
+        let mut entry = json!({
+            "secretRef": {
+                "name": env_binding_name(reference),
+                "optional": env_binding_optional(reference),
+            }
+        });
+        if let Some(prefix) = env_binding_prefix(reference) {
+            entry["prefix"] = json!(prefix);
+        }
+        env_from.push(entry);
+    }
+    env_from
+}
+
+fn kubernetes_runtime_host_path_volumes(
+    template: &DeploymentTemplateSpec,
+    runtime: &KubernetesRuntimeSpec,
+    sources: &[ResourceManifest],
+    control_namespace: &str,
+) -> anyhow::Result<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
+    let mut mounts = Vec::new();
+    if let (Some(workspace_host_path), Some(workspace_mount_path)) = (
+        runtime.workspace_host_path.as_deref(),
+        runtime.workspace_mount_path.as_deref(),
+    ) {
+        mounts.push(KubernetesHostPathMount {
+            host_path: workspace_host_path.to_string(),
+            mount_path: workspace_mount_path.to_string(),
+            read_only: false,
+        });
+    }
+    mounts.extend(runtime.host_path_mounts.clone());
+    mounts.extend(resolved_kubernetes_volume_bindings(
+        &template.volumes,
+        control_namespace,
+        sources,
+    )?);
+
+    let mut volumes = Vec::new();
+    let mut volume_mounts = Vec::new();
+    for (index, mount) in mounts.iter().enumerate() {
+        let volume_name = format!("host-path-{}", index + 1);
+        volumes.push(json!({
+            "name": volume_name,
+            "hostPath": {
+                "path": mount.host_path,
+                "type": "DirectoryOrCreate",
+            }
+        }));
+        volume_mounts.push(json!({
+            "name": volume_name,
+            "mountPath": mount.mount_path,
+            "readOnly": mount.read_only,
+        }));
+    }
+    Ok((volumes, volume_mounts))
+}
+
+fn resolved_kubernetes_volume_bindings(
+    references: &[VolumeBindingRef],
+    control_namespace: &str,
+    sources: &[ResourceManifest],
+) -> anyhow::Result<Vec<KubernetesHostPathMount>> {
+    let mut mounts = Vec::new();
+    for reference in references {
+        let name = volume_binding_name(reference);
+        let manifest = sources.iter().find_map(|manifest| match manifest {
+            ResourceManifest::Volume(volume)
+                if volume.namespace_key() == control_namespace && volume.metadata.name == name =>
+            {
+                Some(volume)
+            }
+            _ => None,
+        });
+        let Some(volume) = manifest else {
+            if volume_binding_optional(reference) {
+                continue;
+            }
+            bail!(
+                "missing Volume '{}/{}' while compiling Kubernetes runtime Deployment",
+                control_namespace,
+                name
+            );
+        };
+        let selected_paths = if volume_binding_paths(reference).is_empty() {
+            volume.spec.paths.clone()
+        } else {
+            volume
+                .spec
+                .paths
+                .iter()
+                .filter(|path| volume_binding_paths(reference).contains(path))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for path in selected_paths {
+            mounts.push(KubernetesHostPathMount {
+                host_path: path.clone(),
+                mount_path: path,
+                read_only: false,
+            });
+        }
+    }
+    Ok(mounts)
 }
 
 fn kubernetes_worker_job_spec_value(
@@ -3872,6 +4466,100 @@ fn validate_template_bindings(
             name
         );
     }
+    if let Some(kubernetes) = template.kubernetes.as_ref() {
+        validate_kubernetes_runtime(kubernetes, kind, name)?;
+    }
+    Ok(())
+}
+
+fn validate_kubernetes_runtime(
+    runtime: &KubernetesRuntimeSpec,
+    kind: &str,
+    name: &str,
+) -> anyhow::Result<()> {
+    if let Some(image) = runtime.image.as_deref() {
+        ensure!(
+            !image.trim().is_empty(),
+            "{} '{}' has an empty kubernetes.image",
+            kind,
+            name
+        );
+    }
+    if let Some(policy) = runtime.image_pull_policy.as_deref() {
+        ensure!(
+            !policy.trim().is_empty(),
+            "{} '{}' has an empty kubernetes.imagePullPolicy",
+            kind,
+            name
+        );
+    }
+    if let Some(service_account_name) = runtime.service_account_name.as_deref() {
+        ensure!(
+            !service_account_name.trim().is_empty(),
+            "{} '{}' has an empty kubernetes.serviceAccountName",
+            kind,
+            name
+        );
+    }
+    if let Some(control_port) = runtime.control_port {
+        ensure!(
+            control_port > 0,
+            "{} '{}' must set kubernetes.controlPort > 0",
+            kind,
+            name
+        );
+    }
+    if runtime.workspace_host_path.is_some() || runtime.workspace_mount_path.is_some() {
+        ensure!(
+            runtime
+                .workspace_host_path
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty()),
+            "{} '{}' must set both kubernetes.workspaceHostPath and kubernetes.workspaceMountPath together",
+            kind,
+            name
+        );
+        ensure!(
+            runtime
+                .workspace_mount_path
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty()),
+            "{} '{}' must set both kubernetes.workspaceHostPath and kubernetes.workspaceMountPath together",
+            kind,
+            name
+        );
+    }
+    for mount in &runtime.host_path_mounts {
+        ensure!(
+            !mount.host_path.trim().is_empty(),
+            "{} '{}' has a kubernetes.hostPathMounts entry with an empty hostPath",
+            kind,
+            name
+        );
+        ensure!(
+            !mount.mount_path.trim().is_empty(),
+            "{} '{}' has a kubernetes.hostPathMounts entry with an empty mountPath",
+            kind,
+            name
+        );
+    }
+    for (key, value) in &runtime.env {
+        ensure!(
+            !key.trim().is_empty(),
+            "{} '{}' has an empty kubernetes.env key",
+            kind,
+            name
+        );
+        ensure!(
+            !value.trim().is_empty(),
+            "{} '{}' has an empty kubernetes.env value for '{}'",
+            kind,
+            name,
+            key
+        );
+    }
     Ok(())
 }
 
@@ -3946,28 +4634,45 @@ fn atomic_write_string(path: &Path, raw: &str) -> anyhow::Result<()> {
 fn reconcile_control_plane() -> anyhow::Result<Vec<String>> {
     let mut messages = Vec::new();
 
-    for manifest in load_manifests_by_kind(ResourceKind::Application, None)? {
-        if let Some(message) = reconcile_manifest(&manifest)? {
-            messages.push(message);
-        }
-    }
-    for manifest in load_manifests_by_kind(ResourceKind::CronJob, None)? {
-        if let Some(message) = reconcile_manifest(&manifest)? {
-            messages.push(message);
-        }
-    }
-    for manifest in load_manifests_by_kind(ResourceKind::Job, None)? {
-        if let Some(message) = reconcile_manifest(&manifest)? {
-            messages.push(message);
-        }
-    }
-    for manifest in load_manifests_by_kind(ResourceKind::Deployment, None)? {
-        if let Some(message) = reconcile_manifest(&manifest)? {
-            messages.push(message);
-        }
-    }
+    reconcile_manifest_batch(
+        load_manifests_by_kind(ResourceKind::Application, None)?,
+        &mut messages,
+    );
+    reconcile_manifest_batch(
+        load_manifests_by_kind(ResourceKind::CronJob, None)?,
+        &mut messages,
+    );
+    reconcile_manifest_batch(
+        load_manifests_by_kind(ResourceKind::Job, None)?,
+        &mut messages,
+    );
+    reconcile_manifest_batch(
+        load_manifests_by_kind(ResourceKind::Deployment, None)?,
+        &mut messages,
+    );
 
     Ok(messages)
+}
+
+fn reconcile_manifest_batch(manifests: Vec<ResourceManifest>, messages: &mut Vec<String>) {
+    for manifest in manifests {
+        match reconcile_manifest(&manifest) {
+            Ok(Some(message)) => messages.push(message),
+            Ok(None) => {}
+            Err(err) => {
+                let scope = manifest
+                    .namespace()
+                    .map(|namespace| format!("{namespace}/{}", manifest.name()))
+                    .unwrap_or_else(|| manifest.name().to_string());
+                error!(
+                    "failed to reconcile {} '{}': {:#}",
+                    manifest.kind().display_name(),
+                    scope,
+                    err
+                );
+            }
+        }
+    }
 }
 
 fn reconcile_manifest(manifest: &ResourceManifest) -> anyhow::Result<Option<String>> {
@@ -10601,15 +11306,25 @@ fn ollama_model_loaded(model: &str) -> anyhow::Result<bool> {
         .arg("ps")
         .output()
         .context("failed to execute 'ollama ps'")?;
-    ensure!(
-        output.status.success(),
-        "'ollama ps' failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if ollama_backend_unavailable(&stderr) {
+            return Ok(false);
+        }
+        ensure!(false, "'ollama ps' failed: {}", stderr);
+    }
     let stdout = String::from_utf8(output.stdout).context("ollama ps returned non-utf8 output")?;
     Ok(stdout
         .lines()
         .any(|line| line.split_whitespace().next() == Some(model)))
+}
+
+fn ollama_backend_unavailable(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("could not connect to ollama server")
+        || stderr.contains("connection refused")
+        || stderr.contains("failed to connect")
+        || stderr.contains("no such file or directory")
 }
 
 fn worker_endpoint(manifest: &ResourceEnvelope<WorkerSpec>) -> String {
@@ -13624,5 +14339,192 @@ spec:
             .and_then(|value| value.get("name"))
             .and_then(serde_json::Value::as_str);
         assert_eq!(secret_name, Some("nvidia-build"));
+    }
+
+    #[test]
+    fn kubernetes_compiler_renders_codex_runtime_deployment_and_service() {
+        let _home_guard = home_env_lock().lock().unwrap();
+        let temp_home = TempHomeGuard::new("jarvisctl-kube-runtime-render");
+        let repo_dir = temp_home.root.join("repo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        let ticket_path = temp_home.root.join("runtime-ticket.md");
+        write_text_file(
+            &ticket_path,
+            &format!(
+                r#"---
+title: Kube Runtime Ticket
+type: ticket
+owner: codex
+repo_path: {}
+---
+
+# Kube Runtime Ticket
+
+## Request
+- Launch Codex inside Kubernetes from the same ticket contract.
+"#,
+                repo_dir.display()
+            ),
+        );
+
+        let manifests = parse_manifest_documents(&format!(
+            r#"apiVersion: jarvisctl.io/v1alpha1
+kind: Namespace
+metadata:
+  name: runtime-lab
+spec: {{}}
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Deployment
+metadata:
+  name: codex-runtime
+  namespace: runtime-lab
+spec:
+  replicas: 1
+  agents: 1
+  driver: app_server
+  template:
+    task_note: {ticket_path}
+    working_directory: {repo_dir}
+    labels:
+      app: codex-runtime
+      lane: codex
+    kubernetes:
+      image: ghcr.io/example/jarvisctl:dev
+      imagePullPolicy: IfNotPresent
+      controlPort: 47999
+      workspaceHostPath: {repo_dir}
+      workspaceMountPath: {repo_dir}
+      env:
+        HOME: /home/rootster
+        EXTRA_FLAG: enabled
+---
+apiVersion: jarvisctl.io/v1alpha1
+kind: Service
+metadata:
+  name: runtime-svc
+  namespace: runtime-lab
+spec:
+  selector:
+    app: codex-runtime
+    lane: codex
+"#,
+            ticket_path = ticket_path.display(),
+            repo_dir = repo_dir.display(),
+        ))
+        .unwrap();
+
+        let compiled = compile_kubernetes_manifests(&manifests).unwrap();
+
+        let launch_config = compiled
+            .manifests
+            .iter()
+            .find(|manifest| {
+                manifest.get("kind").and_then(serde_json::Value::as_str) == Some("ConfigMap")
+                    && manifest
+                        .get("metadata")
+                        .and_then(|metadata| metadata.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("codex-runtime-codex-launch")
+            })
+            .expect("compiled launch config map");
+        let launch_manifest_raw = launch_config["data"]["launch-manifest.json"]
+            .as_str()
+            .expect("launch manifest payload");
+        let launch_manifest: serde_json::Value =
+            serde_json::from_str(launch_manifest_raw).expect("launch manifest json");
+        assert_eq!(launch_manifest["namespace"].as_str(), Some("codex-runtime"));
+        assert_eq!(
+            launch_manifest["working_directory"].as_str(),
+            Some(repo_dir.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            launch_manifest["context"]["control_namespace"].as_str(),
+            Some("runtime-lab")
+        );
+
+        let deployment = compiled
+            .manifests
+            .iter()
+            .find(|manifest| {
+                manifest.get("kind").and_then(serde_json::Value::as_str) == Some("Deployment")
+                    && manifest
+                        .get("metadata")
+                        .and_then(|metadata| metadata.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("codex-runtime")
+            })
+            .expect("compiled runtime deployment");
+        let container = &deployment["spec"]["template"]["spec"]["containers"][0];
+        assert_eq!(
+            container["image"].as_str(),
+            Some("ghcr.io/example/jarvisctl:dev")
+        );
+        assert_eq!(
+            container["workingDir"].as_str(),
+            Some(repo_dir.to_string_lossy().as_ref())
+        );
+        assert_eq!(container["ports"][0]["containerPort"].as_u64(), Some(47999));
+        assert_eq!(
+            container["command"][2].as_str(),
+            Some(
+                "exec jarvisctl codex-app-session-serve --manifest /etc/jarvisctl/launch-manifest.json"
+            )
+        );
+        assert_eq!(
+            container["startupProbe"]["tcpSocket"]["port"].as_u64(),
+            Some(47999)
+        );
+        assert_eq!(
+            container["readinessProbe"]["tcpSocket"]["port"].as_u64(),
+            Some(47999)
+        );
+        let env = container["env"].as_array().expect("runtime env");
+        assert!(
+            env.iter().any(|entry| {
+                entry.get("name").and_then(serde_json::Value::as_str)
+                    == Some("JARVISCTL_CODEX_APP_TCP_PORT")
+                    && entry.get("value").and_then(serde_json::Value::as_str) == Some("47999")
+            }),
+            "expected TCP control port env"
+        );
+        assert!(
+            env.iter().any(|entry| {
+                entry.get("name").and_then(serde_json::Value::as_str) == Some("EXTRA_FLAG")
+                    && entry.get("value").and_then(serde_json::Value::as_str) == Some("enabled")
+            }),
+            "expected runtime env passthrough"
+        );
+        let volume_mounts = container["volumeMounts"].as_array().expect("volume mounts");
+        assert!(
+            volume_mounts.iter().any(|entry| {
+                entry.get("mountPath").and_then(serde_json::Value::as_str)
+                    == Some(repo_dir.to_string_lossy().as_ref())
+            }),
+            "expected workspace hostPath mount"
+        );
+
+        let service = compiled
+            .manifests
+            .iter()
+            .find(|manifest| {
+                manifest.get("kind").and_then(serde_json::Value::as_str) == Some("Service")
+                    && manifest
+                        .get("metadata")
+                        .and_then(|metadata| metadata.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("runtime-svc")
+            })
+            .expect("compiled runtime service");
+        assert_eq!(service["spec"]["ports"][0]["port"].as_u64(), Some(47999));
+        assert_eq!(
+            service["spec"]["selector"]["app"].as_str(),
+            Some("codex-runtime")
+        );
+        assert_eq!(service["spec"]["selector"]["lane"].as_str(), Some("codex"));
+        assert_eq!(
+            service["metadata"]["labels"]["jarvisctl.io/runtime-deployment"].as_str(),
+            Some("codex-runtime")
+        );
     }
 }

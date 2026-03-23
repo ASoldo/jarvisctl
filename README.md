@@ -299,14 +299,65 @@ jarvisctl kube apply \
 * `ConfigMap -> v1/ConfigMap`
 * `Secret -> v1/Secret`
 * `NetworkPolicy -> networking.k8s.io/v1/NetworkPolicy`
+* `Deployment(spec.template.kubernetes) -> v1/ConfigMap + apps/v1/Deployment`
 * `Job(spec.worker) -> batch/v1/Job`
 * `CronJob(spec.jobTemplate.spec.worker) -> batch/v1/CronJob`
 * `Worker -> v1/ConfigMap` metadata surface for cluster inspection
+* `Service(targetKind=runtime) -> v1/Service`
 * `Service(targetKind=worker) -> v1/ConfigMap` routing metadata surface for cluster inspection
 
 Worker-backed Kubernetes jobs execute inside the cluster and call the selected worker endpoint directly. For hosted NVIDIA lanes this means the K3s pod makes the `chat/completions` request itself using the referenced Kubernetes `Secret`, while `jarvisctl` still does the service-to-worker routing decision at compile time.
 
+Kubernetes-hosted Codex runtimes use the same ticket launch contract as local `jarvisctl codex`. A `Deployment` with `spec.template.kubernetes` renders:
+
+* a launch `ConfigMap` carrying the prepared app-server manifest
+* an `apps/v1/Deployment` that serves `jarvisctl codex-app-session-serve`
+* an optional runtime `Service` exposing the Codex app control port when a matching `Service(targetKind=runtime)` exists
+
+For a real cluster proof, use a baked runtime image instead of bind-mounting the host `jarvisctl` binary into the pod. The checked-in runtime image and manifest are:
+
+* [contrib/Dockerfile.kube-runtime](file:///home/rootster/documents/jarvisctl/contrib/Dockerfile.kube-runtime)
+* [contrib/codex-kubernetes-runtime-hostpath.yaml](file:///home/rootster/documents/jarvisctl/contrib/codex-kubernetes-runtime-hostpath.yaml)
+
+Typical single-node k3s flow:
+
+```bash
+docker build -f contrib/Dockerfile.kube-runtime -t jarvisctl-kube-runtime:dev .
+docker save jarvisctl-kube-runtime:dev | sudo k3s ctr images import -
+jarvisctl kube apply -f contrib/codex-kubernetes-runtime-hostpath.yaml --context archiebald-k3s
+kubectl --context archiebald-k3s -n runtime-lab rollout status deployment/codex-runtime
+```
+
+The current Kubernetes proof is intentionally narrow:
+
+* `spec.agents` must be `1`
+* `spec.replicas` must be `1`
+* `spec.driver` must be `app_server`
+* `kubernetes.workspaceHostPath` and `kubernetes.workspaceMountPath` must match `spec.template.working_directory`
+
 `jarvisctl kube apply --dry-run-server` automatically falls back to a client dry run when the rendered namespace does not exist yet, because Kubernetes cannot perform a server-side dry run for namespaced objects inside a namespace that has not actually been created.
+
+### Operate a Kubernetes-hosted Codex runtime
+
+Once the compiled Deployment and runtime Service are live in the cluster, `jarvisctl` can reach the in-pod Codex app-server through `kubectl port-forward`:
+
+```bash
+jarvisctl kube runtime metadata --service runtime-svc -n runtime-lab --context archiebald-k3s --json
+jarvisctl kube runtime attach --service runtime-svc -n runtime-lab --context archiebald-k3s
+jarvisctl kube runtime tell --service runtime-svc -n runtime-lab --context archiebald-k3s --text "Continue from the checkpoint." --mode queue
+jarvisctl kube runtime interrupt --service runtime-svc -n runtime-lab --context archiebald-k3s
+jarvisctl kube runtime delete --deployment codex-runtime -n runtime-lab --context archiebald-k3s
+```
+
+These commands accept either `--deployment` or `--service`. `delete` removes the runtime Deployment, its generated `<deployment>-codex-launch` ConfigMap, and any matching runtime Services that resolve to that Deployment.
+
+For the current hostPath-based proof, keep these paths aligned:
+
+* `spec.template.working_directory`
+* `spec.template.kubernetes.workspaceHostPath`
+* `spec.template.kubernetes.workspaceMountPath`
+
+The pod then gets a usable repo workspace plus whatever additional hostPath mounts you provide for `.codex`, the shared vault, and `.jarvis`.
 
 For the current OpenClaw cluster smoke on this machine, use [contrib/openclaw-kubernetes-smoke.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-kubernetes-smoke.yaml) together with [contrib/openclaw-nvidia-free-endpoints.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-nvidia-free-endpoints.yaml) and [contrib/openclaw-nvidia-build-secret.example.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-nvidia-build-secret.example.yaml). The stable cluster hot path remains `routing-svc -> kimi-routing` and `code-svc -> kimi-code`.
 
@@ -539,6 +590,8 @@ By default this:
 
 * discovers `Ops/Codex Dispatch Board.md` plus project `Board.md` files under the vault
 * loads dispatch state from `~/.jarvis/dispatch/<vault>-state.json`
+* polls every `15` seconds unless you override `--interval-seconds`
+* only reloads boards whose file contents changed, plus boards that still own active Codex runs
 * launches only tickets with `owner: codex` and `autostart: true`
 * moves launched cards from `Ready for Codex` to `Codex Working`
 * changes launched ticket `status` to `active`
@@ -680,6 +733,8 @@ install -Dm644 contrib/jarvisctl-dispatch.service ~/.config/systemd/user/jarvisc
 systemctl --user daemon-reload
 systemctl --user enable --now jarvisctl-dispatch.service
 ```
+
+The example service intentionally runs at lower priority with a `15` second interval so it does not compete aggressively with Codex sessions, Ollama, or local cluster workloads on the same machine.
 
 With that service active, moving a linked ticket card into `Ready for Codex` becomes the normal local launch trigger. The dispatcher then owns the board write-back loop:
 

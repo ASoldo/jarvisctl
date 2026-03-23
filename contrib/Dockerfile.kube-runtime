@@ -1,0 +1,36 @@
+FROM rust:1.89-bookworm AS builder
+
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY contrib ./contrib
+
+RUN cargo build --release
+
+FROM node:25-bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        git \
+        iproute2 \
+        procps \
+        ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @openai/codex@0.116.0
+
+COPY --from=builder /src/target/release/jarvisctl /usr/local/bin/jarvisctl
+
+RUN mkdir -p /home/rootster/.jarvis /workspace \
+    && chown -R 1000:1000 /home/rootster /workspace
+
+ENV HOME=/home/rootster
+ENV PATH=/usr/local/bin:/usr/bin:/bin
+
+USER 1000:1000
+WORKDIR /workspace
+
+CMD ["jarvisctl", "--help"]

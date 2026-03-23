@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -30,6 +31,8 @@ const EVENTS_FILE_NAME: &str = "events.log";
 const CONTROL_QUEUE_DIR_NAME: &str = ".jarvisctl-control-queue";
 const CONTROL_QUEUE_REQUESTS_DIR_NAME: &str = "requests";
 const CONTROL_QUEUE_RESPONSES_DIR_NAME: &str = "responses";
+const TCP_CONTROL_PORT_ENV: &str = "JARVISCTL_CODEX_APP_TCP_PORT";
+const TCP_CONTROL_HOST_ENV: &str = "JARVISCTL_CODEX_APP_TCP_HOST";
 const LOG_LIMIT_BYTES: usize = 512 * 1024;
 const FEED_LIMIT: usize = 18;
 const SUBAGENT_LIMIT: usize = 24;
@@ -1009,6 +1012,19 @@ impl CodexAppSession {
     }
 }
 
+fn codex_app_stdout_is_ignorable(line: &str) -> bool {
+    matches!(
+        line,
+        "Debugger attached."
+            | "The debugger will be deactivated again and closed"
+            | "Waiting for the debugger to disconnect..."
+    ) || line.starts_with("Debugger listening on ws://")
+        || line.starts_with("For help, see: https://nodejs.org/en/docs/inspector")
+        || line.starts_with(
+            "OpenTelemetry eBPF Instrumentation has injected instrumentation via the NodeJS debugger",
+        )
+}
+
 pub fn spawn_codex_app_session(
     manifest: CodexAppLaunchManifest,
 ) -> anyhow::Result<NativeSessionMetadata> {
@@ -1157,6 +1173,8 @@ pub fn serve_codex_app_session(manifest_path: PathBuf) -> anyhow::Result<()> {
         .set_nonblocking(true)
         .context("failed to configure codex app listener")?;
 
+    let tcp_listener = codex_app_tcp_listener()?;
+
     let startup_session = Arc::clone(&session);
     let startup_manifest = manifest;
     thread::spawn(move || {
@@ -1188,6 +1206,11 @@ pub fn serve_codex_app_session(manifest_path: PathBuf) -> anyhow::Result<()> {
             let value: Value = match serde_json::from_str(trimmed) {
                 Ok(value) => value,
                 Err(error) => {
+                    if codex_app_stdout_is_ignorable(trimmed) {
+                        let _ = stdout_session
+                            .append_text_line(format!("[stdout ignored] {}", trimmed));
+                        continue;
+                    }
                     let _ = stdout_session.record_error(&format!(
                         "failed to decode app-server message: {} ({})",
                         error, trimmed
@@ -1257,6 +1280,28 @@ pub fn serve_codex_app_session(manifest_path: PathBuf) -> anyhow::Result<()> {
             thread::sleep(Duration::from_millis(50));
         }
     });
+
+    if let Some(tcp_listener) = tcp_listener {
+        let tcp_session = Arc::clone(&session);
+        thread::spawn(move || {
+            while !tcp_session.shutdown_requested.load(Ordering::SeqCst) {
+                match tcp_listener.accept() {
+                    Ok((stream, _)) => {
+                        let session = Arc::clone(&tcp_session);
+                        thread::spawn(move || {
+                            let _ = handle_tcp_client(stream, session);
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(_) => {
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     while !session.shutdown_requested.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -1502,31 +1547,46 @@ fn handle_client(stream: UnixStream, session: Arc<CodexAppSession>) -> anyhow::R
         .try_clone()
         .context("failed to clone codex app client stream")?;
     let mut reader = BufReader::new(stream);
-    let request = read_client_message(&mut reader)?;
+    handle_client_stream(&mut reader, &mut writer, session)
+}
 
+fn handle_tcp_client(stream: TcpStream, session: Arc<CodexAppSession>) -> anyhow::Result<()> {
+    let mut writer = stream
+        .try_clone()
+        .context("failed to clone codex app tcp client stream")?;
+    let mut reader = BufReader::new(stream);
+    handle_client_stream(&mut reader, &mut writer, session)
+}
+
+fn handle_client_stream(
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+    session: Arc<CodexAppSession>,
+) -> anyhow::Result<()> {
+    let request = read_client_message(reader)?;
     match request {
         ClientMessage::Attach { .. } => {
             let (backlog, rx) = session.subscribe();
             send_server_message(
-                &mut writer,
+                writer,
                 &ServerMessage::Attached {
                     namespace: session.namespace.clone(),
                     agent: "agent0".to_string(),
                 },
             )?;
             if !backlog.is_empty() {
-                send_output(&mut writer, &backlog)?;
+                send_output(writer, &backlog)?;
             }
             while let Ok(chunk) = rx.recv() {
                 if chunk.is_empty() {
                     continue;
                 }
-                if send_output(&mut writer, &chunk).is_err() {
+                if send_output(writer, &chunk).is_err() {
                     break;
                 }
             }
             let _ = send_server_message(
-                &mut writer,
+                writer,
                 &ServerMessage::Exited {
                     agent: "agent0".to_string(),
                 },
@@ -1539,10 +1599,9 @@ fn handle_client(stream: UnixStream, session: Arc<CodexAppSession>) -> anyhow::R
                     message: error.to_string(),
                 },
             };
-            send_server_message(&mut writer, &response)?;
+            send_server_message(writer, &response)?;
         }
     }
-
     Ok(())
 }
 
@@ -1630,6 +1689,145 @@ pub fn request_worker_offload_via_runtime_namespace(
     }
 }
 
+fn request_over_tcp_endpoint(
+    host: &str,
+    port: u16,
+    message: &ClientMessage,
+) -> anyhow::Result<ServerMessage> {
+    let host = host.trim();
+    ensure!(!host.is_empty(), "tcp host must not be empty");
+    ensure!(port > 0, "tcp port must be greater than zero");
+    let address = format!("{host}:{port}");
+    let mut stream = TcpStream::connect(&address)
+        .with_context(|| format!("failed to connect codex app tcp control '{address}'"))?;
+    send_message(&mut stream, message)?;
+    let mut reader = BufReader::new(stream);
+    read_server_message(&mut reader)
+}
+
+pub fn codex_app_session_metadata_tcp(
+    host: &str,
+    port: u16,
+) -> anyhow::Result<NativeSessionMetadata> {
+    match request_over_tcp_endpoint(host, port, &ClientMessage::Metadata)? {
+        ServerMessage::Metadata(metadata) => Ok(metadata),
+        ServerMessage::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected metadata response from codex app tcp control '{}:{}': {:?}",
+            host,
+            port,
+            other
+        )),
+    }
+}
+
+pub fn tell_codex_app_with_mode_tcp(
+    host: &str,
+    port: u16,
+    contents: &str,
+    mode: CodexAppInputMode,
+) -> anyhow::Result<()> {
+    match request_over_tcp_endpoint(
+        host,
+        port,
+        &ClientMessage::SendText {
+            text: contents.to_string(),
+            mode,
+        },
+    )? {
+        ServerMessage::Ok => Ok(()),
+        ServerMessage::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected tell response from codex app tcp control '{}:{}': {:?}",
+            host,
+            port,
+            other
+        )),
+    }
+}
+
+pub fn interrupt_codex_app_tcp(host: &str, port: u16) -> anyhow::Result<()> {
+    match request_over_tcp_endpoint(host, port, &ClientMessage::Interrupt)? {
+        ServerMessage::Ok => Ok(()),
+        ServerMessage::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected interrupt response from codex app tcp control '{}:{}': {:?}",
+            host,
+            port,
+            other
+        )),
+    }
+}
+
+pub fn attach_codex_app_tcp(host: &str, port: u16, namespace: &str) -> anyhow::Result<()> {
+    let address = format!("{host}:{port}");
+    let mut stream = TcpStream::connect(&address)
+        .with_context(|| format!("failed to connect codex app tcp control '{}'", address))?;
+    send_message(
+        &mut stream,
+        &ClientMessage::Attach {
+            agent: "agent0".to_string(),
+        },
+    )?;
+
+    let output = Arc::new(Mutex::new(Vec::<String>::new()));
+    let output_thread = Arc::clone(&output);
+    let namespace_owned = namespace.to_string();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stream);
+        loop {
+            let message = match read_server_message(&mut reader) {
+                Ok(message) => message,
+                Err(error) => {
+                    output_thread
+                        .lock()
+                        .unwrap()
+                        .push(format!("[attach] {}", error));
+                    break;
+                }
+            };
+            match message {
+                ServerMessage::Attached { .. } => {}
+                ServerMessage::Output { data_base64 } => {
+                    let bytes = match BASE64.decode(data_base64) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            output_thread
+                                .lock()
+                                .unwrap()
+                                .push(format!("[attach] decode failed: {}", error));
+                            continue;
+                        }
+                    };
+                    let text = String::from_utf8_lossy(&bytes);
+                    for line in text.lines() {
+                        output_thread.lock().unwrap().push(line.to_string());
+                    }
+                }
+                ServerMessage::Exited { .. } => {
+                    output_thread
+                        .lock()
+                        .unwrap()
+                        .push(format!("[attach] {} closed", namespace_owned));
+                    break;
+                }
+                ServerMessage::Error { message } => {
+                    output_thread
+                        .lock()
+                        .unwrap()
+                        .push(format!("[attach] {}", message));
+                    break;
+                }
+                ServerMessage::Ok
+                | ServerMessage::Metadata(..)
+                | ServerMessage::WorkerOffloadResult(..) => {}
+            }
+        }
+    });
+
+    view_agent(&format!("{}:agent0", namespace), output)
+}
+
 pub fn request_worker_offload_for_current_runtime(
     request_payload: WorkerOffloadRequest,
 ) -> anyhow::Result<Option<WorkerOffloadResult>> {
@@ -1643,7 +1841,7 @@ pub fn request_worker_offload_for_current_runtime(
     request_worker_offload_via_runtime_namespace(&runtime_namespace, request_payload).map(Some)
 }
 
-fn send_message(stream: &mut UnixStream, message: &ClientMessage) -> anyhow::Result<()> {
+fn send_message(stream: &mut impl Write, message: &ClientMessage) -> anyhow::Result<()> {
     let raw =
         serde_json::to_string(message).context("failed to encode codex app client message")?;
     stream
@@ -1657,7 +1855,7 @@ fn send_message(stream: &mut UnixStream, message: &ClientMessage) -> anyhow::Res
         .context("failed to flush codex app client message")
 }
 
-fn send_server_message(stream: &mut UnixStream, message: &ServerMessage) -> anyhow::Result<()> {
+fn send_server_message(stream: &mut impl Write, message: &ServerMessage) -> anyhow::Result<()> {
     let raw =
         serde_json::to_string(message).context("failed to encode codex app server message")?;
     stream
@@ -1671,7 +1869,7 @@ fn send_server_message(stream: &mut UnixStream, message: &ServerMessage) -> anyh
         .context("failed to flush codex app server message")
 }
 
-fn send_output(stream: &mut UnixStream, bytes: &[u8]) -> anyhow::Result<()> {
+fn send_output(stream: &mut impl Write, bytes: &[u8]) -> anyhow::Result<()> {
     send_server_message(
         stream,
         &ServerMessage::Output {
@@ -1799,6 +1997,32 @@ fn wait_for_codex_app_shutdown(namespace: &str) -> anyhow::Result<()> {
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn codex_app_tcp_listener() -> anyhow::Result<Option<TcpListener>> {
+    let Some(port) = env::var(TCP_CONTROL_PORT_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let port = port
+        .parse::<u16>()
+        .with_context(|| format!("failed to parse {TCP_CONTROL_PORT_ENV}='{port}'"))?;
+    ensure!(port > 0, "{TCP_CONTROL_PORT_ENV} must be greater than zero");
+    let host = env::var(TCP_CONTROL_HOST_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let address = format!("{host}:{port}");
+    let listener = TcpListener::bind(&address)
+        .with_context(|| format!("failed to bind codex app tcp control '{address}'"))?;
+    listener
+        .set_nonblocking(true)
+        .context("failed to configure codex app tcp listener")?;
+    Ok(Some(listener))
 }
 
 fn format_rpc_error(error: &Value) -> String {

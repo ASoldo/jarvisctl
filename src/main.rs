@@ -10,7 +10,16 @@
 //! - Delete/List: manage native sessions
 
 use clap::{Parser, Subcommand, ValueEnum, ValueHint};
-use std::{env, ffi::OsStr, fs, path::PathBuf, process::ExitCode, time::Duration};
+use std::{
+    env,
+    ffi::OsStr,
+    fs,
+    net::TcpStream,
+    path::PathBuf,
+    process::{Child, Command as ProcessCommand, ExitCode, Stdio},
+    thread,
+    time::Duration,
+};
 use sysinfo::{Pid, System};
 use thiserror::Error;
 use tracing::{error, info, instrument};
@@ -30,10 +39,11 @@ mod tui;
 use agent::spawn_agent;
 use codex::{CodexLaunchOptions, CodexRuntimeDriver, enrich_native_sessions, launch_codex_ticket};
 use codex_app::{
-    CodexAppInputMode, attach_codex_app, codex_app_session_metadata, collect_codex_app_sessions,
-    delete_codex_app_session, interrupt_codex_app, request_worker_offload_for_current_runtime,
+    CodexAppInputMode, attach_codex_app, attach_codex_app_tcp, codex_app_session_metadata,
+    codex_app_session_metadata_tcp, collect_codex_app_sessions, delete_codex_app_session,
+    interrupt_codex_app, interrupt_codex_app_tcp, request_worker_offload_for_current_runtime,
     request_worker_offload_via_runtime_namespace, serve_codex_app_session,
-    tell_codex_app_with_mode,
+    tell_codex_app_with_mode, tell_codex_app_with_mode_tcp,
 };
 use control_plane::{
     ControlPlaneOutput, ControlPlaneResourceKindArg, KubernetesRenderOutput, WorkerOffloadRequest,
@@ -51,6 +61,7 @@ use native::{
     delete_native_session, interrupt_native, serve_native_session, spawn_native_session,
     tell_native,
 };
+use ticket::slugify;
 use tui::{run_dashboard, view_agent};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -232,7 +243,7 @@ enum Command {
         dry_run: bool,
 
         /// Polling interval in seconds when not using --once
-        #[arg(long, default_value_t = 3)]
+        #[arg(long, default_value_t = 15)]
         interval_seconds: u64,
 
         /// Override the dispatch state file
@@ -617,6 +628,115 @@ enum KubeCommand {
 
         #[arg(long = "dry-run-server", default_value_t = false)]
         dry_run_server: bool,
+    },
+
+    /// Control a pod-hosted Codex runtime exposed through Kubernetes
+    Runtime {
+        #[command(subcommand)]
+        command: KubeRuntimeCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum KubeRuntimeCommand {
+    /// Fetch live metadata from a pod-hosted Codex runtime
+    Metadata {
+        #[arg(long, required_unless_present = "service", conflicts_with = "service")]
+        deployment: Option<String>,
+
+        #[arg(
+            long,
+            required_unless_present = "deployment",
+            conflicts_with = "deployment"
+        )]
+        service: Option<String>,
+
+        #[arg(short = 'n', long = "resource-namespace")]
+        resource_namespace: String,
+
+        #[arg(long)]
+        context: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Attach to the live output stream of a pod-hosted Codex runtime
+    Attach {
+        #[arg(long, required_unless_present = "service", conflicts_with = "service")]
+        deployment: Option<String>,
+
+        #[arg(
+            long,
+            required_unless_present = "deployment",
+            conflicts_with = "deployment"
+        )]
+        service: Option<String>,
+
+        #[arg(short = 'n', long = "resource-namespace")]
+        resource_namespace: String,
+
+        #[arg(long)]
+        context: Option<String>,
+    },
+
+    /// Send text into a pod-hosted Codex runtime
+    Tell {
+        #[arg(long, required_unless_present = "service", conflicts_with = "service")]
+        deployment: Option<String>,
+
+        #[arg(
+            long,
+            required_unless_present = "deployment",
+            conflicts_with = "deployment"
+        )]
+        service: Option<String>,
+
+        #[arg(short = 'n', long = "resource-namespace")]
+        resource_namespace: String,
+
+        #[arg(long)]
+        context: Option<String>,
+
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "text")]
+        file: Option<String>,
+
+        #[arg(long, conflicts_with = "file")]
+        text: Option<String>,
+
+        #[arg(long, value_enum, default_value_t = CodexAppInputMode::Auto)]
+        mode: CodexAppInputMode,
+    },
+
+    /// Interrupt the active turn inside a pod-hosted Codex runtime
+    Interrupt {
+        #[arg(long, required_unless_present = "service", conflicts_with = "service")]
+        deployment: Option<String>,
+
+        #[arg(
+            long,
+            required_unless_present = "deployment",
+            conflicts_with = "deployment"
+        )]
+        service: Option<String>,
+
+        #[arg(short = 'n', long = "resource-namespace")]
+        resource_namespace: String,
+
+        #[arg(long)]
+        context: Option<String>,
+    },
+
+    /// Delete a pod-hosted Codex runtime Deployment and its launch ConfigMap
+    Delete {
+        #[arg(long)]
+        deployment: String,
+
+        #[arg(short = 'n', long = "resource-namespace")]
+        resource_namespace: String,
+
+        #[arg(long)]
+        context: Option<String>,
     },
 }
 
@@ -1208,7 +1328,572 @@ fn kube_command(command: KubeCommand) -> Result<(), JarvisError> {
             );
             Ok(())
         }
+        KubeCommand::Runtime { command } => kube_runtime_command(command),
     }
+}
+
+struct KubePortForward {
+    child: Child,
+    local_port: u16,
+}
+
+struct KubeRuntimeTarget {
+    resource_kind: &'static str,
+    resource_name: String,
+    remote_port: u16,
+}
+
+impl Drop for KubePortForward {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn kube_runtime_command(command: KubeRuntimeCommand) -> Result<(), JarvisError> {
+    match command {
+        KubeRuntimeCommand::Metadata {
+            deployment,
+            service,
+            resource_namespace,
+            context,
+            json,
+        } => {
+            let forward = start_kube_runtime_port_forward(
+                deployment.as_deref(),
+                service.as_deref(),
+                &resource_namespace,
+                context.as_deref(),
+            )?;
+            let metadata = codex_app_session_metadata_tcp("127.0.0.1", forward.local_port)
+                .map_err(JarvisError::from)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&metadata).map_err(anyhow::Error::from)?
+                );
+            } else {
+                println!(
+                    "{}",
+                    serde_yaml::to_string(&metadata).map_err(anyhow::Error::from)?
+                );
+            }
+            Ok(())
+        }
+        KubeRuntimeCommand::Attach {
+            deployment,
+            service,
+            resource_namespace,
+            context,
+        } => {
+            let target = kube_runtime_target_label(deployment.as_deref(), service.as_deref())?;
+            let forward = start_kube_runtime_port_forward(
+                deployment.as_deref(),
+                service.as_deref(),
+                &resource_namespace,
+                context.as_deref(),
+            )?;
+            attach_codex_app_tcp("127.0.0.1", forward.local_port, &target)
+                .map_err(JarvisError::from)
+        }
+        KubeRuntimeCommand::Tell {
+            deployment,
+            service,
+            resource_namespace,
+            context,
+            file,
+            text,
+            mode,
+        } => {
+            let contents = match (text.as_deref(), file.as_deref()) {
+                (Some(text), None) => text.to_string(),
+                (None, Some(path)) => fs::read_to_string(path)?,
+                _ => {
+                    return Err(JarvisError::Other(anyhow::anyhow!(
+                        "provide either --text or --file for kube runtime tell"
+                    )));
+                }
+            };
+            let forward = start_kube_runtime_port_forward(
+                deployment.as_deref(),
+                service.as_deref(),
+                &resource_namespace,
+                context.as_deref(),
+            )?;
+            tell_codex_app_with_mode_tcp("127.0.0.1", forward.local_port, &contents, mode)
+                .map_err(JarvisError::from)
+        }
+        KubeRuntimeCommand::Interrupt {
+            deployment,
+            service,
+            resource_namespace,
+            context,
+        } => {
+            let forward = start_kube_runtime_port_forward(
+                deployment.as_deref(),
+                service.as_deref(),
+                &resource_namespace,
+                context.as_deref(),
+            )?;
+            interrupt_codex_app_tcp("127.0.0.1", forward.local_port).map_err(JarvisError::from)
+        }
+        KubeRuntimeCommand::Delete {
+            deployment,
+            resource_namespace,
+            context,
+        } => kube_runtime_delete(&deployment, &resource_namespace, context.as_deref()),
+    }
+}
+
+fn kube_runtime_target_label(
+    deployment: Option<&str>,
+    service: Option<&str>,
+) -> Result<String, JarvisError> {
+    match (deployment, service) {
+        (Some(deployment), None) => Ok(deployment.to_string()),
+        (None, Some(service)) => Ok(service.to_string()),
+        _ => Err(JarvisError::Other(anyhow::anyhow!(
+            "provide either --deployment or --service"
+        ))),
+    }
+}
+
+fn start_kube_runtime_port_forward(
+    deployment: Option<&str>,
+    service: Option<&str>,
+    resource_namespace: &str,
+    context: Option<&str>,
+) -> Result<KubePortForward, JarvisError> {
+    let target = resolve_kube_runtime_target(deployment, service, resource_namespace, context)?;
+    if target.resource_name.is_empty() {
+        return Err(JarvisError::Other(anyhow::anyhow!(
+            "runtime target name must not be empty"
+        )));
+    }
+
+    let local_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .map_err(JarvisError::from)?
+        .local_addr()
+        .map_err(JarvisError::from)?
+        .port();
+
+    let mut command = ProcessCommand::new("kubectl");
+    if let Some(context) = context.map(str::trim).filter(|value| !value.is_empty()) {
+        command.arg("--context").arg(context);
+    }
+    command
+        .arg("-n")
+        .arg(resource_namespace)
+        .arg("port-forward")
+        .arg(format!("{}/{}", target.resource_kind, target.resource_name))
+        .arg(format!("{local_port}:{}", target.remote_port))
+        .arg("--address")
+        .arg("127.0.0.1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn().map_err(JarvisError::from)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if TcpStream::connect(("127.0.0.1", local_port)).is_ok()
+            && codex_app_session_metadata_tcp("127.0.0.1", local_port).is_ok()
+        {
+            return Ok(KubePortForward { child, local_port });
+        }
+        if let Some(status) = child.try_wait().map_err(JarvisError::from)? {
+            let stderr = child
+                .stderr
+                .take()
+                .map(|mut stream| {
+                    use std::io::Read as _;
+                    let mut buffer = String::new();
+                    let _ = stream.read_to_string(&mut buffer);
+                    buffer
+                })
+                .unwrap_or_default();
+            return Err(JarvisError::Other(anyhow::anyhow!(
+                "kubectl port-forward for {}/{} exited with status {status}: {}",
+                target.resource_kind,
+                target.resource_name,
+                stderr.trim()
+            )));
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let stderr = child
+                .stderr
+                .take()
+                .map(|mut stream| {
+                    use std::io::Read as _;
+                    let mut buffer = String::new();
+                    let _ = stream.read_to_string(&mut buffer);
+                    buffer
+                })
+                .unwrap_or_default();
+            return Err(JarvisError::Other(anyhow::anyhow!(
+                "timed out waiting for Kubernetes runtime {}/{} on port {}: {}",
+                target.resource_kind,
+                target.resource_name,
+                target.remote_port,
+                stderr.trim()
+            )));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn resolve_kube_runtime_target(
+    deployment: Option<&str>,
+    service: Option<&str>,
+    resource_namespace: &str,
+    context: Option<&str>,
+) -> Result<KubeRuntimeTarget, JarvisError> {
+    let (resource_kind, resource_name) = match (deployment, service) {
+        (Some(deployment), None) => ("deployment", deployment.trim()),
+        (None, Some(service)) => ("service", service.trim()),
+        _ => {
+            return Err(JarvisError::Other(anyhow::anyhow!(
+                "provide either --deployment or --service"
+            )));
+        }
+    };
+    if resource_name.is_empty() {
+        return Err(JarvisError::Other(anyhow::anyhow!(
+            "runtime target name must not be empty"
+        )));
+    }
+
+    let manifest = kubectl_get_json(resource_kind, resource_name, resource_namespace, context)?;
+    let remote_port =
+        kube_runtime_control_port_from_manifest(resource_kind, resource_name, &manifest)?;
+    Ok(KubeRuntimeTarget {
+        resource_kind,
+        resource_name: resource_name.to_string(),
+        remote_port,
+    })
+}
+
+fn kubectl_get_json(
+    resource_kind: &str,
+    resource_name: &str,
+    resource_namespace: &str,
+    context: Option<&str>,
+) -> Result<serde_json::Value, JarvisError> {
+    let mut command = ProcessCommand::new("kubectl");
+    if let Some(context) = context.map(str::trim).filter(|value| !value.is_empty()) {
+        command.arg("--context").arg(context);
+    }
+    let output = command
+        .arg("-n")
+        .arg(resource_namespace)
+        .arg("get")
+        .arg(resource_kind)
+        .arg(resource_name)
+        .arg("-o")
+        .arg("json")
+        .output()
+        .map_err(JarvisError::from)?;
+    if !output.status.success() {
+        return Err(JarvisError::Other(anyhow::anyhow!(
+            "kubectl get {resource_kind}/{resource_name} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(anyhow::Error::from)
+        .map_err(JarvisError::from)
+}
+
+fn kube_runtime_control_port_from_manifest(
+    resource_kind: &str,
+    resource_name: &str,
+    manifest: &serde_json::Value,
+) -> Result<u16, JarvisError> {
+    let candidates = match resource_kind {
+        "service" => manifest
+            .get("spec")
+            .and_then(|value| value.get("ports"))
+            .and_then(serde_json::Value::as_array)
+            .map(|ports| {
+                ports
+                    .iter()
+                    .filter_map(|port| {
+                        let port_number = port
+                            .get("port")
+                            .and_then(serde_json::Value::as_u64)
+                            .and_then(|value| u16::try_from(value).ok())?;
+                        Some((
+                            port.get("name")
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToOwned::to_owned),
+                            port_number,
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        "deployment" => manifest
+            .get("spec")
+            .and_then(|value| value.get("template"))
+            .and_then(|value| value.get("spec"))
+            .and_then(|value| value.get("containers"))
+            .and_then(serde_json::Value::as_array)
+            .map(|containers| {
+                containers
+                    .iter()
+                    .flat_map(|container| {
+                        container
+                            .get("ports")
+                            .and_then(serde_json::Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|port| {
+                                let port_number = port
+                                    .get("containerPort")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .and_then(|value| u16::try_from(value).ok())?;
+                                Some((
+                                    port.get("name")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(ToOwned::to_owned),
+                                    port_number,
+                                ))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        other => {
+            return Err(JarvisError::Other(anyhow::anyhow!(
+                "unsupported Kubernetes runtime resource kind '{other}'"
+            )));
+        }
+    };
+
+    select_kube_runtime_control_port(resource_kind, resource_name, &candidates)
+}
+
+fn select_kube_runtime_control_port(
+    resource_kind: &str,
+    resource_name: &str,
+    candidates: &[(Option<String>, u16)],
+) -> Result<u16, JarvisError> {
+    if candidates.is_empty() {
+        return Err(JarvisError::Other(anyhow::anyhow!(
+            "Kubernetes runtime {resource_kind}/{resource_name} does not expose any ports"
+        )));
+    }
+
+    let named_control = candidates
+        .iter()
+        .filter_map(|(name, port)| match name.as_deref() {
+            Some("control") => Some(*port),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if let Some(port) = named_control.first().copied() {
+        if named_control.iter().all(|candidate| *candidate == port) {
+            return Ok(port);
+        }
+        return Err(JarvisError::Other(anyhow::anyhow!(
+            "Kubernetes runtime {resource_kind}/{resource_name} exposes multiple distinct 'control' ports: {:?}",
+            named_control
+        )));
+    }
+
+    let unique_ports = candidates
+        .iter()
+        .map(|(_, port)| *port)
+        .collect::<std::collections::BTreeSet<_>>();
+    if unique_ports.len() == 1 {
+        return Ok(*unique_ports.iter().next().expect("unique port"));
+    }
+
+    Err(JarvisError::Other(anyhow::anyhow!(
+        "Kubernetes runtime {resource_kind}/{resource_name} exposes multiple ports without a unique 'control' port: {:?}",
+        candidates
+    )))
+}
+
+fn kube_runtime_delete(
+    deployment: &str,
+    resource_namespace: &str,
+    context: Option<&str>,
+) -> Result<(), JarvisError> {
+    let deployment_manifest =
+        kubectl_get_json("deployment", deployment, resource_namespace, context).ok();
+    let runtime_service_names = deployment_manifest
+        .as_ref()
+        .map(|manifest| kube_runtime_matching_service_names(manifest, context))
+        .transpose()?
+        .unwrap_or_default();
+
+    let mut command = ProcessCommand::new("kubectl");
+    if let Some(context) = context.map(str::trim).filter(|value| !value.is_empty()) {
+        command.arg("--context").arg(context);
+    }
+    let output = command
+        .arg("-n")
+        .arg(resource_namespace)
+        .arg("delete")
+        .arg("deployment")
+        .arg(deployment)
+        .arg("--ignore-not-found=true")
+        .output()
+        .map_err(JarvisError::from)?;
+    if !output.status.success() {
+        return Err(JarvisError::Other(anyhow::anyhow!(
+            "kubectl delete deployment failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    let launch_config_map = format!("{}-codex-launch", slugify(deployment));
+    let mut config_map_command = ProcessCommand::new("kubectl");
+    if let Some(context) = context.map(str::trim).filter(|value| !value.is_empty()) {
+        config_map_command.arg("--context").arg(context);
+    }
+    let _ = config_map_command
+        .arg("-n")
+        .arg(resource_namespace)
+        .arg("delete")
+        .arg("configmap")
+        .arg(launch_config_map)
+        .arg("--ignore-not-found=true")
+        .output();
+
+    for service_name in &runtime_service_names {
+        let mut service_command = ProcessCommand::new("kubectl");
+        if let Some(context) = context.map(str::trim).filter(|value| !value.is_empty()) {
+            service_command.arg("--context").arg(context);
+        }
+        let _ = service_command
+            .arg("-n")
+            .arg(resource_namespace)
+            .arg("delete")
+            .arg("service")
+            .arg(service_name)
+            .arg("--ignore-not-found=true")
+            .output();
+    }
+
+    println!(
+        "deleted Kubernetes runtime deployment {}/{}{}",
+        resource_namespace,
+        deployment,
+        if runtime_service_names.is_empty() {
+            String::new()
+        } else {
+            format!(" and {} runtime service(s)", runtime_service_names.len())
+        }
+    );
+    Ok(())
+}
+
+fn kube_runtime_matching_service_names(
+    deployment_manifest: &serde_json::Value,
+    context: Option<&str>,
+) -> Result<Vec<String>, JarvisError> {
+    let resource_namespace = deployment_manifest
+        .get("metadata")
+        .and_then(|value| value.get("namespace"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            JarvisError::Other(anyhow::anyhow!("deployment manifest missing namespace"))
+        })?;
+    let deployment_name = deployment_manifest
+        .get("metadata")
+        .and_then(|value| value.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| JarvisError::Other(anyhow::anyhow!("deployment manifest missing name")))?;
+    let labels = deployment_manifest
+        .get("spec")
+        .and_then(|value| value.get("template"))
+        .and_then(|value| value.get("metadata"))
+        .and_then(|value| value.get("labels"))
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            JarvisError::Other(anyhow::anyhow!(
+                "deployment {resource_namespace}/{deployment_name} is missing pod template labels"
+            ))
+        })?;
+    let services = kubectl_list_json("service", resource_namespace, context)?;
+    let items = services
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            JarvisError::Other(anyhow::anyhow!("kubectl get service returned no items"))
+        })?;
+
+    let mut matches = Vec::new();
+    for item in items {
+        let metadata = item.get("metadata").unwrap_or(&serde_json::Value::Null);
+        if metadata
+            .get("labels")
+            .and_then(|value| value.get("jarvisctl.io/runtime-deployment"))
+            .and_then(serde_json::Value::as_str)
+            == Some(deployment_name)
+        {
+            if let Some(name) = metadata.get("name").and_then(serde_json::Value::as_str) {
+                matches.push(name.to_string());
+            }
+            continue;
+        }
+
+        let Some(selector) = item
+            .get("spec")
+            .and_then(|value| value.get("selector"))
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        if selector.is_empty() {
+            continue;
+        }
+        let selector_matches = selector.iter().all(|(key, value)| {
+            labels.get(key).and_then(serde_json::Value::as_str) == value.as_str()
+        });
+        if selector_matches {
+            if let Some(name) = metadata.get("name").and_then(serde_json::Value::as_str) {
+                matches.push(name.to_string());
+            }
+        }
+    }
+
+    matches.sort();
+    matches.dedup();
+    Ok(matches)
+}
+
+fn kubectl_list_json(
+    resource_kind: &str,
+    resource_namespace: &str,
+    context: Option<&str>,
+) -> Result<serde_json::Value, JarvisError> {
+    let mut command = ProcessCommand::new("kubectl");
+    if let Some(context) = context.map(str::trim).filter(|value| !value.is_empty()) {
+        command.arg("--context").arg(context);
+    }
+    let output = command
+        .arg("-n")
+        .arg(resource_namespace)
+        .arg("get")
+        .arg(resource_kind)
+        .arg("-o")
+        .arg("json")
+        .output()
+        .map_err(JarvisError::from)?;
+    if !output.status.success() {
+        return Err(JarvisError::Other(anyhow::anyhow!(
+            "kubectl get {resource_kind} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(anyhow::Error::from)
+        .map_err(JarvisError::from)
 }
 
 fn read_worker_prompt(
@@ -1550,4 +2235,42 @@ fn print_process_info(p: &sysinfo::Process) {
     println!("Cmd line:        {:?}", p.cmd());
     println!("Parent PID:      {:?}", p.parent());
     println!("------------------------------------");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_kube_runtime_control_port;
+
+    #[test]
+    fn selects_named_control_port_first() {
+        let candidates = vec![
+            (Some("metrics".to_string()), 8080),
+            (Some("control".to_string()), 47999),
+        ];
+        let port = select_kube_runtime_control_port("service", "runtime-svc", &candidates).unwrap();
+        assert_eq!(port, 47999);
+    }
+
+    #[test]
+    fn selects_single_unique_port_without_name() {
+        let candidates = vec![(None, 47832), (Some("secondary".to_string()), 47832)];
+        let port =
+            select_kube_runtime_control_port("deployment", "codex-runtime", &candidates).unwrap();
+        assert_eq!(port, 47832);
+    }
+
+    #[test]
+    fn rejects_ambiguous_ports_without_control_name() {
+        let candidates = vec![
+            (Some("first".to_string()), 47832),
+            (Some("second".to_string()), 47999),
+        ];
+        let error =
+            select_kube_runtime_control_port("service", "runtime-svc", &candidates).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("multiple ports without a unique 'control' port")
+        );
+    }
 }
