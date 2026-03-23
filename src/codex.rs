@@ -43,6 +43,24 @@ pub struct CodexLaunchOptions {
     pub command: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PreparedCodexLaunch {
+    pub ticket: TicketNote,
+    pub repo_path: PathBuf,
+    pub namespace: String,
+    pub resume_session_id: Option<String>,
+    pub prompt: String,
+    pub prompt_path: PathBuf,
+    pub record_path: PathBuf,
+    pub runtime_context: RuntimeContextMetadata,
+    pub runtime_environment: BTreeMap<String, String>,
+    pub command: Vec<String>,
+    pub finish_mode: String,
+    pub timestamp_ms: u128,
+    pub readiness_warnings: Vec<String>,
+    pub images: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexLaunchRecord {
     pub version: u32,
@@ -91,6 +109,135 @@ pub fn default_namespace_for_ticket(ticket: &TicketNote) -> String {
 }
 
 pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexLaunchRecord> {
+    let prepared = prepare_codex_ticket_launch(&options)?;
+    let (runtime_backend, codex_session_id) = match options.driver {
+        CodexRuntimeDriver::CliPty => {
+            let mut launch_command = if launches_codex(&prepared.command) {
+                let mut wrapped = vec!["env".to_string(), "NO_UPDATE_NOTIFIER=1".to_string()];
+                wrapped.extend(prepared.command.clone());
+                wrapped
+            } else {
+                prepared.command.clone()
+            };
+            launch_command.push(prepared.prompt.clone());
+
+            let wrapped_command = wrap_launch_command(
+                &prepared.finish_mode,
+                &with_environment(launch_command, &prepared.runtime_environment),
+            );
+            let resume_transcript_path = match prepared.resume_session_id.as_deref() {
+                Some(session_id) => transcript_path_for_session_id(session_id)?,
+                None => None,
+            };
+            super::run_session_shell_with_context(
+                options.backend,
+                &prepared.namespace,
+                options.agents,
+                &Some(prepared.repo_path.display().to_string()),
+                &wrapped_command,
+                Some(RuntimeContextMetadata {
+                    transcript_path: resume_transcript_path,
+                    ..prepared.runtime_context.clone()
+                }),
+            )?;
+
+            if options.startup_delay_ms > 0 {
+                thread::sleep(Duration::from_millis(options.startup_delay_ms));
+            }
+
+            (
+                "native".to_string(),
+                match prepared.resume_session_id.clone() {
+                    Some(session_id) => Some(session_id),
+                    None => discover_codex_session_id(
+                        &prepared.ticket.path,
+                        &prepared.repo_path,
+                        prepared.timestamp_ms,
+                    )?,
+                },
+            )
+        }
+        CodexRuntimeDriver::AppServer => {
+            let metadata = spawn_codex_app_session(CodexAppLaunchManifest {
+                namespace: prepared.namespace.clone(),
+                working_directory: Some(prepared.repo_path.display().to_string()),
+                shell_command: shell_words::join(&prepared.command),
+                startup_prompt: prepared.prompt.clone(),
+                images: prepared
+                    .images
+                    .iter()
+                    .map(|image| image.display().to_string())
+                    .collect(),
+                environment: prepared.runtime_environment.clone(),
+                resume_session_id: prepared.resume_session_id.clone(),
+                created_at_epoch_ms: prepared.timestamp_ms,
+                context: prepared.runtime_context.clone(),
+            })?;
+            let context = metadata.context.unwrap_or_default();
+            (
+                "codex-app".to_string(),
+                context.codex_session_id.or(context.thread_id),
+            )
+        }
+    };
+
+    let record = CodexLaunchRecord {
+        version: 3,
+        launched_at_epoch_ms: prepared.timestamp_ms,
+        task_id: prepared.ticket.effective_id(),
+        title: prepared.ticket.title.clone(),
+        task_note: prepared.ticket.path.display().to_string(),
+        repo_path: prepared.repo_path.display().to_string(),
+        namespace: prepared.namespace.clone(),
+        agent: options.agent.clone(),
+        agents: options.agents,
+        runtime_backend,
+        command: prepared.command,
+        launch_mode: if prepared.resume_session_id.is_some() {
+            "resume".to_string()
+        } else {
+            "fresh".to_string()
+        },
+        codex_session_id,
+        finish_mode: prepared.finish_mode,
+        prompt_file: prepared.prompt_path.display().to_string(),
+        record_file: prepared.record_path.display().to_string(),
+        readiness_warnings: prepared.readiness_warnings,
+    };
+
+    let record_json =
+        serde_json::to_string_pretty(&record).context("failed to serialize launch record")?;
+    fs::write(&prepared.record_path, record_json).with_context(|| {
+        format!(
+            "failed to write launch record '{}'",
+            prepared.record_path.display()
+        )
+    })?;
+
+    Ok(record)
+}
+
+pub fn codex_app_manifest_from_prepared(prepared: &PreparedCodexLaunch) -> CodexAppLaunchManifest {
+    CodexAppLaunchManifest {
+        namespace: prepared.namespace.clone(),
+        working_directory: Some(prepared.repo_path.display().to_string()),
+        shell_command: shell_words::join(&prepared.command),
+        startup_prompt: prepared.prompt.clone(),
+        images: prepared
+            .images
+            .iter()
+            .map(|image| image.display().to_string())
+            .collect(),
+        environment: prepared.runtime_environment.clone(),
+        resume_session_id: prepared.resume_session_id.clone(),
+        created_at_epoch_ms: prepared.timestamp_ms,
+        context: prepared.runtime_context.clone(),
+    }
+}
+
+pub fn prepare_codex_ticket_launch(
+    options: &CodexLaunchOptions,
+) -> anyhow::Result<PreparedCodexLaunch> {
     let ticket = TicketNote::load(&options.task_note)?;
     ticket.validate_codex_minimum()?;
 
@@ -108,7 +255,7 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
         .namespace
         .clone()
         .unwrap_or_else(|| default_namespace_for_ticket(&ticket));
-    let resume_session_id = resolve_resume_session_id(&ticket, &namespace, &options)?;
+    let resume_session_id = resolve_resume_session_id(&ticket, &namespace, options)?;
     let runtime_args = ticket.codex_cli_args()?;
     let finish_mode = ticket.finish_session_policy()?.to_string();
     let command = match options.driver {
@@ -196,104 +343,25 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
     );
     let runtime_environment =
         merge_runtime_environment(options.environment.clone(), &namespace, &runtime_context);
-    let (runtime_backend, codex_session_id) = match options.driver {
-        CodexRuntimeDriver::CliPty => {
-            let mut launch_command = if launches_codex(&command) {
-                let mut wrapped = vec!["env".to_string(), "NO_UPDATE_NOTIFIER=1".to_string()];
-                wrapped.extend(command.clone());
-                wrapped
-            } else {
-                command.clone()
-            };
-            launch_command.push(prompt.clone());
-
-            let wrapped_command = wrap_launch_command(
-                &finish_mode,
-                &with_environment(launch_command, &runtime_environment),
-            );
-            let resume_transcript_path = match resume_session_id.as_deref() {
-                Some(session_id) => transcript_path_for_session_id(session_id)?,
-                None => None,
-            };
-            super::run_session_shell_with_context(
-                options.backend,
-                &namespace,
-                options.agents,
-                &Some(repo_path.display().to_string()),
-                &wrapped_command,
-                Some(RuntimeContextMetadata {
-                    transcript_path: resume_transcript_path,
-                    ..runtime_context.clone()
-                }),
-            )?;
-
-            if options.startup_delay_ms > 0 {
-                thread::sleep(Duration::from_millis(options.startup_delay_ms));
-            }
-
-            (
-                "native".to_string(),
-                match resume_session_id.clone() {
-                    Some(session_id) => Some(session_id),
-                    None => discover_codex_session_id(&ticket.path, &repo_path, timestamp_ms)?,
-                },
-            )
-        }
-        CodexRuntimeDriver::AppServer => {
-            let metadata = spawn_codex_app_session(CodexAppLaunchManifest {
-                namespace: namespace.clone(),
-                working_directory: Some(repo_path.display().to_string()),
-                shell_command: shell_words::join(&command),
-                startup_prompt: prompt.clone(),
-                images: options
-                    .images
-                    .iter()
-                    .map(|image| image.display().to_string())
-                    .collect(),
-                environment: runtime_environment.clone(),
-                resume_session_id: resume_session_id.clone(),
-                created_at_epoch_ms: timestamp_ms,
-                context: runtime_context.clone(),
-            })?;
-            let context = metadata.context.unwrap_or_default();
-            (
-                "codex-app".to_string(),
-                context.codex_session_id.or(context.thread_id),
-            )
-        }
-    };
 
     let readiness_warnings = ticket.readiness_warnings();
-    let record = CodexLaunchRecord {
-        version: 3,
-        launched_at_epoch_ms: timestamp_ms,
-        task_id: ticket.effective_id(),
-        title: ticket.title.clone(),
-        task_note: ticket.path.display().to_string(),
-        repo_path: repo_path.display().to_string(),
-        namespace: namespace.clone(),
-        agent: options.agent.clone(),
-        agents: options.agents,
-        runtime_backend,
+
+    Ok(PreparedCodexLaunch {
+        ticket,
+        repo_path,
+        namespace,
+        resume_session_id,
+        prompt,
+        prompt_path,
+        record_path,
+        runtime_context,
+        runtime_environment,
         command,
-        launch_mode: if resume_session_id.is_some() {
-            "resume".to_string()
-        } else {
-            "fresh".to_string()
-        },
-        codex_session_id,
         finish_mode,
-        prompt_file: prompt_path.display().to_string(),
-        record_file: record_path.display().to_string(),
+        timestamp_ms,
         readiness_warnings,
-    };
-
-    let record_json =
-        serde_json::to_string_pretty(&record).context("failed to serialize launch record")?;
-    fs::write(&record_path, record_json)
-        .with_context(|| format!("failed to write launch record '{}'", record_path.display()))?;
-
-    Ok(record)
+        images: options.images.clone(),
+    })
 }
 
 fn jarvis_home() -> anyhow::Result<PathBuf> {

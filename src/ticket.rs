@@ -448,3 +448,111 @@ pub fn slugify(input: &str) -> String {
 
     slug.trim_matches('-').to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TicketNote;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after UNIX_EPOCH")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{nonce}"))
+    }
+
+    #[test]
+    fn load_parses_markdown_ticket_sections_and_prompt() {
+        let root = unique_temp_dir("jarvisctl-ticket-load");
+        let repo_path = root.join("repo");
+        fs::create_dir_all(&repo_path).unwrap();
+        let ticket_path = root.join("ticket.md");
+        fs::write(
+            &ticket_path,
+            format!(
+                r#"---
+title: Markdown Launch
+type: ticket
+status: ready_for_codex
+owner: codex
+autostart: true
+project: Projects/jarvisctl/Project.md
+repo_path: {}
+codex_finish_mode: close
+---
+
+# Markdown Launch
+
+## Request
+- Launch from a real Markdown note.
+
+## Definition Of Done
+- Parse the note body.
+- Keep the prompt aligned with the ticket.
+
+## Execution Handoff
+- Use the note as the execution contract.
+"#,
+                repo_path.display()
+            ),
+        )
+        .unwrap();
+
+        let ticket = TicketNote::load(&ticket_path).unwrap();
+        assert_eq!(ticket.title, "Markdown Launch");
+        assert_eq!(
+            ticket.section("Request"),
+            Some("- Launch from a real Markdown note.")
+        );
+        assert!(
+            ticket
+                .section("Definition Of Done")
+                .unwrap()
+                .contains("Parse the note body.")
+        );
+        assert!(ticket.render_codex_prompt().contains("Execution Handoff:"));
+        assert_eq!(ticket.completion_column(), "Review");
+        assert_eq!(ticket.finish_session_policy().unwrap(), "close");
+        ticket.validate_codex_minimum().unwrap();
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_uses_markdown_heading_when_frontmatter_title_is_missing() {
+        let root = unique_temp_dir("jarvisctl-ticket-heading");
+        let repo_path = root.join("repo");
+        fs::create_dir_all(&repo_path).unwrap();
+        let ticket_path = root.join("ticket.md");
+        fs::write(
+            &ticket_path,
+            format!(
+                r#"---
+type: ticket
+owner: codex
+repo_path: {}
+---
+
+# Heading Derived Title
+
+## Request
+- Verify title fallback.
+"#,
+                repo_path.display()
+            ),
+        )
+        .unwrap();
+
+        let ticket = TicketNote::load(&ticket_path).unwrap();
+        assert_eq!(ticket.title, "Heading Derived Title");
+        assert_eq!(ticket.effective_id(), "heading-derived-title");
+        assert!(
+            ticket
+                .render_codex_prompt()
+                .contains("Heading Derived Title")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+}

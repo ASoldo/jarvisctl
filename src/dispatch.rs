@@ -55,7 +55,17 @@ pub struct DispatchState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoardSnapshotState {
     pub updated_at_epoch_ms: u128,
+    #[serde(default)]
+    pub file_modified_epoch_ms: Option<u128>,
+    #[serde(default)]
+    pub file_len_bytes: Option<u64>,
     pub card_columns: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BoardFileSignature {
+    modified_epoch_ms: u128,
+    len_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,15 +144,33 @@ fn dispatch_once(options: &DispatchOptions) -> anyhow::Result<()> {
         .unwrap_or(default_state_file(&options.vault_path)?);
     let mut state = load_state(&state_path)?;
     let board_paths = resolve_board_paths(options)?;
+    let active_board_paths = state
+        .active_runs
+        .values()
+        .map(|run| PathBuf::from(&run.board_path))
+        .collect::<BTreeSet<_>>();
+    let mut boards_to_load = Vec::new();
+    for board_path in &board_paths {
+        let snapshot = state.boards.get(&board_path.display().to_string());
+        if should_load_board(
+            board_path,
+            snapshot,
+            active_board_paths.contains(board_path),
+        )? {
+            boards_to_load.push(board_path.clone());
+        }
+    }
     info!(
-        "Dispatch scan starting for {} board(s) using state '{}'",
+        "Dispatch scan starting for {} board(s); loading {} changed/active board(s) using state '{}'",
         board_paths.len(),
+        boards_to_load.len(),
         state_path.display()
     );
-    let mut boards = load_boards(&board_paths)?;
+    let mut boards = load_boards(&boards_to_load)?;
+    let mut dirty_boards = BTreeSet::new();
 
     let canceled_links = process_manual_cancellations(&mut boards, &mut state, options)?;
-    process_completed_runs(&mut boards, &mut state, options)?;
+    process_completed_runs(&mut boards, &mut state, options, &mut dirty_boards)?;
 
     for board_path in &board_paths {
         info!("Scanning board '{}'", board_path.display());
@@ -153,9 +181,9 @@ fn dispatch_once(options: &DispatchOptions) -> anyhow::Result<()> {
             .map(|snapshot| snapshot.card_columns.clone())
             .unwrap_or_default();
 
-        let board = boards
-            .get_mut(board_path)
-            .ok_or_else(|| anyhow!("board '{}' was not loaded", board_path.display()))?;
+        let Some(board) = boards.get_mut(board_path) else {
+            continue;
+        };
         let current_positions = board
             .card_positions()
             .into_iter()
@@ -171,25 +199,29 @@ fn dispatch_once(options: &DispatchOptions) -> anyhow::Result<()> {
                 && previous_column.map(|value| normalize_column(value))
                     != Some(READY_FOR_CODEX.to_string())
             {
-                handle_ready_transition(board, ticket_link, options, &mut state)?;
+                handle_ready_transition(
+                    board,
+                    ticket_link,
+                    options,
+                    &mut state,
+                    &mut dirty_boards,
+                )?;
             }
         }
-
-        state.boards.insert(
-            key,
-            BoardSnapshotState {
-                updated_at_epoch_ms: now_epoch_ms()?,
-                card_columns: board
-                    .card_positions()
-                    .into_iter()
-                    .collect::<BTreeMap<String, String>>(),
-            },
-        );
     }
 
     if !options.dry_run {
-        for board in boards.values() {
+        for board_path in &dirty_boards {
+            let board = boards
+                .get(board_path)
+                .ok_or_else(|| anyhow!("board '{}' was not loaded", board_path.display()))?;
             board.save()?;
+        }
+        for board_path in boards.keys() {
+            let board = boards
+                .get(board_path)
+                .ok_or_else(|| anyhow!("board '{}' was not loaded", board_path.display()))?;
+            refresh_board_snapshot(&mut state, board_path, board)?;
         }
         save_state(&state_path, &state)?;
     }
@@ -204,6 +236,7 @@ fn handle_ready_transition(
     ticket_link: &str,
     options: &DispatchOptions,
     state: &mut DispatchState,
+    dirty_boards: &mut BTreeSet<PathBuf>,
 ) -> anyhow::Result<()> {
     let ticket_path = resolve_wiki_link(&options.vault_path, ticket_link);
     let ticket_key = ticket_path.display().to_string();
@@ -323,6 +356,7 @@ fn handle_ready_transition(
     })?;
 
     board.move_card(ticket_link, CODEX_WORKING)?;
+    dirty_boards.insert(board.path.clone());
     update_ticket_status(&ticket_path, "active")?;
     remember_ticket_runtime(
         state,
@@ -410,6 +444,7 @@ fn process_completed_runs(
     boards: &mut BTreeMap<PathBuf, BoardFile>,
     state: &mut DispatchState,
     options: &DispatchOptions,
+    dirty_boards: &mut BTreeSet<PathBuf>,
 ) -> anyhow::Result<()> {
     let mut completed = Vec::new();
     let active_runs = state.active_runs.clone();
@@ -463,6 +498,7 @@ fn process_completed_runs(
                         &ticket,
                         codex_session_id,
                         "Run finished after Codex emitted a stop event.",
+                        dirty_boards,
                     )?;
                     completed.push(ticket_note);
                 }
@@ -490,6 +526,7 @@ fn process_completed_runs(
                     &ticket,
                     codex_session_id,
                     "Run finished after the runtime stopped.",
+                    dirty_boards,
                 )?;
                 completed.push(ticket_note);
             }
@@ -512,6 +549,7 @@ fn finalize_run(
     ticket: &TicketNote,
     codex_session_id: Option<String>,
     completion_reason: &str,
+    dirty_boards: &mut BTreeSet<PathBuf>,
 ) -> anyhow::Result<()> {
     let completion_column = ticket.completion_column();
     let completion_status = ticket.completion_status();
@@ -528,6 +566,7 @@ fn finalize_run(
             .get_mut(&board_path)
             .ok_or_else(|| anyhow!("board '{}' is not loaded", board_path.display()))?;
         board.move_card(&run.ticket_link, &completion_column)?;
+        dirty_boards.insert(board.path.clone());
         append_ticket_progress(
             &ticket.path,
             &format!(
@@ -559,6 +598,67 @@ fn load_boards(board_paths: &[PathBuf]) -> anyhow::Result<BTreeMap<PathBuf, Boar
         boards.insert(path.clone(), BoardFile::load(path)?);
     }
     Ok(boards)
+}
+
+fn should_load_board(
+    board_path: &Path,
+    snapshot: Option<&BoardSnapshotState>,
+    force: bool,
+) -> anyhow::Result<bool> {
+    if force || snapshot.is_none() {
+        return Ok(true);
+    }
+    let signature = board_file_signature(board_path)?;
+    let snapshot = snapshot.expect("checked is_some above");
+    Ok(
+        snapshot.file_modified_epoch_ms != Some(signature.modified_epoch_ms)
+            || snapshot.file_len_bytes != Some(signature.len_bytes),
+    )
+}
+
+fn refresh_board_snapshot(
+    state: &mut DispatchState,
+    board_path: &Path,
+    board: &BoardFile,
+) -> anyhow::Result<()> {
+    let signature = board_file_signature(board_path)?;
+    state.boards.insert(
+        board_path.display().to_string(),
+        BoardSnapshotState {
+            updated_at_epoch_ms: now_epoch_ms()?,
+            file_modified_epoch_ms: Some(signature.modified_epoch_ms),
+            file_len_bytes: Some(signature.len_bytes),
+            card_columns: board
+                .card_positions()
+                .into_iter()
+                .collect::<BTreeMap<String, String>>(),
+        },
+    );
+    Ok(())
+}
+
+fn board_file_signature(board_path: &Path) -> anyhow::Result<BoardFileSignature> {
+    let metadata = fs::metadata(board_path)
+        .with_context(|| format!("failed to stat board '{}'", board_path.display()))?;
+    let modified = metadata.modified().with_context(|| {
+        format!(
+            "failed to read modified time for '{}'",
+            board_path.display()
+        )
+    })?;
+    let modified_epoch_ms = modified
+        .duration_since(UNIX_EPOCH)
+        .with_context(|| {
+            format!(
+                "board '{}' has mtime before UNIX_EPOCH",
+                board_path.display()
+            )
+        })?
+        .as_millis();
+    Ok(BoardFileSignature {
+        modified_epoch_ms,
+        len_bytes: metadata.len(),
+    })
 }
 
 fn resolve_board_paths(options: &DispatchOptions) -> anyhow::Result<Vec<PathBuf>> {

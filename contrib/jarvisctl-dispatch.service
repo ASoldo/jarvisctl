@@ -4,11 +4,14 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/jarvisctl dispatch --vault-path %h/documents/codex
+ExecStart=%h/.local/bin/jarvisctl dispatch --vault-path %h/documents/codex --interval-seconds 15
 Restart=always
 RestartSec=2
-Environment=RUST_LOG=info
+Environment=RUST_LOG=warn
 WorkingDirectory=%h/documents/jarvisctl
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 
 [Install]
 WantedBy=default.target
