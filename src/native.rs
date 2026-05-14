@@ -162,6 +162,24 @@ pub struct RuntimeContextMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_objective: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_control_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_environment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub codex_settings: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codex_features: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codex_disabled_features: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub codex_environments: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<String>,
@@ -701,20 +719,6 @@ pub fn delete_native_session(namespace: &str) -> anyhow::Result<()> {
         let _ = clear_native_completion(namespace);
     }
     result
-}
-
-pub fn native_session_completion(
-    namespace: &str,
-) -> anyhow::Result<Option<NativeSessionCompletion>> {
-    let path = completion_path_for(namespace)?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read '{}'", path.display()))?;
-    let completion: NativeSessionCompletion =
-        serde_json::from_str(&raw).context("failed to parse native session completion")?;
-    Ok(Some(completion))
 }
 
 pub fn tell_native(

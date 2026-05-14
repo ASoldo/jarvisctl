@@ -4,12 +4,10 @@ use crate::codex::{
     CodexLaunchOptions, CodexRuntimeDriver, default_namespace_for_ticket,
     discover_codex_session_id, discover_latest_launch_session_id, launch_codex_ticket,
 };
-use crate::codex_app::{
-    codex_app_session_metadata, delete_codex_app_session, interrupt_codex_app, tell_codex_app,
-};
-use crate::native::{
-    RuntimeContextMetadata, delete_native_session, interrupt_native, native_session_metadata,
-    tell_native,
+use crate::native::RuntimeContextMetadata;
+use crate::runtime::{
+    RuntimeSessionState, cancel_runtime_session, delete_runtime_session_if_exists,
+    probe_runtime_session_state,
 };
 use crate::ticket::TicketNote;
 use anyhow::{Context, anyhow};
@@ -19,7 +17,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use sysinfo::{Pid, System};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tracing::{info, warn};
@@ -107,13 +104,6 @@ struct HookSessionState {
     last_event: Option<String>,
     #[serde(default)]
     last_event_at: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NamespaceRunState {
-    Missing,
-    ActiveCodex,
-    Idle,
 }
 
 impl Default for DispatchState {
@@ -271,8 +261,8 @@ fn handle_ready_transition(
         .get(&ticket_key)
         .and_then(|runtime| runtime.last_codex_session_id.clone());
 
-    match probe_namespace_run_state(options.backend, &expected_namespace)? {
-        NamespaceRunState::ActiveCodex => {
+    match probe_runtime_session_state(&expected_namespace)? {
+        RuntimeSessionState::ActiveWork => {
             info!(
                 "Adopting existing active Codex session '{}' for '{}'",
                 expected_namespace,
@@ -309,17 +299,17 @@ fn handle_ready_transition(
             );
             return Ok(());
         }
-        NamespaceRunState::Idle => {
+        RuntimeSessionState::Idle => {
             info!(
                 "Removing stale namespace '{}' before relaunching '{}'",
                 expected_namespace,
                 ticket_path.display()
             );
             if !options.dry_run {
-                kill_session_if_exists(options.backend, &expected_namespace)?;
+                delete_runtime_session_if_exists(&expected_namespace)?;
             }
         }
-        NamespaceRunState::Missing => {}
+        RuntimeSessionState::Missing => {}
     }
 
     if last_codex_session_id.is_some() {
@@ -425,7 +415,7 @@ fn process_manual_cancellations(
             ),
         )?;
         update_ticket_status(&ticket_path, "canceled")?;
-        cancel_run_namespace(options.backend, &run.namespace, &run.agent)?;
+        cancel_runtime_session(&run.namespace, &run.agent)?;
         remember_ticket_runtime(
             state,
             &ticket_note,
@@ -451,8 +441,8 @@ fn process_completed_runs(
     let hook_state = load_hook_state(&options.vault_path)?;
 
     for (ticket_note, run) in active_runs {
-        match probe_namespace_run_state(options.backend, &run.namespace)? {
-            NamespaceRunState::ActiveCodex => {
+        match probe_runtime_session_state(&run.namespace)? {
+            RuntimeSessionState::ActiveWork => {
                 let ticket_path = PathBuf::from(&ticket_note);
                 let ticket = TicketNote::load(&ticket_path)?;
                 let mut codex_session_id = run.codex_session_id.clone();
@@ -503,7 +493,7 @@ fn process_completed_runs(
                     completed.push(ticket_note);
                 }
             }
-            NamespaceRunState::Idle | NamespaceRunState::Missing => {
+            runtime_state @ (RuntimeSessionState::Idle | RuntimeSessionState::Missing) => {
                 let ticket_path = PathBuf::from(&ticket_note);
                 let ticket = TicketNote::load(&ticket_path)?;
                 let codex_session_id = resolve_ticket_session_id(
@@ -525,7 +515,11 @@ fn process_completed_runs(
                     &run,
                     &ticket,
                     codex_session_id,
-                    "Run finished after the runtime stopped.",
+                    match runtime_state {
+                        RuntimeSessionState::Idle => "Run finished after the runtime became idle.",
+                        RuntimeSessionState::Missing => "Run finished after the runtime stopped.",
+                        _ => unreachable!(),
+                    },
                     dirty_boards,
                 )?;
                 completed.push(ticket_note);
@@ -576,7 +570,7 @@ fn finalize_run(
         )?;
         update_ticket_status(&ticket.path, &completion_status)?;
         if finish_mode == "close" {
-            kill_session_if_exists(options.backend, &run.namespace)?;
+            delete_runtime_session_if_exists(&run.namespace)?;
         }
     }
 
@@ -735,55 +729,6 @@ fn save_state(path: &Path, state: &DispatchState) -> anyhow::Result<()> {
     fs::write(path, raw).with_context(|| format!("failed to write '{}'", path.display()))
 }
 
-fn probe_namespace_run_state(
-    backend: SessionBackend,
-    namespace: &str,
-) -> anyhow::Result<NamespaceRunState> {
-    let _ = backend;
-    let metadata = if let Some(metadata) = codex_app_session_metadata(namespace)? {
-        metadata
-    } else if let Some(metadata) = native_session_metadata(namespace)? {
-        metadata
-    } else {
-        return Ok(NamespaceRunState::Missing);
-    };
-
-    if metadata.backend == "codex-app" {
-        let turn_active = metadata
-            .context
-            .as_ref()
-            .and_then(|context| context.turn_status.as_deref())
-            == Some("inProgress");
-        return Ok(if turn_active {
-            NamespaceRunState::ActiveCodex
-        } else {
-            NamespaceRunState::Idle
-        });
-    }
-
-    let mut system = System::new_all();
-    system.refresh_all();
-    let has_active_codex = metadata.agents.iter().any(|agent| {
-        agent.running
-            && process_tree_has_codex(
-                &system,
-                usize::try_from(agent.pid)
-                    .ok()
-                    .map(Pid::from)
-                    .unwrap_or_else(|| Pid::from(0)),
-            )
-    });
-    if has_active_codex {
-        return Ok(NamespaceRunState::ActiveCodex);
-    }
-
-    if metadata.agents.iter().any(|agent| agent.running) {
-        return Ok(NamespaceRunState::Idle);
-    }
-
-    Ok(NamespaceRunState::Idle)
-}
-
 fn stop_hook_epoch_ms(
     hook_state: &HookStateFile,
     codex_session_id: Option<&str>,
@@ -826,77 +771,6 @@ fn parse_rfc3339_epoch_ms(value: &str) -> anyhow::Result<u128> {
         .ok_or_else(|| anyhow!("timestamp '{}' overflowed epoch milliseconds", value))?;
     u128::try_from(millis)
         .map_err(|_| anyhow!("timestamp '{}' is before UNIX_EPOCH and unsupported", value))
-}
-
-fn process_tree_has_codex(system: &System, root_pid: Pid) -> bool {
-    let mut pending = vec![root_pid];
-    let mut visited = BTreeSet::new();
-
-    while let Some(pid) = pending.pop() {
-        if !visited.insert(pid) {
-            continue;
-        }
-
-        let Some(process) = system.process(pid) else {
-            continue;
-        };
-        if process.name().to_string_lossy() == "codex" {
-            return true;
-        }
-
-        for child in system.processes().values() {
-            if child.parent() == Some(pid) {
-                pending.push(child.pid());
-            }
-        }
-    }
-
-    false
-}
-
-fn cancel_run_namespace(
-    backend: SessionBackend,
-    namespace: &str,
-    agent: &str,
-) -> anyhow::Result<()> {
-    let _ = backend;
-    if let Some(metadata) = codex_app_session_metadata(namespace)? {
-        if metadata
-            .context
-            .as_ref()
-            .and_then(|context| context.turn_status.as_deref())
-            == Some("inProgress")
-        {
-            let _ = tell_codex_app(
-                namespace,
-                "Stop the current turn and wait for operator guidance.",
-            );
-            thread::sleep(Duration::from_millis(200));
-            let _ = interrupt_codex_app(namespace);
-            thread::sleep(Duration::from_millis(100));
-        }
-        return kill_session_if_exists(backend, namespace);
-    }
-
-    if probe_namespace_run_state(backend, namespace)? == NamespaceRunState::ActiveCodex {
-        let _ = tell_native(namespace, agent, "/clear", true);
-        thread::sleep(Duration::from_millis(200));
-        let _ = interrupt_native(namespace, agent);
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    kill_session_if_exists(backend, namespace)
-}
-
-fn kill_session_if_exists(backend: SessionBackend, namespace: &str) -> anyhow::Result<()> {
-    let _ = backend;
-    if codex_app_session_metadata(namespace)?.is_some() {
-        return delete_codex_app_session(namespace);
-    }
-    if native_session_metadata(namespace)?.is_none() {
-        return Ok(());
-    }
-    delete_native_session(namespace)
 }
 
 fn resolve_ticket_session_id(

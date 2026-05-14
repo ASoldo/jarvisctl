@@ -1,5 +1,6 @@
 use anyhow::{Context, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -25,6 +26,8 @@ pub struct TicketFrontmatter {
     #[serde(default)]
     pub repo_path: Option<String>,
     #[serde(default)]
+    pub codex_driver: Option<String>,
+    #[serde(default)]
     pub codex_sandbox_mode: Option<String>,
     #[serde(default)]
     pub codex_approval_policy: Option<String>,
@@ -33,7 +36,49 @@ pub struct TicketFrontmatter {
     #[serde(default)]
     pub codex_model: Option<String>,
     #[serde(default)]
+    pub codex_model_provider: Option<String>,
+    #[serde(default)]
     pub codex_reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub codex_reasoning_summary: Option<String>,
+    #[serde(default)]
+    pub codex_personality: Option<String>,
+    #[serde(default)]
+    pub codex_service_name: Option<String>,
+    #[serde(default)]
+    pub codex_service_tier: Option<String>,
+    #[serde(default)]
+    pub codex_approvals_reviewer: Option<String>,
+    #[serde(default)]
+    pub codex_thread_source: Option<String>,
+    #[serde(default)]
+    pub codex_session_start_source: Option<String>,
+    #[serde(default)]
+    pub codex_ephemeral: Option<bool>,
+    #[serde(default)]
+    pub codex_developer_instructions: Option<String>,
+    #[serde(default)]
+    pub codex_base_instructions: Option<String>,
+    #[serde(default)]
+    pub codex_permission_profile: Option<String>,
+    #[serde(default)]
+    pub codex_permission_additional_writable_roots: Vec<String>,
+    #[serde(default)]
+    pub codex_goal: Option<String>,
+    #[serde(default)]
+    pub codex_goal_token_budget: Option<u64>,
+    #[serde(default)]
+    pub codex_memory_mode: Option<String>,
+    #[serde(default)]
+    pub codex_enable_features: Vec<String>,
+    #[serde(default)]
+    pub codex_disable_features: Vec<String>,
+    #[serde(default)]
+    pub codex_environments: Vec<String>,
+    #[serde(default)]
+    pub codex_app_thread_config: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub codex_app_turn_config: BTreeMap<String, Value>,
     #[serde(default)]
     pub codex_completion_status: Option<String>,
     #[serde(default)]
@@ -109,6 +154,7 @@ impl TicketNote {
         );
 
         self.codex_cli_args()?;
+        self.validate_codex_app_protocol_fields()?;
         self.finish_session_policy()?;
 
         Ok(())
@@ -239,6 +285,18 @@ impl TicketNote {
             args.push(format!("model_reasoning_effort=\"{}\"", normalized));
         }
 
+        if let Some(reasoning_summary) = self.frontmatter.codex_reasoning_summary.as_deref() {
+            let normalized = reasoning_summary.trim();
+            ensure!(
+                matches!(normalized, "none" | "auto" | "concise" | "detailed"),
+                "ticket '{}' has unsupported codex_reasoning_summary '{}'",
+                self.path.display(),
+                reasoning_summary
+            );
+            args.push("--config".to_string());
+            args.push(format!("model_reasoning_summary=\"{}\"", normalized));
+        }
+
         if let Some(sandbox_mode) = self.frontmatter.codex_sandbox_mode.as_deref() {
             let normalized = sandbox_mode.trim();
             ensure!(
@@ -273,6 +331,42 @@ impl TicketNote {
             args.push("--search".to_string());
         }
 
+        if let Some(memory_mode) = self.frontmatter.codex_memory_mode.as_deref() {
+            match memory_mode.trim() {
+                "enabled" => {
+                    args.push("--enable".to_string());
+                    args.push("memories".to_string());
+                }
+                "disabled" => {
+                    args.push("--disable".to_string());
+                    args.push("memories".to_string());
+                }
+                _ => {}
+            }
+        }
+
+        for feature in &self.frontmatter.codex_enable_features {
+            let trimmed = feature.trim();
+            ensure!(
+                !trimmed.is_empty(),
+                "ticket '{}' contains an empty codex_enable_features entry",
+                self.path.display()
+            );
+            args.push("--enable".to_string());
+            args.push(trimmed.to_string());
+        }
+
+        for feature in &self.frontmatter.codex_disable_features {
+            let trimmed = feature.trim();
+            ensure!(
+                !trimmed.is_empty(),
+                "ticket '{}' contains an empty codex_disable_features entry",
+                self.path.display()
+            );
+            args.push("--disable".to_string());
+            args.push(trimmed.to_string());
+        }
+
         for add_dir in &self.frontmatter.codex_add_dirs {
             let trimmed = add_dir.trim();
             ensure!(
@@ -290,14 +384,29 @@ impl TicketNote {
     pub fn codex_runtime_summary(&self) -> Option<String> {
         let mut parts = Vec::new();
 
+        if let Some(driver) = self.frontmatter.codex_driver.as_deref() {
+            parts.push(format!("driver={}", driver));
+        }
         if let Some(profile) = self.frontmatter.codex_profile.as_deref() {
             parts.push(format!("profile={}", profile));
         }
         if let Some(model) = self.frontmatter.codex_model.as_deref() {
             parts.push(format!("model={}", model));
         }
+        if let Some(model_provider) = self.frontmatter.codex_model_provider.as_deref() {
+            parts.push(format!("provider={}", model_provider));
+        }
         if let Some(reasoning_effort) = self.frontmatter.codex_reasoning_effort.as_deref() {
             parts.push(format!("reasoning={}", reasoning_effort));
+        }
+        if let Some(reasoning_summary) = self.frontmatter.codex_reasoning_summary.as_deref() {
+            parts.push(format!("summary={}", reasoning_summary));
+        }
+        if let Some(personality) = self.frontmatter.codex_personality.as_deref() {
+            parts.push(format!("personality={}", personality));
+        }
+        if let Some(permission_profile) = self.frontmatter.codex_permission_profile.as_deref() {
+            parts.push(format!("permission_profile={}", permission_profile));
         }
         parts.push(format!(
             "finish={}",
@@ -316,6 +425,24 @@ impl TicketNote {
             parts.push(format!(
                 "add_dirs={}",
                 self.frontmatter.codex_add_dirs.join(",")
+            ));
+        }
+        if !self.frontmatter.codex_environments.is_empty() {
+            parts.push(format!(
+                "environments={}",
+                self.frontmatter.codex_environments.join(",")
+            ));
+        }
+        if let Some(goal) = self.frontmatter.codex_goal.as_deref() {
+            parts.push(format!("goal={}", truncate_summary(goal, 72)));
+        }
+        if let Some(memory_mode) = self.frontmatter.codex_memory_mode.as_deref() {
+            parts.push(format!("memory={}", memory_mode));
+        }
+        if !self.frontmatter.codex_enable_features.is_empty() {
+            parts.push(format!(
+                "features={}",
+                self.frontmatter.codex_enable_features.join(",")
             ));
         }
 
@@ -362,6 +489,118 @@ impl TicketNote {
         );
         Ok(policy)
     }
+
+    fn validate_codex_app_protocol_fields(&self) -> anyhow::Result<()> {
+        if let Some(personality) = self.frontmatter.codex_personality.as_deref() {
+            ensure!(
+                matches!(personality.trim(), "none" | "friendly" | "pragmatic"),
+                "ticket '{}' has unsupported codex_personality '{}'",
+                self.path.display(),
+                personality
+            );
+        }
+        if let Some(reviewer) = self.frontmatter.codex_approvals_reviewer.as_deref() {
+            ensure!(
+                matches!(
+                    reviewer.trim(),
+                    "user" | "auto_review" | "guardian_subagent"
+                ),
+                "ticket '{}' has unsupported codex_approvals_reviewer '{}'",
+                self.path.display(),
+                reviewer
+            );
+        }
+        if let Some(thread_source) = self.frontmatter.codex_thread_source.as_deref() {
+            ensure!(
+                matches!(
+                    thread_source.trim(),
+                    "user" | "subagent" | "memory_consolidation"
+                ),
+                "ticket '{}' has unsupported codex_thread_source '{}'",
+                self.path.display(),
+                thread_source
+            );
+        }
+        if let Some(source) = self.frontmatter.codex_session_start_source.as_deref() {
+            ensure!(
+                matches!(source.trim(), "startup" | "clear"),
+                "ticket '{}' has unsupported codex_session_start_source '{}'",
+                self.path.display(),
+                source
+            );
+        }
+        if let Some(memory_mode) = self.frontmatter.codex_memory_mode.as_deref() {
+            ensure!(
+                matches!(memory_mode.trim(), "enabled" | "disabled"),
+                "ticket '{}' has unsupported codex_memory_mode '{}'",
+                self.path.display(),
+                memory_mode
+            );
+        }
+        if let Some(service_name) = self.frontmatter.codex_service_name.as_deref() {
+            ensure!(
+                !service_name.trim().is_empty(),
+                "ticket '{}' has an empty codex_service_name",
+                self.path.display()
+            );
+        }
+        if let Some(service_tier) = self.frontmatter.codex_service_tier.as_deref() {
+            ensure!(
+                !service_tier.trim().is_empty(),
+                "ticket '{}' has an empty codex_service_tier",
+                self.path.display()
+            );
+        }
+        if let Some(model_provider) = self.frontmatter.codex_model_provider.as_deref() {
+            ensure!(
+                !model_provider.trim().is_empty(),
+                "ticket '{}' has an empty codex_model_provider",
+                self.path.display()
+            );
+        }
+        if let Some(permission_profile) = self.frontmatter.codex_permission_profile.as_deref() {
+            ensure!(
+                !permission_profile.trim().is_empty(),
+                "ticket '{}' has an empty codex_permission_profile",
+                self.path.display()
+            );
+        }
+        if let Some(goal) = self.frontmatter.codex_goal.as_deref() {
+            ensure!(
+                !goal.trim().is_empty(),
+                "ticket '{}' has an empty codex_goal",
+                self.path.display()
+            );
+        }
+        for root in &self.frontmatter.codex_permission_additional_writable_roots {
+            ensure!(
+                !root.trim().is_empty(),
+                "ticket '{}' contains an empty codex_permission_additional_writable_roots entry",
+                self.path.display()
+            );
+        }
+        for environment in &self.frontmatter.codex_environments {
+            ensure!(
+                !environment.trim().is_empty(),
+                "ticket '{}' contains an empty codex_environments entry",
+                self.path.display()
+            );
+        }
+        Ok(())
+    }
+}
+
+fn truncate_summary(raw: &str, limit: usize) -> String {
+    let normalized = raw.replace('\n', " ").trim().to_string();
+    if normalized.chars().count() <= limit {
+        return normalized;
+    }
+    let mut rendered = normalized
+        .chars()
+        .take(limit.saturating_sub(1))
+        .collect::<String>();
+    rendered.push_str("...");
+    rendered
 }
 
 fn split_frontmatter(raw: &str) -> anyhow::Result<(String, String)> {

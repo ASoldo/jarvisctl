@@ -5,15 +5,12 @@ use crate::codex::{
 };
 use crate::codex_app::{collect_codex_app_sessions, delete_codex_app_session};
 use crate::native::{
-    NativeSessionCompletion, NativeSessionMetadata, RuntimeContextMetadata,
-    collect_native_sessions, delete_native_session, native_session_completion,
+    NativeSessionMetadata, RuntimeContextMetadata, collect_native_sessions, delete_native_session,
 };
 use crate::ticket::slugify;
 use anyhow::{Context, anyhow, bail, ensure};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
 use clap::ValueEnum;
-use cron::Schedule;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_yaml::Value;
@@ -21,18 +18,27 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
-use std::str::FromStr;
-use std::sync::mpsc;
-use std::thread;
+use std::process::Command as ProcessCommand;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
-use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 use tracing::error;
 
+mod kubernetes;
+mod reporting;
+mod storage;
+
+use kubernetes::*;
+pub use kubernetes::{apply_kubernetes_resources, render_kubernetes_resources};
+use reporting::*;
+pub use reporting::{
+    render_describe_output, render_get_output, render_rollout_history_output,
+    render_rollout_status_output, wait_for_rollout_status_output,
+};
+use storage::*;
+
 const API_VERSION: &str = "jarvisctl.io/v1alpha1";
-const JOB_COMPLETION_GRACE_MS: u128 = 5_000;
-const WORKER_RUN_STARTUP_GRACE_MS: u128 = 2_000;
 const DEFAULT_KUBERNETES_RUNTIME_IMAGE: &str = "node:25-bookworm-slim";
 const DEFAULT_KUBERNETES_RUNTIME_CONTROL_PORT: u16 = 47832;
 
@@ -51,6 +57,8 @@ pub enum KubernetesRenderOutput {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum ControlPlaneResourceKindArg {
+    #[value(alias = "node", alias = "nodes")]
+    Node,
     #[value(alias = "namespace", alias = "namespaces")]
     Namespace,
     #[value(alias = "deployment", alias = "deployments")]
@@ -62,22 +70,6 @@ pub enum ControlPlaneResourceKindArg {
         alias = "replica-sets"
     )]
     ReplicaSet,
-    #[value(alias = "job", alias = "jobs")]
-    Job,
-    #[value(
-        alias = "cronjob",
-        alias = "cronjobs",
-        alias = "cron-job",
-        alias = "cron-jobs"
-    )]
-    CronJob,
-    #[value(
-        alias = "application",
-        alias = "applications",
-        alias = "app",
-        alias = "apps"
-    )]
-    Application,
     #[value(alias = "service", alias = "services")]
     Service,
     #[value(
@@ -93,26 +85,88 @@ pub enum ControlPlaneResourceKindArg {
     Secret,
     #[value(alias = "volume", alias = "volumes")]
     Volume,
-    #[value(alias = "worker", alias = "workers")]
-    Worker,
     #[value(alias = "resources")]
     All,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResourceKind {
+    Node,
     Namespace,
     Deployment,
     ReplicaSet,
-    Job,
-    CronJob,
-    Application,
     Service,
     NetworkPolicy,
     ConfigMap,
     Secret,
     Volume,
-    Worker,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NodeSpec {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default, rename = "sshHost", skip_serializing_if = "Option::is_none")]
+    pub ssh_host: Option<String>,
+    #[serde(default, rename = "sshUser", skip_serializing_if = "Option::is_none")]
+    pub ssh_user: Option<String>,
+    #[serde(
+        default,
+        rename = "workspaceRoot",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workspace_root: Option<String>,
+    #[serde(
+        default,
+        rename = "maxSessions",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_sessions: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cordoned: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub taints: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub capabilities: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NodeRegisterOptions {
+    pub name: String,
+    pub address: Option<String>,
+    pub ssh_host: Option<String>,
+    pub ssh_user: Option<String>,
+    pub roles: Vec<String>,
+    pub labels: BTreeMap<String, String>,
+    pub workspace_root: Option<String>,
+    pub max_sessions: Option<usize>,
+    pub local: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeVisitOptions {
+    pub node: String,
+    pub prompt: String,
+    pub working_directory: Option<String>,
+    pub namespace: Option<String>,
+    pub timeout_seconds: u64,
+    pub sandbox_mode: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub ephemeral: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeVisitResult {
+    pub node: String,
+    pub namespace: String,
+    pub exit_status: i32,
+    pub final_message: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub cleanup_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -178,236 +232,6 @@ pub struct VolumeSpec {
     pub access_policy: ResourceAccessPolicy,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkerProvider {
-    #[default]
-    Ollama,
-    Nvidia,
-    Moonshot,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkerOutputMode {
-    #[default]
-    Text,
-    Json,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkerLocality {
-    #[default]
-    Local,
-    Remote,
-    Cloud,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct WorkerSpec {
-    #[serde(default)]
-    pub provider: WorkerProvider,
-    pub model: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
-    #[serde(default, rename = "apiKeyEnv", skip_serializing_if = "Option::is_none")]
-    pub api_key_env: Option<String>,
-    #[serde(
-        default,
-        rename = "apiKeySecretRef",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub api_key_secret_ref: Option<SecretKeyRef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub role: Option<String>,
-    #[serde(
-        default,
-        rename = "systemPrompt",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub system_prompt: Option<String>,
-    #[serde(
-        default,
-        rename = "outputMode",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub output_mode: Option<WorkerOutputMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
-    #[serde(default, rename = "topP", skip_serializing_if = "Option::is_none")]
-    pub top_p: Option<f32>,
-    #[serde(
-        default,
-        rename = "frequencyPenalty",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub frequency_penalty: Option<f32>,
-    #[serde(
-        default,
-        rename = "presencePenalty",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub presence_penalty: Option<f32>,
-    #[serde(
-        default,
-        rename = "numPredict",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub num_predict: Option<u32>,
-    #[serde(default, rename = "numCtx", skip_serializing_if = "Option::is_none")]
-    pub num_ctx: Option<u32>,
-    #[serde(default, rename = "memoryMiB", skip_serializing_if = "Option::is_none")]
-    pub memory_mib: Option<u64>,
-    #[serde(
-        default,
-        rename = "gpuMemoryMiB",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub gpu_memory_mib: Option<u64>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub capabilities: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub classes: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pool: Option<String>,
-    #[serde(
-        default,
-        rename = "maxConcurrent",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub max_concurrent: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub locality: Option<WorkerLocality>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SecretKeyRef {
-    pub name: String,
-    pub key: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub namespace: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct WorkerJobSpec {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(default, rename = "className", skip_serializing_if = "Option::is_none")]
-    pub class_name: Option<String>,
-    #[serde(
-        default,
-        rename = "fallbackClassNames",
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    pub fallback_class_names: Vec<String>,
-    #[serde(
-        default,
-        rename = "resourceNamespace",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub resource_namespace: Option<String>,
-    #[serde(
-        default,
-        rename = "serviceName",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub service_name: Option<String>,
-    #[serde(
-        default,
-        rename = "serviceNamespace",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub service_namespace: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selector: Option<LabelSelector>,
-    #[serde(
-        default,
-        rename = "requiredCapabilities",
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    pub required_capabilities: Vec<String>,
-    #[serde(
-        default,
-        rename = "preferredProviders",
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    pub preferred_providers: Vec<WorkerProvider>,
-    #[serde(default, rename = "preferLocal")]
-    pub prefer_local: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub intent: Option<String>,
-    pub prompt: String,
-    #[serde(
-        default,
-        rename = "timeoutSeconds",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub timeout_seconds: Option<u64>,
-    #[serde(
-        default,
-        rename = "outputPath",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub output_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub validation: Option<WorkerValidationSpec>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct WorkerValidationSpec {
-    #[serde(
-        default,
-        rename = "shellCommand",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub shell_command: Option<String>,
-    #[serde(default, rename = "failJobOnFailure", skip_serializing_if = "is_false")]
-    pub fail_job_on_failure: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct WorkerOffloadRequest {
-    pub service_name: String,
-    pub resource_namespace: Option<String>,
-    pub prompt: String,
-    pub intent: Option<String>,
-    pub timeout_seconds: Option<u64>,
-    pub output_path: Option<String>,
-    pub job_name: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerOffloadResult {
-    pub job_name: String,
-    pub namespace: String,
-    pub service_name: String,
-    pub phase: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub selected_class: Option<String>,
-    pub fallback_class: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker_namespace: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker_provider: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker_model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker_locality: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub validation_state: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub validation_message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub artifact_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ServiceRoutingStrategy {
@@ -421,7 +245,6 @@ pub enum ServiceRoutingStrategy {
 pub enum ServiceTargetKind {
     #[default]
     Runtime,
-    Worker,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -436,28 +259,6 @@ pub struct ServiceSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub target_kind: Option<ServiceTargetKind>,
-    #[serde(default, rename = "className", skip_serializing_if = "Option::is_none")]
-    pub class_name: Option<String>,
-    #[serde(
-        default,
-        rename = "fallbackClassNames",
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    pub fallback_class_names: Vec<String>,
-    #[serde(
-        default,
-        rename = "requiredCapabilities",
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    pub required_capabilities: Vec<String>,
-    #[serde(
-        default,
-        rename = "preferredProviders",
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    pub preferred_providers: Vec<WorkerProvider>,
-    #[serde(default, rename = "preferLocal", skip_serializing_if = "is_false")]
-    pub prefer_local: bool,
     #[serde(
         default,
         rename = "allowedIntents",
@@ -613,6 +414,14 @@ pub struct DeploymentTemplateSpec {
     pub secrets: Vec<EnvBindingRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<VolumeBindingRef>,
+    #[serde(
+        default,
+        rename = "nodeSelector",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub node_selector: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tolerations: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -858,160 +667,6 @@ impl Default for ReplicaSetSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JobSpec {
-    #[serde(default = "default_parallelism")]
-    pub parallelism: usize,
-    #[serde(default = "default_completions")]
-    pub completions: usize,
-    #[serde(default = "default_agents")]
-    pub agents: usize,
-    #[serde(default, rename = "backoffLimit")]
-    pub backoff_limit: usize,
-    #[serde(default)]
-    pub suspend: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub driver: Option<CodexRuntimeDriver>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub startup_delay_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker: Option<WorkerJobSpec>,
-    #[serde(default)]
-    pub template: DeploymentTemplateSpec,
-}
-
-impl Default for JobSpec {
-    fn default() -> Self {
-        Self {
-            parallelism: default_parallelism(),
-            completions: default_completions(),
-            agents: default_agents(),
-            backoff_limit: default_backoff_limit(),
-            suspend: false,
-            driver: None,
-            startup_delay_ms: None,
-            worker: None,
-            template: DeploymentTemplateSpec::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct JobTemplateSpec {
-    pub spec: JobSpec,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub enum CronJobConcurrencyPolicy {
-    #[serde(rename = "Allow")]
-    #[default]
-    Allow,
-    #[serde(rename = "Forbid")]
-    Forbid,
-    #[serde(rename = "Replace")]
-    Replace,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CronJobSpec {
-    pub schedule: String,
-    #[serde(default)]
-    pub suspend: bool,
-    #[serde(default, rename = "concurrencyPolicy")]
-    pub concurrency_policy: CronJobConcurrencyPolicy,
-    #[serde(
-        default = "default_successful_jobs_history_limit",
-        rename = "successfulJobsHistoryLimit"
-    )]
-    pub successful_jobs_history_limit: usize,
-    #[serde(
-        default = "default_failed_jobs_history_limit",
-        rename = "failedJobsHistoryLimit"
-    )]
-    pub failed_jobs_history_limit: usize,
-    #[serde(rename = "jobTemplate")]
-    pub job_template: JobTemplateSpec,
-}
-
-impl Default for CronJobSpec {
-    fn default() -> Self {
-        Self {
-            schedule: "* * * * *".to_string(),
-            suspend: false,
-            concurrency_policy: CronJobConcurrencyPolicy::Allow,
-            successful_jobs_history_limit: default_successful_jobs_history_limit(),
-            failed_jobs_history_limit: default_failed_jobs_history_limit(),
-            job_template: JobTemplateSpec::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ApplicationSourceSpec {
-    pub path: String,
-    #[serde(
-        default,
-        rename = "repoURL",
-        alias = "repoUrl",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub repo_url: Option<String>,
-    #[serde(
-        default,
-        rename = "targetRevision",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub target_revision: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ApplicationDestinationSpec {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub namespace: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApplicationAutomatedSyncPolicy {
-    #[serde(default = "default_true")]
-    pub enable: bool,
-    #[serde(default = "default_true", rename = "prune")]
-    pub prune: bool,
-    #[serde(default = "default_true", rename = "selfHeal")]
-    pub self_heal: bool,
-}
-
-impl Default for ApplicationAutomatedSyncPolicy {
-    fn default() -> Self {
-        Self {
-            enable: true,
-            prune: true,
-            self_heal: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApplicationSyncPolicy {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub automated: Option<ApplicationAutomatedSyncPolicy>,
-}
-
-impl Default for ApplicationSyncPolicy {
-    fn default() -> Self {
-        Self {
-            automated: Some(ApplicationAutomatedSyncPolicy::default()),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct ApplicationSpec {
-    pub source: ApplicationSourceSpec,
-    pub destination: ApplicationDestinationSpec,
-    #[serde(default, rename = "syncPolicy")]
-    pub sync_policy: ApplicationSyncPolicy,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceEnvelope<T> {
     #[serde(rename = "apiVersion")]
     pub api_version: String,
@@ -1023,32 +678,15 @@ pub struct ResourceEnvelope<T> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 enum ResourceManifest {
+    Node(ResourceEnvelope<NodeSpec>),
     Namespace(ResourceEnvelope<NamespaceSpec>),
     Deployment(ResourceEnvelope<DeploymentSpec>),
     ReplicaSet(ResourceEnvelope<ReplicaSetSpec>),
-    Job(ResourceEnvelope<JobSpec>),
-    CronJob(ResourceEnvelope<CronJobSpec>),
-    Application(ResourceEnvelope<ApplicationSpec>),
     Service(ResourceEnvelope<ServiceSpec>),
     NetworkPolicy(ResourceEnvelope<NetworkPolicySpec>),
     ConfigMap(ResourceEnvelope<ConfigMapSpec>),
     Secret(ResourceEnvelope<SecretSpec>),
     Volume(ResourceEnvelope<VolumeSpec>),
-    Worker(ResourceEnvelope<WorkerSpec>),
-}
-
-#[derive(Debug, Clone)]
-struct KubernetesCompilation {
-    manifests: Vec<serde_json::Value>,
-    warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct KubernetesResolvedWorker {
-    worker: ResourceEnvelope<WorkerSpec>,
-    service_name: Option<String>,
-    selected_class: Option<String>,
-    fallback_class: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1058,6 +696,21 @@ struct ResourceSummary {
     name: String,
     status: String,
     detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NodeStatus {
+    available: bool,
+    schedulable: bool,
+    roles: Vec<String>,
+    address: Option<String>,
+    ssh_target: Option<String>,
+    architecture: Option<String>,
+    operating_system: Option<String>,
+    codex: Option<String>,
+    codex_auth: Option<String>,
+    jarvisctl: Option<String>,
+    message: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1098,52 +751,6 @@ struct ReplicaSetStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct JobStatus {
-    completions: usize,
-    pending: usize,
-    active: usize,
-    succeeded: usize,
-    failed: usize,
-    runs: Vec<String>,
-    run_details: Vec<JobRunDetail>,
-    conditions: Vec<StatusCondition>,
-    events: Vec<StatusEvent>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct CronJobStatus {
-    schedule: String,
-    active_jobs: Vec<String>,
-    last_schedule_epoch_ms: Option<u128>,
-    successful_jobs: usize,
-    failed_jobs: usize,
-    history: Vec<CronJobJobHistoryEntry>,
-    conditions: Vec<StatusCondition>,
-    events: Vec<StatusEvent>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ApplicationStatus {
-    source_path: String,
-    repo_url: Option<String>,
-    source_type: String,
-    source_root: Option<String>,
-    target_revision: String,
-    source_revision: String,
-    source_dirty: bool,
-    resolved_revision: String,
-    last_applied_revision: Option<String>,
-    sync_status: String,
-    health_status: String,
-    destination_namespace: Option<String>,
-    rendered_resources: usize,
-    last_sync_epoch_ms: Option<u128>,
-    history: Vec<ApplicationSyncHistoryEntry>,
-    conditions: Vec<StatusCondition>,
-    events: Vec<StatusEvent>,
-}
-
-#[derive(Debug, Clone, Serialize)]
 struct StatusCondition {
     #[serde(rename = "type")]
     condition_type: String,
@@ -1162,63 +769,6 @@ struct StatusEvent {
     epoch_ms: u128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     related: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct CronJobJobHistoryEntry {
-    job_name: String,
-    phase: String,
-    scheduled_at_epoch_ms: Option<u128>,
-    last_transition_epoch_ms: Option<u128>,
-    pending: usize,
-    active: usize,
-    succeeded: usize,
-    failed: usize,
-    worker_backed: bool,
-    workers: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ApplicationSourceResolution {
-    repo_url: Option<String>,
-    source_type: String,
-    source_root: Option<String>,
-    source_revision: String,
-    source_dirty: bool,
-    render_path: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-struct ApplicationDesiredState {
-    source: ApplicationSourceResolution,
-    rendered: Vec<ResourceManifest>,
-    rendered_resources: BTreeSet<RenderedResourceRef>,
-    resolved_revision: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ApplicationDiffEntry {
-    action: String,
-    kind: String,
-    namespace: Option<String>,
-    name: String,
-    detail: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ApplicationDiffResult {
-    application: String,
-    namespace: String,
-    repo_url: Option<String>,
-    source_type: String,
-    source_revision: String,
-    source_dirty: bool,
-    target_revision: String,
-    resolved_revision: String,
-    creates: usize,
-    updates: usize,
-    deletes: usize,
-    changes: Vec<ApplicationDiffEntry>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1246,11 +796,6 @@ struct ServiceStatus {
     target_kind: String,
     endpoints: Vec<String>,
     strategy: ServiceRoutingStrategy,
-    class_name: Option<String>,
-    fallback_class_names: Vec<String>,
-    required_capabilities: Vec<String>,
-    preferred_providers: Vec<String>,
-    prefer_local: bool,
     allowed_intents: Vec<String>,
     access_policy: ResourceAccessPolicyStatus,
 }
@@ -1259,31 +804,6 @@ struct ServiceStatus {
 struct NetworkPolicyStatus {
     selected_sessions: Vec<String>,
     policy_types: Vec<NetworkPolicyType>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct WorkerStatus {
-    provider: String,
-    model: String,
-    endpoint: String,
-    locality: String,
-    role: Option<String>,
-    capabilities: Vec<String>,
-    classes: Vec<String>,
-    pool: Option<String>,
-    output_mode: String,
-    max_concurrent: usize,
-    active_runs: usize,
-    pending_runs: usize,
-    available_slots: usize,
-    admission: String,
-    admission_code: String,
-    admission_reason: String,
-    estimated_memory_mib: Option<u64>,
-    estimated_gpu_memory_mib: Option<u64>,
-    machine_memory_available_mib: Option<u64>,
-    machine_gpu_memory_available_mib: Option<u64>,
-    loaded: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1306,37 +826,6 @@ struct VolumeStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct JobRunDetail {
-    name: String,
-    execution_id: String,
-    backend: String,
-    phase: String,
-    service_name: Option<String>,
-    intent: Option<String>,
-    selected_class: Option<String>,
-    fallback_class: bool,
-    worker: Option<String>,
-    worker_namespace: Option<String>,
-    worker_provider: Option<String>,
-    worker_model: Option<String>,
-    worker_locality: Option<String>,
-    worker_pool: Option<String>,
-    worker_classes: Vec<String>,
-    admission_state: Option<String>,
-    admission_code: Option<String>,
-    validation_state: Option<String>,
-    validation_message: Option<String>,
-    validation_enforced: bool,
-    reason: Option<String>,
-    created_at_epoch_ms: u128,
-    completed_at_epoch_ms: Option<u128>,
-    artifact_path: Option<String>,
-    output_path: Option<String>,
-    error: Option<String>,
-    events: Vec<StatusEvent>,
-}
-
-#[derive(Debug, Clone, Serialize)]
 struct NamespaceStatus {
     resources: usize,
     sessions: usize,
@@ -1351,179 +840,6 @@ struct DescribeEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ServiceRouteState {
     next_index: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct JobRunState {
-    name: String,
-    runtime_namespace: String,
-    created_at_epoch_ms: u128,
-    #[serde(default)]
-    backend: JobRunBackend,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    worker_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    worker_namespace: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    service_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    intent: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    selected_class: Option<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    fallback_class: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    worker_locality: Option<WorkerLocality>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    admission_state: Option<JobRunAdmissionState>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    admission_code: Option<WorkerAdmissionCode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    validation_state: Option<WorkerRunValidationState>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    validation_message: Option<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    validation_enforced: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    admission_reason: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_active_epoch_ms: Option<u128>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    completed_at_epoch_ms: Option<u128>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    artifact_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    output_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_error: Option<String>,
-    status: JobRunPhase,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum JobRunBackend {
-    #[default]
-    Runtime,
-    Worker,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum JobRunAdmissionState {
-    Pending,
-    Granted,
-    Rejected,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum WorkerAdmissionCode {
-    Ready,
-    CapacitySaturated,
-    MemoryPressure,
-    GpuPressure,
-    CredentialsMissing,
-    NoMatchingWorker,
-    WaitingForNamedWorker,
-    RemoteFallback,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum WorkerRunValidationState {
-    Passed,
-    Failed,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum JobRunPhase {
-    Pending,
-    #[default]
-    Active,
-    Succeeded,
-    Failed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct JobControllerState {
-    runs: Vec<JobRunState>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkerRunLaunchManifest {
-    control_namespace: String,
-    job_name: String,
-    execution_id: String,
-    worker_name: String,
-    worker_namespace: String,
-    prompt: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    timeout_seconds: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    output_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    validation: Option<WorkerValidationSpec>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkerRunCompletion {
-    execution_id: String,
-    worker_name: String,
-    status: JobRunPhase,
-    completed_at_epoch_ms: u128,
-    artifact_path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    output_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    validation_state: Option<WorkerRunValidationState>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    validation_message: Option<String>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    validation_enforced: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct WorkerValidationOutcome {
-    state: WorkerRunValidationState,
-    message: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct CronJobControllerState {
-    last_schedule_epoch_ms: Option<u128>,
-    jobs: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct ApplicationControllerState {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_sync_epoch_ms: Option<u128>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    rendered_resources: Vec<RenderedResourceRef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_attempted_revision: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_applied_revision: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    history: Vec<ApplicationSyncHistoryEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
-struct RenderedResourceRef {
-    kind: String,
-    name: String,
-    namespace: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ApplicationSyncHistoryEntry {
-    revision: String,
-    synced_at_epoch_ms: u128,
-    rendered_resources: usize,
-    source_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1576,6 +892,643 @@ struct KustomizePatchTarget {
 #[derive(Debug, Clone)]
 pub struct ServiceResolution {
     pub runtime_namespace: String,
+}
+
+pub fn register_node(options: NodeRegisterOptions) -> anyhow::Result<Vec<String>> {
+    let mut metadata = ResourceMetadata {
+        name: options.name.trim().to_string(),
+        namespace: None,
+        labels: options.labels,
+        annotations: BTreeMap::new(),
+    };
+    normalize_metadata(&mut metadata, true)?;
+    if options.local {
+        metadata
+            .labels
+            .insert("jarvisctl.io/local".to_string(), "true".to_string());
+    }
+
+    let mut capabilities = BTreeMap::new();
+    if options.local {
+        capabilities.extend(probe_local_capabilities());
+    }
+
+    let manifest = ResourceEnvelope {
+        api_version: API_VERSION.to_string(),
+        kind: "Node".to_string(),
+        metadata,
+        spec: NodeSpec {
+            roles: options.roles,
+            address: options.address,
+            ssh_host: options.ssh_host,
+            ssh_user: options.ssh_user,
+            workspace_root: options.workspace_root,
+            max_sessions: options.max_sessions,
+            cordoned: false,
+            taints: Vec::new(),
+            capabilities,
+        },
+    };
+    validate_node(&manifest)?;
+    let name = manifest.metadata.name.clone();
+    save_manifest(&ResourceManifest::Node(manifest))?;
+    Ok(vec![format!("registered Node {}", name)])
+}
+
+pub fn set_node_cordoned(name: &str, cordoned: bool) -> anyhow::Result<String> {
+    let manifest = load_manifest(ResourceKind::Node, name, None)?;
+    let ResourceManifest::Node(mut node) = manifest else {
+        bail!("resource '{}' is not a Node", name);
+    };
+    node.spec.cordoned = cordoned;
+    save_manifest(&ResourceManifest::Node(node.clone()))?;
+    Ok(format!(
+        "{} Node {}",
+        if cordoned { "cordoned" } else { "uncordoned" },
+        node.metadata.name
+    ))
+}
+
+pub fn sync_codex_auth_to_node(name: &str) -> anyhow::Result<String> {
+    let manifest = load_manifest(ResourceKind::Node, name, None)?;
+    let ResourceManifest::Node(node) = manifest else {
+        bail!("resource '{}' is not a Node", name);
+    };
+    let files = local_codex_auth_files()?;
+    if node_is_local(&node) {
+        return Ok(format!(
+            "Node '{}' is local; Codex auth already lives in {}",
+            node.metadata.name,
+            local_codex_dir()?.display()
+        ));
+    }
+    sync_codex_auth_to_remote_node(&node, &files)?;
+    Ok(format!(
+        "Synced {} Codex auth/config file(s) to Node '{}' over SSH",
+        files.len(),
+        node.metadata.name
+    ))
+}
+
+pub fn run_node_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitResult> {
+    ensure!(
+        !options.prompt.trim().is_empty(),
+        "visit prompt must not be empty"
+    );
+    let manifest = load_manifest(ResourceKind::Node, &options.node, None)?;
+    let ResourceManifest::Node(node) = manifest else {
+        bail!("resource '{}' is not a Node", options.node);
+    };
+    ensure!(
+        !node_is_local(&node),
+        "visit currently targets remote SSH nodes; '{}' is local",
+        node.metadata.name
+    );
+    let target = node_ssh_target(&node.spec)
+        .ok_or_else(|| anyhow!("Node '{}' has no SSH target", node.metadata.name))?;
+    let namespace = options
+        .namespace
+        .clone()
+        .unwrap_or_else(|| format!("visit-{}-{}", slugify(&node.metadata.name), now_epoch_ms()));
+    let auth_files = local_codex_auth_files()?;
+    sync_codex_auth_to_remote_node_for_namespace(&node, &auth_files, &namespace).with_context(
+        || {
+            format!(
+                "failed to sync leased Codex auth before visit '{}' on Node '{}'",
+                namespace, node.metadata.name
+            )
+        },
+    )?;
+
+    let visit_result = run_remote_codex_exec_visit(&target, &options, &namespace);
+    let cleanup_result = cleanup_codex_auth_lease_on_remote_node(&node, &namespace);
+
+    let mut result = visit_result?;
+    result.cleanup_status = match cleanup_result {
+        Ok(()) => "restored".to_string(),
+        Err(error) => format!("failed: {error}"),
+    };
+    ensure!(
+        result.cleanup_status == "restored",
+        "visit '{}' completed, but Codex auth cleanup failed on Node '{}': {}",
+        namespace,
+        node.metadata.name,
+        result.cleanup_status
+    );
+    Ok(result)
+}
+
+pub fn render_node_probe_output(name: &str, output: ControlPlaneOutput) -> anyhow::Result<String> {
+    let manifest = load_manifest(ResourceKind::Node, name, None)?;
+    let ResourceManifest::Node(node) = manifest else {
+        bail!("resource '{}' is not a Node", name);
+    };
+    let status = probe_node_status(&node);
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(&status).context("failed to encode node status")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(&status).context("failed to encode node status")
+        }
+        ControlPlaneOutput::Table => Ok(render_node_status_table(&node.metadata.name, &status)),
+    }
+}
+
+pub fn attach_cluster_runtime_session(namespace: &str, agent: &str) -> anyhow::Result<bool> {
+    let Some(node) = remote_node_for_runtime_session(namespace)? else {
+        return Ok(false);
+    };
+    run_remote_runtime_command_interactive(
+        &node,
+        vec![
+            "jarvisctl".to_string(),
+            "attach".to_string(),
+            "--namespace".to_string(),
+            namespace.to_string(),
+            "--agent".to_string(),
+            agent.to_string(),
+        ],
+    )?;
+    Ok(true)
+}
+
+pub fn tell_cluster_runtime_session(
+    namespace: &str,
+    agent: &str,
+    contents: &str,
+    mode: &str,
+) -> anyhow::Result<bool> {
+    let Some(node) = remote_node_for_runtime_session(namespace)? else {
+        return Ok(false);
+    };
+    run_remote_runtime_command(
+        &node,
+        vec![
+            "jarvisctl".to_string(),
+            "tell".to_string(),
+            "--namespace".to_string(),
+            namespace.to_string(),
+            "--agent".to_string(),
+            agent.to_string(),
+            "--text".to_string(),
+            contents.to_string(),
+            "--mode".to_string(),
+            mode.to_string(),
+        ],
+    )?;
+    Ok(true)
+}
+
+pub fn interrupt_cluster_runtime_session(namespace: &str, agent: &str) -> anyhow::Result<bool> {
+    let Some(node) = remote_node_for_runtime_session(namespace)? else {
+        return Ok(false);
+    };
+    run_remote_runtime_command(
+        &node,
+        vec![
+            "jarvisctl".to_string(),
+            "interrupt".to_string(),
+            "--namespace".to_string(),
+            namespace.to_string(),
+            "--agent".to_string(),
+            agent.to_string(),
+        ],
+    )?;
+    Ok(true)
+}
+
+pub fn delete_cluster_runtime_session(namespace: &str) -> anyhow::Result<bool> {
+    let Some(node) = remote_node_for_runtime_session(namespace)? else {
+        return Ok(false);
+    };
+    delete_remote_runtime_session(&node, namespace)?;
+    Ok(true)
+}
+
+fn probe_node_status(node: &ResourceEnvelope<NodeSpec>) -> NodeStatus {
+    let mut status = NodeStatus {
+        available: false,
+        schedulable: !node.spec.cordoned && node.spec.taints.is_empty(),
+        roles: node.spec.roles.clone(),
+        address: node.spec.address.clone(),
+        ssh_target: node_ssh_target(&node.spec),
+        architecture: None,
+        operating_system: None,
+        codex: None,
+        codex_auth: None,
+        jarvisctl: None,
+        message: String::new(),
+    };
+
+    let command_output = if node_is_local(node) {
+        run_probe_command(None)
+    } else {
+        run_probe_command(
+            status
+                .ssh_target
+                .as_deref()
+                .or(node.spec.address.as_deref()),
+        )
+    };
+
+    match command_output {
+        Ok(output) => {
+            let values = parse_probe_output(&output);
+            status.architecture = values
+                .get("arch")
+                .cloned()
+                .or_else(|| node.spec.capabilities.get("arch").cloned());
+            status.operating_system = values
+                .get("os")
+                .cloned()
+                .or_else(|| node.spec.capabilities.get("os").cloned());
+            status.codex = values
+                .get("codex")
+                .cloned()
+                .or_else(|| node.spec.capabilities.get("codex").cloned());
+            status.codex_auth = values
+                .get("codex_auth")
+                .cloned()
+                .or_else(|| node.spec.capabilities.get("codex_auth").cloned());
+            status.jarvisctl = values
+                .get("jarvisctl")
+                .cloned()
+                .or_else(|| node.spec.capabilities.get("jarvisctl").cloned());
+            status.available = true;
+            status.message = "probe succeeded".to_string();
+        }
+        Err(error) => {
+            status.message = error.to_string();
+        }
+    }
+    status
+}
+
+fn render_node_status_table(name: &str, status: &NodeStatus) -> String {
+    let target = status
+        .ssh_target
+        .as_deref()
+        .or(status.address.as_deref())
+        .unwrap_or("local");
+    format!(
+        "NAME\tAVAILABLE\tSCHEDULABLE\tTARGET\tARCH\tCODEX\tCODEX_AUTH\tJARVISCTL\tMESSAGE\n{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        name,
+        status.available,
+        status.schedulable,
+        target,
+        status.architecture.as_deref().unwrap_or("-"),
+        status.codex.as_deref().unwrap_or("-"),
+        status.codex_auth.as_deref().unwrap_or("-"),
+        status.jarvisctl.as_deref().unwrap_or("-"),
+        status.message
+    )
+}
+
+fn node_is_local(node: &ResourceEnvelope<NodeSpec>) -> bool {
+    node.metadata
+        .labels
+        .get("jarvisctl.io/local")
+        .map(String::as_str)
+        == Some("true")
+        || node.spec.ssh_host.as_deref().is_none()
+            && node.spec.address.as_deref().is_none()
+            && node.metadata.name == local_hostname().unwrap_or_default()
+}
+
+fn node_ssh_target(spec: &NodeSpec) -> Option<String> {
+    let host = spec.ssh_host.as_deref().or(spec.address.as_deref())?;
+    Some(match spec.ssh_user.as_deref() {
+        Some(user) if !user.trim().is_empty() => format!("{user}@{host}"),
+        _ => host.to_string(),
+    })
+}
+
+fn run_probe_command(target: Option<&str>) -> anyhow::Result<String> {
+    let script = "printf 'arch='; uname -m 2>/dev/null || true; printf '\\nos='; uname -s 2>/dev/null || true; printf '\\ncodex='; (codex --version 2>/dev/null || command -v codex 2>/dev/null || true) | head -n 1; printf '\\njarvisctl='; (jarvisctl --version 2>/dev/null || command -v jarvisctl 2>/dev/null || true) | head -n 1; printf '\\ncodex_auth='; test -s \"$HOME/.codex/auth.json\" && echo present || echo missing; printf '\\n'";
+    let output = if let Some(target) = target {
+        ProcessCommand::new("ssh")
+            .args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                target,
+                script,
+            ])
+            .output()
+            .with_context(|| format!("failed to run ssh probe for '{target}'"))?
+    } else {
+        ProcessCommand::new("sh")
+            .args(["-lc", script])
+            .output()
+            .context("failed to run local node probe")?
+    };
+    if !output.status.success() {
+        bail!(
+            "probe exited with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn parse_probe_output(output: &str) -> BTreeMap<String, String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            let value = value.trim();
+            if value.is_empty() {
+                None
+            } else {
+                Some((key.trim().to_string(), value.to_string()))
+            }
+        })
+        .collect()
+}
+
+fn probe_local_capabilities() -> BTreeMap<String, String> {
+    run_probe_command(None)
+        .map(|output| parse_probe_output(&output))
+        .unwrap_or_default()
+}
+
+fn local_codex_dir() -> anyhow::Result<PathBuf> {
+    let home = env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".codex"))
+}
+
+fn local_codex_auth_files() -> anyhow::Result<Vec<String>> {
+    let codex_dir = local_codex_dir()?;
+    let candidates = ["auth.json", "config.toml", "version.json"];
+    let mut files = Vec::new();
+    for candidate in candidates {
+        if codex_dir.join(candidate).is_file() {
+            files.push(candidate.to_string());
+        }
+    }
+    ensure!(
+        files.iter().any(|file| file == "auth.json"),
+        "local Codex auth file '{}' does not exist; run `codex login` on this machine first",
+        codex_dir.join("auth.json").display()
+    );
+    Ok(files)
+}
+
+fn sync_codex_auth_to_remote_node(
+    node: &ResourceEnvelope<NodeSpec>,
+    files: &[String],
+) -> anyhow::Result<()> {
+    sync_codex_auth_to_remote_node_with_lease(node, files, None)
+}
+
+fn sync_codex_auth_to_remote_node_for_namespace(
+    node: &ResourceEnvelope<NodeSpec>,
+    files: &[String],
+    runtime_namespace: &str,
+) -> anyhow::Result<()> {
+    sync_codex_auth_to_remote_node_with_lease(node, files, Some(runtime_namespace))
+}
+
+fn sync_codex_auth_to_remote_node_with_lease(
+    node: &ResourceEnvelope<NodeSpec>,
+    files: &[String],
+    runtime_namespace: Option<&str>,
+) -> anyhow::Result<()> {
+    let target = node_ssh_target(&node.spec)
+        .ok_or_else(|| anyhow!("Node '{}' has no SSH target", node.metadata.name))?;
+    let codex_dir = local_codex_dir()?;
+    let mut tar = ProcessCommand::new("tar")
+        .arg("-C")
+        .arg(&codex_dir)
+        .arg("-czf")
+        .arg("-")
+        .args(files)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to archive local Codex auth from '{}'",
+                codex_dir.display()
+            )
+        })?;
+
+    let lease_name = runtime_namespace.map(auth_lease_name);
+    let remote_script = "set -eu; umask 077; mkdir -p \"$HOME/.codex\"; lease=\"${JARVIS_CODEX_AUTH_LEASE:-}\"; if [ -n \"$lease\" ]; then lease_dir=\"$HOME/.jarvis/codex/auth-leases/$lease\"; rm -rf \"$lease_dir.tmp\"; mkdir -p \"$lease_dir.tmp/backup\"; for f in auth.json config.toml version.json; do if [ -e \"$HOME/.codex/$f\" ]; then cp -p \"$HOME/.codex/$f\" \"$lease_dir.tmp/backup/$f\"; else : > \"$lease_dir.tmp/backup/$f.missing\"; fi; done; rm -rf \"$lease_dir\"; mv \"$lease_dir.tmp\" \"$lease_dir\"; fi; tar -xzf - -C \"$HOME/.codex\"; chmod 700 \"$HOME/.codex\"; chmod 600 \"$HOME/.codex/auth.json\" \"$HOME/.codex/config.toml\" \"$HOME/.codex/version.json\" 2>/dev/null || true";
+    let mut ssh_args = vec![
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=10".to_string(),
+        target.clone(),
+    ];
+    if let Some(lease_name) = lease_name.as_deref() {
+        ssh_args.push("env".to_string());
+        ssh_args.push(format!("JARVIS_CODEX_AUTH_LEASE={lease_name}"));
+    }
+    ssh_args.extend([
+        "sh".to_string(),
+        "-lc".to_string(),
+        remote_script.to_string(),
+    ]);
+    let mut ssh = ProcessCommand::new("ssh")
+        .args(ssh_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to open SSH auth sync to Node '{}'",
+                node.metadata.name
+            )
+        })?;
+
+    {
+        let mut tar_stdout = tar.stdout.take().context("failed to capture tar stdout")?;
+        let mut ssh_stdin = ssh.stdin.take().context("failed to open ssh stdin")?;
+        io::copy(&mut tar_stdout, &mut ssh_stdin)
+            .context("failed to stream Codex auth archive over SSH")?;
+    }
+
+    let tar_status = tar
+        .wait()
+        .context("failed waiting for Codex auth archive")?;
+    ensure!(
+        tar_status.success(),
+        "Codex auth archive failed with status {tar_status}"
+    );
+    let ssh_status = ssh
+        .wait()
+        .context("failed waiting for remote Codex auth install")?;
+    ensure!(
+        ssh_status.success(),
+        "remote Codex auth install on Node '{}' failed with status {ssh_status}",
+        node.metadata.name
+    );
+    Ok(())
+}
+
+fn cleanup_codex_auth_lease_on_remote_node(
+    node: &ResourceEnvelope<NodeSpec>,
+    runtime_namespace: &str,
+) -> anyhow::Result<()> {
+    let target = node_ssh_target(&node.spec)
+        .ok_or_else(|| anyhow!("Node '{}' has no SSH target", node.metadata.name))?;
+    let lease_name = auth_lease_name(runtime_namespace);
+    let remote_script = "set -eu; lease=\"${JARVIS_CODEX_AUTH_LEASE:-}\"; [ -n \"$lease\" ] || exit 0; lease_dir=\"$HOME/.jarvis/codex/auth-leases/$lease\"; [ -d \"$lease_dir/backup\" ] || exit 0; mkdir -p \"$HOME/.codex\"; for f in auth.json config.toml version.json; do if [ -e \"$lease_dir/backup/$f\" ]; then cp -p \"$lease_dir/backup/$f\" \"$HOME/.codex/$f\"; elif [ -e \"$lease_dir/backup/$f.missing\" ]; then rm -f \"$HOME/.codex/$f\"; fi; done; chmod 700 \"$HOME/.codex\" 2>/dev/null || true; chmod 600 \"$HOME/.codex/auth.json\" \"$HOME/.codex/config.toml\" \"$HOME/.codex/version.json\" 2>/dev/null || true; rm -rf \"$lease_dir\"";
+    let output = ProcessCommand::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            &target,
+            "env",
+            &format!("JARVIS_CODEX_AUTH_LEASE={lease_name}"),
+            "sh",
+            "-lc",
+            remote_script,
+        ])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to clean Codex auth lease for runtime '{}' on Node '{}'",
+                runtime_namespace, node.metadata.name
+            )
+        })?;
+    ensure!(
+        output.status.success(),
+        "Codex auth lease cleanup for runtime '{}' on Node '{}' failed with status {}: {}",
+        runtime_namespace,
+        node.metadata.name,
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
+}
+
+fn auth_lease_name(runtime_namespace: &str) -> String {
+    slugify(runtime_namespace)
+}
+
+fn run_remote_codex_exec_visit(
+    target: &str,
+    options: &NodeVisitOptions,
+    namespace: &str,
+) -> anyhow::Result<NodeVisitResult> {
+    let mut codex_args = vec![
+        "codex".to_string(),
+        "exec".to_string(),
+        "--skip-git-repo-check".to_string(),
+        "--color".to_string(),
+        "never".to_string(),
+    ];
+    if let Some(sandbox_mode) = options.sandbox_mode.as_deref() {
+        codex_args.push("--sandbox".to_string());
+        codex_args.push(sandbox_mode.to_string());
+    }
+    if let Some(model) = options.model.as_deref() {
+        codex_args.push("--model".to_string());
+        codex_args.push(model.to_string());
+    }
+    if let Some(reasoning_effort) = options.reasoning_effort.as_deref() {
+        codex_args.push("-c".to_string());
+        codex_args.push(format!("reasoning_effort=\"{reasoning_effort}\""));
+    }
+    if options.ephemeral {
+        codex_args.push("--ephemeral".to_string());
+    }
+
+    let cd_command = options
+        .working_directory
+        .as_deref()
+        .map(|path| format!("cd {};", shell_escape(path)))
+        .unwrap_or_else(|| "cd;".to_string());
+    let output_name = slugify(namespace);
+    let remote_script = format!(
+        "set -u; mkdir -p \"$HOME/.jarvis/codex/visits\"; out=\"$HOME/.jarvis/codex/visits/{}.last-message.md\"; rm -f \"$out\"; {} {} --output-last-message \"$out\" -; visit_status=$?; printf '\\n__JARVIS_VISIT_LAST_MESSAGE_BEGIN__\\n'; if [ -f \"$out\" ]; then cat \"$out\"; fi; printf '\\n__JARVIS_VISIT_LAST_MESSAGE_END__\\n'; exit \"$visit_status\"",
+        output_name,
+        cd_command,
+        shell_words::join(codex_args),
+    );
+
+    let timeout_duration = format!("{}s", options.timeout_seconds);
+    let remote_command = shell_words::join([
+        "sh".to_string(),
+        "-lc".to_string(),
+        remote_script.to_string(),
+    ]);
+    let mut child = ProcessCommand::new("timeout")
+        .args([
+            "--kill-after=5s",
+            &timeout_duration,
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            target,
+            &remote_command,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start remote Codex visit on '{target}'"))?;
+
+    {
+        let stdin = child.stdin.as_mut().context("failed to open visit stdin")?;
+        stdin
+            .write_all(options.prompt.as_bytes())
+            .context("failed to stream visit prompt to remote Codex")?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .context("failed waiting for remote Codex visit")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let final_message = extract_visit_final_message(&stdout).unwrap_or_else(|| stdout.clone());
+    let exit_status = output.status.code().unwrap_or(-1);
+    ensure!(
+        output.status.success(),
+        "remote Codex visit '{}' on '{}' failed with status {}: {}",
+        namespace,
+        target,
+        output.status,
+        stderr.trim()
+    );
+
+    Ok(NodeVisitResult {
+        node: options.node.clone(),
+        namespace: namespace.to_string(),
+        exit_status,
+        final_message,
+        stdout,
+        stderr,
+        cleanup_status: "pending".to_string(),
+    })
+}
+
+fn extract_visit_final_message(stdout: &str) -> Option<String> {
+    let (_, rest) = stdout.split_once("__JARVIS_VISIT_LAST_MESSAGE_BEGIN__")?;
+    let (message, _) = rest.split_once("__JARVIS_VISIT_LAST_MESSAGE_END__")?;
+    Some(message.trim().to_string())
+}
+
+fn shell_escape(value: &str) -> String {
+    shell_words::join([value.to_string()])
+}
+
+fn local_hostname() -> Option<String> {
+    fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 impl<T> ResourceEnvelope<T> {
@@ -1648,16 +1601,6 @@ fn volume_binding_statuses(references: &[VolumeBindingRef]) -> Vec<VolumeBinding
         .collect()
 }
 
-impl RenderedResourceRef {
-    fn from_manifest(manifest: &ResourceManifest) -> Self {
-        Self {
-            kind: manifest.kind().display_name().to_string(),
-            name: manifest.name().to_string(),
-            namespace: manifest.namespace().map(ToOwned::to_owned),
-        }
-    }
-}
-
 pub fn apply_manifests(paths: &[PathBuf]) -> anyhow::Result<Vec<String>> {
     ensure!(
         !paths.is_empty(),
@@ -1678,13 +1621,7 @@ pub fn apply_manifests(paths: &[PathBuf]) -> anyhow::Result<Vec<String>> {
     let mut messages = Vec::new();
     for manifest in &manifests {
         save_manifest(manifest)?;
-        if !matches!(
-            manifest,
-            ResourceManifest::Deployment(_)
-                | ResourceManifest::Job(_)
-                | ResourceManifest::CronJob(_)
-                | ResourceManifest::Application(_)
-        ) {
+        if !matches!(manifest, ResourceManifest::Deployment(_)) {
             messages.push(format!("applied {}", manifest_ref(manifest)));
         }
     }
@@ -1703,119 +1640,12 @@ pub fn apply_kustomization(path: &Path) -> anyhow::Result<Vec<String>> {
     let mut messages = Vec::new();
     for manifest in &manifests {
         save_manifest(manifest)?;
-        if !matches!(
-            manifest,
-            ResourceManifest::Deployment(_)
-                | ResourceManifest::Job(_)
-                | ResourceManifest::CronJob(_)
-                | ResourceManifest::Application(_)
-        ) {
+        if !matches!(manifest, ResourceManifest::Deployment(_)) {
             messages.push(format!("applied {}", manifest_ref(manifest)));
         }
     }
     messages.extend(reconcile_control_plane()?);
     Ok(messages)
-}
-
-pub fn render_kubernetes_resources(
-    files: &[PathBuf],
-    kustomize: Option<&Path>,
-    output: KubernetesRenderOutput,
-) -> anyhow::Result<String> {
-    let manifests = load_source_manifests(files, kustomize)?;
-    let compiled = compile_kubernetes_manifests(&manifests)?;
-    ensure!(
-        !compiled.manifests.is_empty(),
-        "no Kubernetes resources were generated from the provided jarvisctl manifests"
-    );
-    match output {
-        KubernetesRenderOutput::Json => serde_json::to_string_pretty(&compiled.manifests)
-            .context("failed to encode Kubernetes manifests"),
-        KubernetesRenderOutput::Yaml => render_kubernetes_yaml_documents(&compiled.manifests),
-    }
-}
-
-pub fn apply_kubernetes_resources(
-    files: &[PathBuf],
-    kustomize: Option<&Path>,
-    kubectl_context: Option<&str>,
-    dry_run_server: bool,
-) -> anyhow::Result<String> {
-    let manifests = load_source_manifests(files, kustomize)?;
-    let compiled = compile_kubernetes_manifests(&manifests)?;
-    ensure!(
-        !compiled.manifests.is_empty(),
-        "no Kubernetes resources were generated from the provided jarvisctl manifests"
-    );
-
-    let mut messages = Vec::new();
-    let namespace_manifests = compiled
-        .manifests
-        .iter()
-        .filter(|manifest| {
-            manifest.get("kind").and_then(serde_json::Value::as_str) == Some("Namespace")
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let namespaced_manifests = compiled
-        .manifests
-        .iter()
-        .filter(|manifest| {
-            manifest.get("kind").and_then(serde_json::Value::as_str) != Some("Namespace")
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-
-    let mut dry_run_mode = if dry_run_server { Some("server") } else { None };
-    if dry_run_server {
-        let missing_namespaces = namespaced_manifests
-            .iter()
-            .filter_map(|manifest| {
-                manifest
-                    .get("metadata")
-                    .and_then(|metadata| metadata.get("namespace"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned)
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .filter(|namespace| !kubernetes_namespace_exists(kubectl_context, namespace))
-            .collect::<Vec<_>>();
-        if !missing_namespaces.is_empty() {
-            dry_run_mode = Some("client");
-            messages.push(format!(
-                "server dry-run downgraded to client dry-run because these target namespaces do not exist yet: {}",
-                missing_namespaces.join(", ")
-            ));
-        }
-    }
-
-    if !namespace_manifests.is_empty() {
-        if let Some(output) =
-            kubectl_apply_rendered_documents(&namespace_manifests, kubectl_context, dry_run_mode)?
-        {
-            messages.push(output);
-        }
-    }
-    if !namespaced_manifests.is_empty() {
-        if let Some(output) =
-            kubectl_apply_rendered_documents(&namespaced_manifests, kubectl_context, dry_run_mode)?
-        {
-            messages.push(output);
-        }
-    }
-    if !compiled.warnings.is_empty() {
-        messages.push(format!(
-            "compiler warnings:\n{}",
-            compiled
-                .warnings
-                .iter()
-                .map(|warning| format!("- {}", warning))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
-    }
-    Ok(messages.join("\n"))
 }
 
 fn load_source_manifests(
@@ -1840,1719 +1670,6 @@ fn load_source_manifests(
         (true, Some(path)) => render_source_path(path, None, &BTreeMap::new()),
         (false, Some(_)) => bail!("use either --file or --kustomize, not both"),
         (true, None) => bail!("provide at least one --file or one --kustomize path"),
-    }
-}
-
-fn render_kubernetes_yaml_documents(manifests: &[serde_json::Value]) -> anyhow::Result<String> {
-    let mut rendered = Vec::new();
-    for manifest in manifests {
-        rendered
-            .push(serde_yaml::to_string(manifest).context("failed to encode Kubernetes manifest")?);
-    }
-    Ok(rendered.join("---\n"))
-}
-
-fn kubectl_apply_rendered_documents(
-    manifests: &[serde_json::Value],
-    kubectl_context: Option<&str>,
-    dry_run_mode: Option<&str>,
-) -> anyhow::Result<Option<String>> {
-    if manifests.is_empty() {
-        return Ok(None);
-    }
-    let rendered = render_kubernetes_yaml_documents(manifests)?;
-    let mut command = ProcessCommand::new("kubectl");
-    if let Some(context) = kubectl_context
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        command.arg("--context").arg(context);
-    }
-    command.arg("apply").arg("-f").arg("-");
-    if let Some(mode) = dry_run_mode {
-        command.arg(format!("--dry-run={mode}"));
-    }
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to spawn kubectl apply")?;
-    use std::io::Write as _;
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| anyhow!("failed to open kubectl stdin"))?
-        .write_all(rendered.as_bytes())
-        .context("failed to stream rendered manifests to kubectl")?;
-    let output = child
-        .wait_with_output()
-        .context("failed while waiting for kubectl apply")?;
-    if !output.status.success() {
-        bail!(
-            "kubectl apply failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let mut chunks = Vec::new();
-    let stdout = String::from_utf8(output.stdout).context("kubectl returned non-utf8 stdout")?;
-    let stderr = String::from_utf8(output.stderr).context("kubectl returned non-utf8 stderr")?;
-    if !stdout.trim().is_empty() {
-        chunks.push(stdout.trim().to_string());
-    }
-    if !stderr.trim().is_empty() {
-        chunks.push(stderr.trim().to_string());
-    }
-    Ok((!chunks.is_empty()).then(|| chunks.join("\n")))
-}
-
-fn kubernetes_namespace_exists(kubectl_context: Option<&str>, namespace: &str) -> bool {
-    let mut command = ProcessCommand::new("kubectl");
-    if let Some(context) = kubectl_context
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        command.arg("--context").arg(context);
-    }
-    command
-        .args(["get", "namespace", namespace, "-o", "name"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-fn compile_kubernetes_manifests(
-    manifests: &[ResourceManifest],
-) -> anyhow::Result<KubernetesCompilation> {
-    let mut rendered = Vec::new();
-    let mut warnings = Vec::new();
-    for manifest in manifests {
-        match manifest {
-            ResourceManifest::Namespace(namespace) => {
-                rendered.push(kubernetes_namespace_value(namespace));
-            }
-            ResourceManifest::ConfigMap(config_map) => {
-                rendered.push(kubernetes_config_map_value(config_map));
-            }
-            ResourceManifest::Secret(secret) => {
-                rendered.push(kubernetes_secret_value(secret));
-            }
-            ResourceManifest::NetworkPolicy(policy) => {
-                rendered.push(kubernetes_network_policy_value(policy));
-            }
-            ResourceManifest::Worker(worker) => {
-                rendered.push(kubernetes_worker_info_value(worker)?);
-            }
-            ResourceManifest::Service(service) => {
-                if effective_service_target_kind(&service.spec) == ServiceTargetKind::Worker {
-                    rendered.push(kubernetes_worker_service_info_value(service)?);
-                } else if let Some(value) = kubernetes_runtime_service_value(service, manifests)? {
-                    rendered.push(value);
-                } else {
-                    warnings.push(format!(
-                        "skipped runtime Service '{}/{}' because no matching Kubernetes runtime Deployment exposed a control port",
-                        service.namespace_key(),
-                        service.metadata.name
-                    ));
-                }
-            }
-            ResourceManifest::Job(job) => {
-                if let Some(value) = kubernetes_job_value(job, manifests)? {
-                    rendered.push(value);
-                } else {
-                    warnings.push(format!(
-                        "skipped Job '{}/{}' because only worker-backed jobs currently compile to Kubernetes",
-                        job.namespace_key(),
-                        job.metadata.name
-                    ));
-                }
-            }
-            ResourceManifest::CronJob(cron_job) => {
-                if let Some(value) = kubernetes_cron_job_value(cron_job, manifests)? {
-                    rendered.push(value);
-                } else {
-                    warnings.push(format!(
-                        "skipped CronJob '{}/{}' because only worker-backed cron jobs currently compile to Kubernetes",
-                        cron_job.namespace_key(),
-                        cron_job.metadata.name
-                    ));
-                }
-            }
-            ResourceManifest::Deployment(deployment) => {
-                if let Some(values) = kubernetes_deployment_values(deployment, manifests)? {
-                    rendered.extend(values);
-                } else {
-                    warnings.push(format!(
-                        "skipped Deployment '{}/{}' because spec.template.kubernetes is not set",
-                        deployment.namespace_key(),
-                        deployment.metadata.name
-                    ));
-                }
-            }
-            ResourceManifest::ReplicaSet(replica_set) => warnings.push(format!(
-                "skipped ReplicaSet '{}/{}' because ReplicaSets are controller-generated local rollout history",
-                replica_set.namespace_key(),
-                replica_set.metadata.name
-            )),
-            ResourceManifest::Application(application) => warnings.push(format!(
-                "skipped Application '{}/{}' because GitOps Applications do not map directly to a single Kubernetes object",
-                application.namespace_key(),
-                application.metadata.name
-            )),
-            ResourceManifest::Volume(volume) => warnings.push(format!(
-                "skipped Volume '{}/{}' because jarvisctl Volume resources do not yet declare a Kubernetes storage class or claim template",
-                volume.namespace_key(),
-                volume.metadata.name
-            )),
-        }
-    }
-    Ok(KubernetesCompilation {
-        manifests: rendered,
-        warnings,
-    })
-}
-
-fn kubernetes_metadata_value(
-    metadata: &ResourceMetadata,
-    cluster_scoped: bool,
-    extra_labels: BTreeMap<String, String>,
-    extra_annotations: BTreeMap<String, String>,
-    explicit_name: Option<String>,
-) -> serde_json::Value {
-    let mut labels = metadata.labels.clone();
-    labels.extend(extra_labels);
-    let mut annotations = metadata.annotations.clone();
-    annotations.extend(extra_annotations);
-    let mut value = serde_json::Map::new();
-    value.insert(
-        "name".to_string(),
-        json!(explicit_name.unwrap_or_else(|| metadata.name.clone())),
-    );
-    if !cluster_scoped {
-        value.insert(
-            "namespace".to_string(),
-            json!(normalize_namespaced_resource_namespace(
-                metadata.namespace.as_deref()
-            )),
-        );
-    }
-    if !labels.is_empty() {
-        value.insert("labels".to_string(), json!(labels));
-    }
-    if !annotations.is_empty() {
-        value.insert("annotations".to_string(), json!(annotations));
-    }
-    serde_json::Value::Object(value)
-}
-
-fn kubernetes_namespace_value(manifest: &ResourceEnvelope<NamespaceSpec>) -> serde_json::Value {
-    json!({
-        "apiVersion": "v1",
-        "kind": "Namespace",
-        "metadata": kubernetes_metadata_value(
-            &manifest.metadata,
-            true,
-            BTreeMap::from([("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string())]),
-            BTreeMap::new(),
-            None,
-        ),
-    })
-}
-
-fn kubernetes_config_map_value(manifest: &ResourceEnvelope<ConfigMapSpec>) -> serde_json::Value {
-    json!({
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": kubernetes_metadata_value(
-            &manifest.metadata,
-            false,
-            BTreeMap::from([("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string())]),
-            BTreeMap::new(),
-            None,
-        ),
-        "data": manifest.spec.data,
-    })
-}
-
-fn kubernetes_secret_value(manifest: &ResourceEnvelope<SecretSpec>) -> serde_json::Value {
-    json!({
-        "apiVersion": "v1",
-        "kind": "Secret",
-        "type": "Opaque",
-        "metadata": kubernetes_metadata_value(
-            &manifest.metadata,
-            false,
-            BTreeMap::from([("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string())]),
-            BTreeMap::new(),
-            None,
-        ),
-        "stringData": manifest.spec.string_data,
-    })
-}
-
-fn kubernetes_network_policy_value(
-    manifest: &ResourceEnvelope<NetworkPolicySpec>,
-) -> serde_json::Value {
-    json!({
-        "apiVersion": "networking.k8s.io/v1",
-        "kind": "NetworkPolicy",
-        "metadata": kubernetes_metadata_value(
-            &manifest.metadata,
-            false,
-            BTreeMap::from([("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string())]),
-            BTreeMap::new(),
-            None,
-        ),
-        "spec": {
-            "podSelector": manifest.spec.pod_selector,
-            "policyTypes": effective_network_policy_types(&manifest.spec),
-            "ingress": manifest.spec.ingress,
-            "egress": manifest.spec.egress,
-        }
-    })
-}
-
-fn kubernetes_worker_info_value(
-    manifest: &ResourceEnvelope<WorkerSpec>,
-) -> anyhow::Result<serde_json::Value> {
-    let config_map_name = format!("jarvisctl-worker-{}", slugify(&manifest.metadata.name));
-    let mut data = BTreeMap::new();
-    data.insert(
-        "provider".to_string(),
-        worker_provider_name(manifest.spec.provider).to_string(),
-    );
-    data.insert("model".to_string(), manifest.spec.model.clone());
-    data.insert("endpoint".to_string(), worker_endpoint(manifest));
-    data.insert(
-        "locality".to_string(),
-        worker_locality_name(&effective_worker_locality(manifest)).to_string(),
-    );
-    if let Some(role) = manifest.spec.role.as_ref() {
-        data.insert("role".to_string(), role.clone());
-    }
-    if let Some(pool) = manifest.spec.pool.as_ref() {
-        data.insert("pool".to_string(), pool.clone());
-    }
-    if !manifest.spec.classes.is_empty() {
-        data.insert("classes".to_string(), manifest.spec.classes.join(","));
-    }
-    if !manifest.spec.capabilities.is_empty() {
-        data.insert(
-            "capabilities".to_string(),
-            manifest.spec.capabilities.join(","),
-        );
-    }
-    if let Some(prompt) = manifest.spec.system_prompt.as_ref() {
-        data.insert("systemPrompt".to_string(), prompt.clone());
-    }
-    Ok(json!({
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": kubernetes_metadata_value(
-            &manifest.metadata,
-            false,
-            BTreeMap::from([
-                ("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string()),
-                ("jarvisctl.io/resource-kind".to_string(), "Worker".to_string()),
-            ]),
-            BTreeMap::from([
-                ("jarvisctl.io/source-kind".to_string(), "Worker".to_string()),
-                ("jarvisctl.io/source-name".to_string(), manifest.metadata.name.clone()),
-            ]),
-            Some(config_map_name),
-        ),
-        "data": data,
-    }))
-}
-
-fn kubernetes_worker_service_info_value(
-    manifest: &ResourceEnvelope<ServiceSpec>,
-) -> anyhow::Result<serde_json::Value> {
-    let config_map_name = format!("jarvisctl-service-{}", slugify(&manifest.metadata.name));
-    let mut data = BTreeMap::new();
-    data.insert("targetKind".to_string(), "worker".to_string());
-    data.insert(
-        "strategy".to_string(),
-        match manifest.spec.strategy {
-            ServiceRoutingStrategy::FirstReady => "first_ready".to_string(),
-            ServiceRoutingStrategy::RoundRobin => "round_robin".to_string(),
-        },
-    );
-    if let Some(class_name) = manifest.spec.class_name.as_ref() {
-        data.insert("className".to_string(), class_name.clone());
-    }
-    if !manifest.spec.fallback_class_names.is_empty() {
-        data.insert(
-            "fallbackClassNames".to_string(),
-            manifest.spec.fallback_class_names.join(","),
-        );
-    }
-    if !manifest.spec.required_capabilities.is_empty() {
-        data.insert(
-            "requiredCapabilities".to_string(),
-            manifest.spec.required_capabilities.join(","),
-        );
-    }
-    if !manifest.spec.preferred_providers.is_empty() {
-        data.insert(
-            "preferredProviders".to_string(),
-            manifest
-                .spec
-                .preferred_providers
-                .iter()
-                .map(|provider| worker_provider_name(*provider))
-                .collect::<Vec<_>>()
-                .join(","),
-        );
-    }
-    data.insert(
-        "preferLocal".to_string(),
-        if manifest.spec.prefer_local {
-            "true"
-        } else {
-            "false"
-        }
-        .to_string(),
-    );
-    data.insert(
-        "selector".to_string(),
-        serde_json::to_string(&manifest.spec.selector)
-            .context("failed to encode worker service selector")?,
-    );
-    Ok(json!({
-        "apiVersion": "v1",
-        "kind": "ConfigMap",
-        "metadata": kubernetes_metadata_value(
-            &manifest.metadata,
-            false,
-            BTreeMap::from([
-                ("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string()),
-                ("jarvisctl.io/resource-kind".to_string(), "Service".to_string()),
-            ]),
-            BTreeMap::from([
-                ("jarvisctl.io/source-kind".to_string(), "Service".to_string()),
-                ("jarvisctl.io/source-name".to_string(), manifest.metadata.name.clone()),
-            ]),
-            Some(config_map_name),
-        ),
-        "data": data,
-    }))
-}
-
-fn kubernetes_job_value(
-    manifest: &ResourceEnvelope<JobSpec>,
-    sources: &[ResourceManifest],
-) -> anyhow::Result<Option<serde_json::Value>> {
-    let Some(worker_request) = manifest.spec.worker.as_ref() else {
-        return Ok(None);
-    };
-    let resolved =
-        resolve_kubernetes_worker_request(worker_request, manifest.namespace_key(), sources)?;
-    let job_spec = kubernetes_worker_job_spec_value(
-        &manifest.metadata,
-        manifest.namespace_key(),
-        worker_request,
-        &resolved,
-        manifest.spec.backoff_limit,
-        manifest.spec.parallelism,
-        manifest.spec.completions,
-        manifest.spec.suspend,
-    )?;
-    Ok(Some(json!({
-        "apiVersion": "batch/v1",
-        "kind": "Job",
-        "metadata": kubernetes_metadata_value(
-            &manifest.metadata,
-            false,
-            BTreeMap::from([("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string())]),
-            BTreeMap::new(),
-            None,
-        ),
-        "spec": job_spec,
-    })))
-}
-
-fn kubernetes_cron_job_value(
-    manifest: &ResourceEnvelope<CronJobSpec>,
-    sources: &[ResourceManifest],
-) -> anyhow::Result<Option<serde_json::Value>> {
-    let Some(worker_request) = manifest.spec.job_template.spec.worker.as_ref() else {
-        return Ok(None);
-    };
-    let resolved =
-        resolve_kubernetes_worker_request(worker_request, manifest.namespace_key(), sources)?;
-    let job_template_spec = kubernetes_worker_job_spec_value(
-        &manifest.metadata,
-        manifest.namespace_key(),
-        worker_request,
-        &resolved,
-        manifest.spec.job_template.spec.backoff_limit,
-        manifest.spec.job_template.spec.parallelism,
-        manifest.spec.job_template.spec.completions,
-        manifest.spec.job_template.spec.suspend,
-    )?;
-    Ok(Some(json!({
-        "apiVersion": "batch/v1",
-        "kind": "CronJob",
-        "metadata": kubernetes_metadata_value(
-            &manifest.metadata,
-            false,
-            BTreeMap::from([("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string())]),
-            BTreeMap::new(),
-            None,
-        ),
-        "spec": {
-            "schedule": manifest.spec.schedule,
-            "suspend": manifest.spec.suspend,
-            "concurrencyPolicy": match manifest.spec.concurrency_policy {
-                CronJobConcurrencyPolicy::Allow => "Allow",
-                CronJobConcurrencyPolicy::Forbid => "Forbid",
-                CronJobConcurrencyPolicy::Replace => "Replace",
-            },
-            "successfulJobsHistoryLimit": manifest.spec.successful_jobs_history_limit,
-            "failedJobsHistoryLimit": manifest.spec.failed_jobs_history_limit,
-            "jobTemplate": {
-                "spec": job_template_spec
-            }
-        }
-    })))
-}
-
-fn kubernetes_deployment_values(
-    manifest: &ResourceEnvelope<DeploymentSpec>,
-    sources: &[ResourceManifest],
-) -> anyhow::Result<Option<Vec<serde_json::Value>>> {
-    let Some(_) = manifest.spec.template.kubernetes.as_ref() else {
-        return Ok(None);
-    };
-    ensure!(
-        manifest.spec.agents == 1,
-        "Deployment '{}/{}' currently compiles to Kubernetes only with spec.agents = 1",
-        manifest.namespace_key(),
-        manifest.metadata.name
-    );
-    ensure!(
-        manifest.spec.replicas <= 1,
-        "Deployment '{}/{}' currently compiles to Kubernetes only with spec.replicas <= 1",
-        manifest.namespace_key(),
-        manifest.metadata.name
-    );
-    ensure!(
-        manifest
-            .spec
-            .driver
-            .unwrap_or(CodexRuntimeDriver::AppServer)
-            == CodexRuntimeDriver::AppServer,
-        "Deployment '{}/{}' currently compiles to Kubernetes only with the app_server driver",
-        manifest.namespace_key(),
-        manifest.metadata.name
-    );
-
-    let namespace_defaults = namespace_defaults_from_sources(manifest.namespace_key(), sources);
-    let template = resolved_deployment_template(manifest, &namespace_defaults);
-    let runtime = template
-        .kubernetes
-        .as_ref()
-        .ok_or_else(|| anyhow!("deployment template lost kubernetes runtime during resolution"))?;
-    let working_directory = template
-        .working_directory
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow!(
-                "Deployment '{}/{}' needs spec.template.working_directory or Namespace default_working_directory for Kubernetes runtime rendering",
-                manifest.namespace_key(),
-                manifest.metadata.name
-            )
-        })?;
-    if let Some(workspace_mount_path) = runtime.workspace_mount_path.as_deref() {
-        ensure!(
-            workspace_mount_path == working_directory,
-            "Deployment '{}/{}' must keep kubernetes.workspaceMountPath equal to spec.template.working_directory for the current hostPath-based Kubernetes runtime proof",
-            manifest.namespace_key(),
-            manifest.metadata.name
-        );
-    }
-    if let Some(workspace_host_path) = runtime.workspace_host_path.as_deref() {
-        ensure!(
-            workspace_host_path == working_directory,
-            "Deployment '{}/{}' must keep kubernetes.workspaceHostPath equal to spec.template.working_directory for the current hostPath-based Kubernetes runtime proof",
-            manifest.namespace_key(),
-            manifest.metadata.name
-        );
-    }
-
-    let control_namespace = manifest.namespace_key().to_string();
-    let control_port = runtime
-        .control_port
-        .unwrap_or(DEFAULT_KUBERNETES_RUNTIME_CONTROL_PORT);
-    let pod_labels = kubernetes_runtime_pod_labels(manifest);
-    let deployment_metadata_labels = pod_labels.clone();
-    let launch_config_map_name =
-        format!("{}-codex-launch", slugify(&manifest.metadata.name)).to_string();
-
-    let prepared = prepare_codex_ticket_launch(&CodexLaunchOptions {
-        backend: SessionBackend::Native,
-        driver: CodexRuntimeDriver::AppServer,
-        task_note: PathBuf::from(&template.task_note),
-        namespace: Some(manifest.metadata.name.clone()),
-        agents: manifest.spec.agents,
-        agent: "agent0".to_string(),
-        fresh_session: true,
-        resume_session_id: None,
-        working_directory: Some(PathBuf::from(working_directory)),
-        prompt_file: None,
-        operator_message: template.operator_message.clone(),
-        images: template.images.iter().map(PathBuf::from).collect(),
-        environment: runtime.env.clone(),
-        context_overlay: RuntimeContextMetadata {
-            control_namespace: Some(control_namespace.clone()),
-            deployment: Some(manifest.metadata.name.clone()),
-            labels: pod_labels.clone(),
-            config_maps: template
-                .config_maps
-                .iter()
-                .map(|reference| env_binding_name(reference).to_string())
-                .collect(),
-            secrets: template
-                .secrets
-                .iter()
-                .map(|reference| env_binding_name(reference).to_string())
-                .collect(),
-            volumes: template
-                .volumes
-                .iter()
-                .map(|reference| volume_binding_name(reference).to_string())
-                .collect(),
-            ..RuntimeContextMetadata::default()
-        },
-        extra_runtime_args: Vec::new(),
-        startup_delay_ms: manifest.spec.startup_delay_ms.unwrap_or(1500),
-        command: template.command.clone(),
-    })?;
-    let launch_manifest = codex_app_manifest_from_prepared(&prepared);
-    let launch_manifest_raw = serde_json::to_string_pretty(&launch_manifest)
-        .context("failed to encode Kubernetes Codex launch manifest")?;
-
-    let (extra_volumes, extra_volume_mounts) =
-        kubernetes_runtime_host_path_volumes(&template, runtime, sources, &control_namespace)?;
-    let env_from = kubernetes_runtime_env_from(&template);
-    let image = runtime
-        .image
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(DEFAULT_KUBERNETES_RUNTIME_IMAGE);
-    let image_pull_policy = runtime
-        .image_pull_policy
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("IfNotPresent");
-    let home_dir = runtime
-        .env
-        .get("HOME")
-        .cloned()
-        .unwrap_or_else(|| "/home/rootster".to_string());
-    let path_value = runtime
-        .env
-        .get("PATH")
-        .cloned()
-        .unwrap_or_else(|| format!("{home_dir}/.local/bin:/usr/local/bin:/usr/bin:/bin"));
-    let mut container_env = vec![
-        json!({"name": "HOME", "value": home_dir}),
-        json!({"name": "PATH", "value": path_value}),
-        json!({"name": "JARVISCTL_CODEX_APP_TCP_HOST", "value": "0.0.0.0"}),
-        json!({"name": "JARVISCTL_CODEX_APP_TCP_PORT", "value": control_port.to_string()}),
-        json!({"name": "JARVIS_KUBERNETES_RUNTIME", "value": "true"}),
-    ];
-    for (key, value) in &runtime.env {
-        if key == "HOME" || key == "PATH" {
-            continue;
-        }
-        container_env.push(json!({"name": key, "value": value}));
-    }
-
-    let mut volumes = vec![json!({
-        "name": "codex-launch-manifest",
-        "configMap": {
-            "name": launch_config_map_name,
-            "items": [{
-                "key": "launch-manifest.json",
-                "path": "launch-manifest.json",
-            }]
-        }
-    })];
-    volumes.extend(extra_volumes);
-
-    let mut volume_mounts = vec![json!({
-        "name": "codex-launch-manifest",
-        "mountPath": "/etc/jarvisctl/launch-manifest.json",
-        "subPath": "launch-manifest.json",
-        "readOnly": true,
-    })];
-    volume_mounts.extend(extra_volume_mounts);
-
-    let mut container = json!({
-        "name": "codex-runtime",
-        "image": image,
-        "imagePullPolicy": image_pull_policy,
-        "command": ["/bin/sh", "-lc", "exec jarvisctl codex-app-session-serve --manifest /etc/jarvisctl/launch-manifest.json"],
-        "env": container_env,
-        "ports": [{
-            "name": "control",
-            "containerPort": control_port,
-            "protocol": "TCP",
-        }],
-        "volumeMounts": volume_mounts,
-        "workingDir": working_directory,
-        "startupProbe": {
-            "tcpSocket": {
-                "port": control_port,
-            },
-            "periodSeconds": 2,
-            "timeoutSeconds": 1,
-            "failureThreshold": 60,
-        },
-        "readinessProbe": {
-            "tcpSocket": {
-                "port": control_port,
-            },
-            "periodSeconds": 2,
-            "timeoutSeconds": 1,
-            "failureThreshold": 15,
-        },
-    });
-    if !env_from.is_empty() {
-        container["envFrom"] = json!(env_from);
-    }
-
-    let mut pod_spec = json!({
-        "restartPolicy": "Always",
-        "containers": [container],
-        "volumes": volumes,
-    });
-    if let Some(service_account_name) = runtime
-        .service_account_name
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        pod_spec["serviceAccountName"] = json!(service_account_name);
-    }
-
-    Ok(Some(vec![
-        json!({
-            "apiVersion": "v1",
-            "kind": "ConfigMap",
-            "metadata": kubernetes_metadata_value(
-                &manifest.metadata,
-                false,
-                BTreeMap::from([
-                    ("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string()),
-                    ("jarvisctl.io/resource-kind".to_string(), "CodexLaunchManifest".to_string()),
-                    ("jarvisctl.io/runtime-namespace".to_string(), manifest.metadata.name.clone()),
-                ]),
-                BTreeMap::from([
-                    ("jarvisctl.io/source-kind".to_string(), "Deployment".to_string()),
-                    ("jarvisctl.io/source-name".to_string(), manifest.metadata.name.clone()),
-                ]),
-                Some(launch_config_map_name.clone()),
-            ),
-            "data": {
-                "launch-manifest.json": launch_manifest_raw,
-            }
-        }),
-        json!({
-            "apiVersion": "apps/v1",
-            "kind": "Deployment",
-            "metadata": kubernetes_metadata_value(
-                &manifest.metadata,
-                false,
-                BTreeMap::from([
-                    ("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string()),
-                    ("jarvisctl.io/runtime-driver".to_string(), "codex-app".to_string()),
-                    ("jarvisctl.io/runtime-namespace".to_string(), manifest.metadata.name.clone()),
-                ]),
-                BTreeMap::new(),
-                None,
-            ),
-            "spec": {
-                "replicas": manifest.spec.replicas,
-                "selector": {
-                    "matchLabels": pod_labels,
-                },
-                "template": {
-                    "metadata": {
-                        "labels": deployment_metadata_labels,
-                    },
-                    "spec": pod_spec,
-                }
-            }
-        }),
-    ]))
-}
-
-fn kubernetes_runtime_service_value(
-    manifest: &ResourceEnvelope<ServiceSpec>,
-    sources: &[ResourceManifest],
-) -> anyhow::Result<Option<serde_json::Value>> {
-    let targets = kubernetes_runtime_service_targets(manifest, sources)?;
-    let Some(target) = targets.first() else {
-        return Ok(None);
-    };
-    ensure!(
-        targets.len() == 1,
-        "runtime Service '{}/{}' matched multiple runtime deployments: {:?}",
-        manifest.namespace_key(),
-        manifest.metadata.name,
-        targets
-            .iter()
-            .map(|deployment| deployment.metadata.name.as_str())
-            .collect::<Vec<_>>()
-    );
-    let control_port = target
-        .spec
-        .template
-        .kubernetes
-        .as_ref()
-        .and_then(|runtime| runtime.control_port)
-        .unwrap_or(DEFAULT_KUBERNETES_RUNTIME_CONTROL_PORT);
-    Ok(Some(json!({
-        "apiVersion": "v1",
-        "kind": "Service",
-        "metadata": kubernetes_metadata_value(
-            &manifest.metadata,
-            false,
-            BTreeMap::from([
-                ("app.kubernetes.io/managed-by".to_string(), "jarvisctl".to_string()),
-                (
-                    "jarvisctl.io/runtime-deployment".to_string(),
-                    target.metadata.name.clone(),
-                ),
-            ]),
-            BTreeMap::from([
-                ("jarvisctl.io/source-kind".to_string(), "Service".to_string()),
-                ("jarvisctl.io/source-name".to_string(), manifest.metadata.name.clone()),
-            ]),
-            None,
-        ),
-        "spec": {
-            "selector": manifest.spec.selector,
-            "ports": [{
-                "name": "control",
-                "port": control_port,
-                "targetPort": control_port,
-                "protocol": "TCP",
-            }]
-        }
-    })))
-}
-
-fn kubernetes_runtime_service_targets<'a>(
-    manifest: &ResourceEnvelope<ServiceSpec>,
-    sources: &'a [ResourceManifest],
-) -> anyhow::Result<Vec<&'a ResourceEnvelope<DeploymentSpec>>> {
-    let mut matched_targets = Vec::new();
-    for source in sources {
-        let ResourceManifest::Deployment(deployment) = source else {
-            continue;
-        };
-        if deployment.namespace_key() != manifest.namespace_key() {
-            continue;
-        }
-        let Some(_) = deployment.spec.template.kubernetes.as_ref() else {
-            continue;
-        };
-        if !selector_matches_labels(
-            &manifest.spec.selector,
-            &kubernetes_runtime_pod_labels(deployment),
-        ) {
-            continue;
-        }
-        matched_targets.push(deployment);
-    }
-    Ok(matched_targets)
-}
-
-fn selector_matches_labels(
-    selector: &BTreeMap<String, String>,
-    labels: &BTreeMap<String, String>,
-) -> bool {
-    selector
-        .iter()
-        .all(|(key, value)| labels.get(key) == Some(value))
-}
-
-fn kubernetes_runtime_pod_labels(
-    manifest: &ResourceEnvelope<DeploymentSpec>,
-) -> BTreeMap<String, String> {
-    let mut labels = manifest.metadata.labels.clone();
-    labels.extend(manifest.spec.template.labels.clone());
-    labels.insert(
-        "app.kubernetes.io/name".to_string(),
-        manifest.metadata.name.clone(),
-    );
-    labels.insert(
-        "jarvisctl.io/runtime-driver".to_string(),
-        "codex-app".to_string(),
-    );
-    labels.insert(
-        "jarvisctl.io/runtime-namespace".to_string(),
-        manifest.metadata.name.clone(),
-    );
-    labels.insert(
-        "jarvisctl.io/control-namespace".to_string(),
-        manifest.namespace_key().to_string(),
-    );
-    labels
-}
-
-fn namespace_defaults_from_sources(
-    control_namespace: &str,
-    sources: &[ResourceManifest],
-) -> NamespaceSpec {
-    sources
-        .iter()
-        .find_map(|manifest| match manifest {
-            ResourceManifest::Namespace(namespace)
-                if namespace.metadata.name == control_namespace =>
-            {
-                Some(namespace.spec.clone())
-            }
-            _ => None,
-        })
-        .unwrap_or_default()
-}
-
-fn kubernetes_runtime_env_from(template: &DeploymentTemplateSpec) -> Vec<serde_json::Value> {
-    let mut env_from = Vec::new();
-    for reference in &template.config_maps {
-        let mut entry = json!({
-            "configMapRef": {
-                "name": env_binding_name(reference),
-                "optional": env_binding_optional(reference),
-            }
-        });
-        if let Some(prefix) = env_binding_prefix(reference) {
-            entry["prefix"] = json!(prefix);
-        }
-        env_from.push(entry);
-    }
-    for reference in &template.secrets {
-        let mut entry = json!({
-            "secretRef": {
-                "name": env_binding_name(reference),
-                "optional": env_binding_optional(reference),
-            }
-        });
-        if let Some(prefix) = env_binding_prefix(reference) {
-            entry["prefix"] = json!(prefix);
-        }
-        env_from.push(entry);
-    }
-    env_from
-}
-
-fn kubernetes_runtime_host_path_volumes(
-    template: &DeploymentTemplateSpec,
-    runtime: &KubernetesRuntimeSpec,
-    sources: &[ResourceManifest],
-    control_namespace: &str,
-) -> anyhow::Result<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
-    let mut mounts = Vec::new();
-    if let (Some(workspace_host_path), Some(workspace_mount_path)) = (
-        runtime.workspace_host_path.as_deref(),
-        runtime.workspace_mount_path.as_deref(),
-    ) {
-        mounts.push(KubernetesHostPathMount {
-            host_path: workspace_host_path.to_string(),
-            mount_path: workspace_mount_path.to_string(),
-            read_only: false,
-        });
-    }
-    mounts.extend(runtime.host_path_mounts.clone());
-    mounts.extend(resolved_kubernetes_volume_bindings(
-        &template.volumes,
-        control_namespace,
-        sources,
-    )?);
-
-    let mut volumes = Vec::new();
-    let mut volume_mounts = Vec::new();
-    for (index, mount) in mounts.iter().enumerate() {
-        let volume_name = format!("host-path-{}", index + 1);
-        volumes.push(json!({
-            "name": volume_name,
-            "hostPath": {
-                "path": mount.host_path,
-                "type": "DirectoryOrCreate",
-            }
-        }));
-        volume_mounts.push(json!({
-            "name": volume_name,
-            "mountPath": mount.mount_path,
-            "readOnly": mount.read_only,
-        }));
-    }
-    Ok((volumes, volume_mounts))
-}
-
-fn resolved_kubernetes_volume_bindings(
-    references: &[VolumeBindingRef],
-    control_namespace: &str,
-    sources: &[ResourceManifest],
-) -> anyhow::Result<Vec<KubernetesHostPathMount>> {
-    let mut mounts = Vec::new();
-    for reference in references {
-        let name = volume_binding_name(reference);
-        let manifest = sources.iter().find_map(|manifest| match manifest {
-            ResourceManifest::Volume(volume)
-                if volume.namespace_key() == control_namespace && volume.metadata.name == name =>
-            {
-                Some(volume)
-            }
-            _ => None,
-        });
-        let Some(volume) = manifest else {
-            if volume_binding_optional(reference) {
-                continue;
-            }
-            bail!(
-                "missing Volume '{}/{}' while compiling Kubernetes runtime Deployment",
-                control_namespace,
-                name
-            );
-        };
-        let selected_paths = if volume_binding_paths(reference).is_empty() {
-            volume.spec.paths.clone()
-        } else {
-            volume
-                .spec
-                .paths
-                .iter()
-                .filter(|path| volume_binding_paths(reference).contains(path))
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        for path in selected_paths {
-            mounts.push(KubernetesHostPathMount {
-                host_path: path.clone(),
-                mount_path: path,
-                read_only: false,
-            });
-        }
-    }
-    Ok(mounts)
-}
-
-fn kubernetes_worker_job_spec_value(
-    metadata: &ResourceMetadata,
-    control_namespace: &str,
-    worker_request: &WorkerJobSpec,
-    resolved: &KubernetesResolvedWorker,
-    backoff_limit: usize,
-    parallelism: usize,
-    completions: usize,
-    suspend: bool,
-) -> anyhow::Result<serde_json::Value> {
-    let worker = &resolved.worker;
-    let job_namespace = normalize_namespaced_resource_namespace(Some(control_namespace));
-    let pod_name = slugify(&metadata.name);
-    let mut job_labels = metadata.labels.clone();
-    job_labels.insert("jarvisctl.io/kube-compiled".to_string(), "true".to_string());
-    job_labels.insert(
-        "jarvisctl.io/worker".to_string(),
-        worker.metadata.name.clone(),
-    );
-    job_labels.insert(
-        "jarvisctl.io/provider".to_string(),
-        worker_provider_name(worker.spec.provider).to_string(),
-    );
-    if let Some(service_name) = resolved.service_name.as_ref() {
-        job_labels.insert("jarvisctl.io/service".to_string(), service_name.clone());
-    }
-    if let Some(class_name) = resolved.selected_class.as_ref() {
-        job_labels.insert("jarvisctl.io/class".to_string(), class_name.clone());
-    }
-    let pod_labels = job_labels.clone();
-
-    let mut container_env = vec![
-        json!({"name": "JARVIS_PROVIDER", "value": worker_provider_name(worker.spec.provider)}),
-        json!({"name": "JARVIS_WORKER_NAME", "value": worker.metadata.name}),
-        json!({"name": "JARVIS_WORKER_MODEL", "value": worker.spec.model}),
-        json!({"name": "JARVIS_WORKER_URL", "value": worker_endpoint(worker)}),
-        json!({"name": "JARVIS_OUTPUT_MODE", "value": match effective_worker_output_mode(worker) {
-            WorkerOutputMode::Text => "text",
-            WorkerOutputMode::Json => "json",
-        }}),
-        json!({"name": "JARVIS_PROMPT_B64", "value": BASE64_STANDARD.encode(worker_request.prompt.as_bytes())}),
-    ];
-    if let Some(system_prompt) = worker.spec.system_prompt.as_deref() {
-        container_env.push(json!({
-            "name": "JARVIS_SYSTEM_PROMPT_B64",
-            "value": BASE64_STANDARD.encode(system_prompt.as_bytes())
-        }));
-    }
-    if let Some(service_name) = resolved.service_name.as_ref() {
-        container_env.push(json!({"name": "JARVIS_SERVICE_NAME", "value": service_name}));
-    }
-    if let Some(class_name) = resolved.selected_class.as_ref() {
-        container_env.push(json!({"name": "JARVIS_SELECTED_CLASS", "value": class_name}));
-    }
-    if resolved.fallback_class {
-        container_env.push(json!({"name": "JARVIS_FALLBACK_CLASS", "value": "true"}));
-    }
-    if let Some(intent) = worker_request
-        .intent
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        container_env.push(json!({"name": "JARVIS_INTENT", "value": intent}));
-    }
-    if let Some(output_path) = worker_request
-        .output_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        container_env.push(json!({"name": "JARVIS_WORKER_OUTPUT_PATH", "value": output_path}));
-    }
-    if let Some(temperature) = worker.spec.temperature {
-        container_env.push(json!({"name": "JARVIS_TEMPERATURE", "value": temperature.to_string()}));
-    }
-    if let Some(top_p) = worker.spec.top_p {
-        container_env.push(json!({"name": "JARVIS_TOP_P", "value": top_p.to_string()}));
-    }
-    if let Some(frequency_penalty) = worker.spec.frequency_penalty {
-        container_env.push(
-            json!({"name": "JARVIS_FREQUENCY_PENALTY", "value": frequency_penalty.to_string()}),
-        );
-    }
-    if let Some(presence_penalty) = worker.spec.presence_penalty {
-        container_env.push(
-            json!({"name": "JARVIS_PRESENCE_PENALTY", "value": presence_penalty.to_string()}),
-        );
-    }
-    if let Some(num_predict) = worker.spec.num_predict {
-        container_env.push(json!({"name": "JARVIS_MAX_TOKENS", "value": num_predict.to_string()}));
-    }
-    if let Some(timeout_seconds) = worker_request.timeout_seconds {
-        container_env
-            .push(json!({"name": "JARVIS_TIMEOUT_SECONDS", "value": timeout_seconds.to_string()}));
-    }
-    if let Some(validation) = worker_request.validation.as_ref()
-        && let Some(shell_command) = validation
-            .shell_command
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    {
-        container_env.push(json!({
-            "name": "JARVIS_VALIDATION_COMMAND_B64",
-            "value": BASE64_STANDARD.encode(shell_command.as_bytes())
-        }));
-        container_env.push(json!({
-            "name": "JARVIS_VALIDATION_FAIL_ON_FAILURE",
-            "value": if validation.fail_job_on_failure { "true" } else { "false" }
-        }));
-    }
-    if matches!(
-        worker.spec.provider,
-        WorkerProvider::Nvidia | WorkerProvider::Moonshot
-    ) {
-        let secret_ref = worker_api_key_secret_ref(worker).ok_or_else(|| {
-            anyhow!(
-                "worker '{}/{}' needs spec.apiKeySecretRef to compile into a Kubernetes job",
-                worker.namespace_key(),
-                worker.metadata.name
-            )
-        })?;
-        ensure!(
-            secret_ref.namespace == job_namespace,
-            "worker '{}/{}' references secret '{}/{}' outside job namespace '{}'; cross-namespace secret refs are not supported in Kubernetes jobs",
-            worker.namespace_key(),
-            worker.metadata.name,
-            secret_ref.namespace,
-            secret_ref.name,
-            job_namespace
-        );
-        container_env.push(json!({
-            "name": "JARVIS_WORKER_API_KEY",
-            "valueFrom": {
-                "secretKeyRef": {
-                    "name": secret_ref.name,
-                    "key": secret_ref.key
-                }
-            }
-        }));
-    }
-
-    Ok(json!({
-        "parallelism": parallelism,
-        "completions": completions,
-        "backoffLimit": backoff_limit,
-        "suspend": suspend,
-        "template": {
-            "metadata": {
-                "labels": pod_labels
-            },
-            "spec": {
-                "restartPolicy": "Never",
-                "containers": [{
-                    "name": format!("{}-worker", pod_name),
-                    "image": "python:3.12-alpine",
-                    "imagePullPolicy": "IfNotPresent",
-                    "command": ["python", "-c", kubernetes_worker_runner_script()],
-                    "env": container_env,
-                }]
-            }
-        }
-    }))
-}
-
-fn resolve_kubernetes_worker_request(
-    request: &WorkerJobSpec,
-    control_namespace: &str,
-    manifests: &[ResourceManifest],
-) -> anyhow::Result<KubernetesResolvedWorker> {
-    let named_worker = request
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let selector = request.selector.as_ref();
-    let service_name = request
-        .service_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let intent = request
-        .intent
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .or(Some("task_offload"));
-    let mut worker_namespace = worker_request_namespace(request, control_namespace);
-    let mut candidates = Vec::new();
-    let mut service_policy: Option<ServiceSpec> = None;
-    let mut matched_class: Option<String> = None;
-    let mut fallback_class = false;
-
-    if let Some(name) = named_worker {
-        let worker = manifest_workers_in_namespace(manifests, &worker_namespace)
-            .into_iter()
-            .find(|worker| worker.metadata.name == name)
-            .ok_or_else(|| {
-                anyhow!(
-                    "worker '{}/{}' was not present in the provided manifests",
-                    worker_namespace,
-                    name
-                )
-            })?;
-        candidates.push(worker);
-    } else if let Some(service_name) = service_name {
-        let service_namespace = service_selection_namespace(request, control_namespace);
-        let service = manifest_services_in_namespace(manifests, &service_namespace)
-            .into_iter()
-            .find(|service| service.metadata.name == service_name)
-            .ok_or_else(|| {
-                anyhow!(
-                    "service '{}/{}' was not present in the provided manifests",
-                    service_namespace,
-                    service_name
-                )
-            })?;
-        ensure!(
-            effective_service_target_kind(&service.spec) == ServiceTargetKind::Worker,
-            "service '{}/{}' does not target workers",
-            service.namespace_key(),
-            service.metadata.name
-        );
-        ensure!(
-            service_allows_intent(&service.spec, intent),
-            "service '{}/{}' does not allow intent '{}'",
-            service.namespace_key(),
-            service.metadata.name,
-            intent.unwrap_or("task_offload")
-        );
-        worker_namespace = service_namespace;
-        candidates = manifest_workers_in_namespace(manifests, &worker_namespace)
-            .into_iter()
-            .filter(|worker| worker_matches_service_runtime_policy(&service, worker))
-            .collect();
-        service_policy = Some(service.spec);
-    } else {
-        candidates = manifest_workers_in_namespace(manifests, &worker_namespace);
-    }
-
-    if let Some(selector) = selector {
-        candidates.retain(|worker| worker_labels_match_selector(&worker.metadata.labels, selector));
-    }
-    let required_capabilities = merged_required_capabilities(
-        &request.required_capabilities,
-        service_policy
-            .as_ref()
-            .map(|service| service.required_capabilities.as_slice()),
-    );
-    if !required_capabilities.is_empty() {
-        candidates
-            .retain(|worker| worker_supports_required_capabilities(worker, &required_capabilities));
-    }
-
-    let (effective_class_name, fallback_class_names) =
-        effective_class_policy(request, service_policy.as_ref());
-    let preferred_providers = merged_preferred_providers(
-        &request.preferred_providers,
-        service_policy
-            .as_ref()
-            .map(|service| service.preferred_providers.as_slice()),
-    );
-
-    if let Some(class_name) = effective_class_name.as_deref() {
-        let primary = candidates
-            .iter()
-            .filter(|worker| worker_matches_class(worker, class_name))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !primary.is_empty() {
-            matched_class = Some(class_name.to_string());
-            candidates = primary;
-        } else {
-            for fallback_name in &fallback_class_names {
-                let matches = candidates
-                    .iter()
-                    .filter(|worker| worker_matches_class(worker, fallback_name))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if !matches.is_empty() {
-                    matched_class = Some(fallback_name.to_string());
-                    fallback_class = true;
-                    candidates = matches;
-                    break;
-                }
-            }
-        }
-    } else {
-        for fallback_name in &fallback_class_names {
-            let matches = candidates
-                .iter()
-                .filter(|worker| worker_matches_class(worker, fallback_name))
-                .cloned()
-                .collect::<Vec<_>>();
-            if !matches.is_empty() {
-                matched_class = Some(fallback_name.to_string());
-                fallback_class = true;
-                candidates = matches;
-                break;
-            }
-        }
-    }
-
-    ensure!(
-        !candidates.is_empty(),
-        "no worker from the provided manifests matched the Kubernetes job request in namespace '{}'",
-        worker_namespace
-    );
-    sort_static_kubernetes_workers(
-        &mut candidates,
-        &preferred_providers,
-        request.prefer_local
-            || service_policy
-                .as_ref()
-                .map(|service| service.prefer_local)
-                .unwrap_or(false),
-    );
-    Ok(KubernetesResolvedWorker {
-        worker: candidates.remove(0),
-        service_name: service_name.map(ToOwned::to_owned),
-        selected_class: matched_class,
-        fallback_class,
-    })
-}
-
-fn manifest_workers_in_namespace(
-    manifests: &[ResourceManifest],
-    namespace: &str,
-) -> Vec<ResourceEnvelope<WorkerSpec>> {
-    manifests
-        .iter()
-        .filter_map(|manifest| match manifest {
-            ResourceManifest::Worker(worker) if worker.namespace_key() == namespace => {
-                Some(worker.clone())
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-fn manifest_services_in_namespace(
-    manifests: &[ResourceManifest],
-    namespace: &str,
-) -> Vec<ResourceEnvelope<ServiceSpec>> {
-    manifests
-        .iter()
-        .filter_map(|manifest| match manifest {
-            ResourceManifest::Service(service) if service.namespace_key() == namespace => {
-                Some(service.clone())
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-fn sort_static_kubernetes_workers(
-    candidates: &mut [ResourceEnvelope<WorkerSpec>],
-    preferred_providers: &[WorkerProvider],
-    prefer_local: bool,
-) {
-    candidates.sort_by(|left, right| {
-        let left_locality = effective_worker_locality(left);
-        let right_locality = effective_worker_locality(right);
-        if prefer_local {
-            (left_locality != WorkerLocality::Local).cmp(&(right_locality != WorkerLocality::Local))
-        } else {
-            std::cmp::Ordering::Equal
-        }
-        .then_with(|| {
-            provider_preference_rank(left.spec.provider, preferred_providers).cmp(
-                &provider_preference_rank(right.spec.provider, preferred_providers),
-            )
-        })
-        .then_with(|| left.metadata.name.cmp(&right.metadata.name))
-    });
-}
-
-fn kubernetes_worker_runner_script() -> String {
-    r#"
-import base64
-import json
-import os
-import subprocess
-import sys
-import urllib.request
-
-def decode_b64(name: str) -> str:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return ""
-    return base64.b64decode(raw.encode("utf-8")).decode("utf-8")
-
-def maybe_float(name: str):
-    value = os.environ.get(name, "").strip()
-    return float(value) if value else None
-
-def maybe_int(name: str):
-    value = os.environ.get(name, "").strip()
-    return int(value) if value else None
-
-provider = os.environ.get("JARVIS_PROVIDER", "nvidia").strip()
-endpoint = os.environ["JARVIS_WORKER_URL"].strip()
-model = os.environ["JARVIS_WORKER_MODEL"].strip()
-output_mode = os.environ.get("JARVIS_OUTPUT_MODE", "text").strip() or "text"
-prompt = decode_b64("JARVIS_PROMPT_B64").strip()
-system_prompt = decode_b64("JARVIS_SYSTEM_PROMPT_B64").strip()
-validation_command = decode_b64("JARVIS_VALIDATION_COMMAND_B64").strip()
-fail_on_validation = os.environ.get("JARVIS_VALIDATION_FAIL_ON_FAILURE", "false").strip().lower() == "true"
-output_path = os.environ.get("JARVIS_WORKER_OUTPUT_PATH", "").strip() or "/tmp/jarvisctl-output.txt"
-
-if provider == "ollama":
-    final_prompt = f"{system_prompt}\n\nTask:\n{prompt}".strip() if system_prompt else prompt
-    payload = {"model": model, "prompt": final_prompt, "stream": False}
-    temperature = maybe_float("JARVIS_TEMPERATURE")
-    max_tokens = maybe_int("JARVIS_MAX_TOKENS")
-    if temperature is not None or max_tokens is not None:
-        options = {}
-        if temperature is not None:
-            options["temperature"] = temperature
-        if max_tokens is not None:
-            options["num_predict"] = max_tokens
-        payload["options"] = options
-    if output_mode == "json":
-        payload["format"] = "json"
-    url = endpoint.rstrip("/") + "/api/generate"
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=maybe_int("JARVIS_TIMEOUT_SECONDS") or 180) as response:
-        body = json.loads(response.read().decode("utf-8"))
-    text = body["response"].strip()
-else:
-    system_parts = []
-    if system_prompt:
-        system_parts.append(system_prompt)
-    if output_mode == "json":
-        system_parts.append("Return only valid JSON with no markdown fences, no commentary, and no surrounding prose.")
-    messages = []
-    if system_parts:
-        messages.append({"role": "system", "content": "\n\n".join(system_parts)})
-    messages.append({"role": "user", "content": prompt})
-    payload = {"model": model, "messages": messages, "stream": False}
-    for env_name, payload_key in [
-        ("JARVIS_TEMPERATURE", "temperature"),
-        ("JARVIS_TOP_P", "top_p"),
-        ("JARVIS_FREQUENCY_PENALTY", "frequency_penalty"),
-        ("JARVIS_PRESENCE_PENALTY", "presence_penalty"),
-    ]:
-        value = maybe_float(env_name)
-        if value is not None:
-            payload[payload_key] = value
-    max_tokens = maybe_int("JARVIS_MAX_TOKENS")
-    if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
-    url = endpoint if endpoint.endswith("/chat/completions") else endpoint.rstrip("/") + "/chat/completions"
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    api_key = os.environ.get("JARVIS_WORKER_API_KEY", "").strip()
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=maybe_int("JARVIS_TIMEOUT_SECONDS") or 180) as response:
-        body = json.loads(response.read().decode("utf-8"))
-    content = body["choices"][0]["message"]["content"]
-    if isinstance(content, str):
-        text = content.strip()
-    elif isinstance(content, list):
-        text = "".join(
-            part.get("text", "") or part.get("content", "")
-            for part in content
-            if isinstance(part, dict)
-        ).strip()
-    else:
-        raise SystemExit("unsupported OpenAI-compatible worker response content")
-
-if output_mode == "json":
-    text = json.dumps(json.loads(text), indent=2, sort_keys=True)
-
-with open(output_path, "w", encoding="utf-8") as handle:
-    handle.write(text)
-    if not text.endswith("\n"):
-        handle.write("\n")
-
-print(text)
-
-if validation_command:
-    env = os.environ.copy()
-    env["JARVIS_WORKER_OUTPUT_PATH"] = output_path
-    result = subprocess.run(
-        ["/bin/sh", "-lc", validation_command],
-        env=env,
-        text=True,
-        capture_output=True,
-    )
-    if result.stdout:
-        sys.stdout.write(result.stdout)
-    if result.stderr:
-        sys.stderr.write(result.stderr)
-    if result.returncode != 0 and fail_on_validation:
-        sys.exit(result.returncode)
-"#
-    .trim()
-    .to_string()
-}
-
-pub fn render_get_output(
-    kind_arg: ControlPlaneResourceKindArg,
-    namespace: Option<&str>,
-    output: ControlPlaneOutput,
-) -> anyhow::Result<String> {
-    let _ = reconcile_control_plane()?;
-    let summaries = list_resource_summaries(kind_arg, namespace)?;
-    match output {
-        ControlPlaneOutput::Json => serde_json::to_string_pretty(&summaries)
-            .context("failed to encode control-plane summaries"),
-        ControlPlaneOutput::Yaml => {
-            serde_yaml::to_string(&summaries).context("failed to encode control-plane summaries")
-        }
-        ControlPlaneOutput::Table => Ok(render_summary_table(&summaries)),
-    }
-}
-
-pub fn render_describe_output(
-    kind_arg: ControlPlaneResourceKindArg,
-    name: &str,
-    namespace: Option<&str>,
-    output: ControlPlaneOutput,
-) -> anyhow::Result<String> {
-    let _ = reconcile_control_plane()?;
-    let kind = parse_specific_kind(kind_arg)?;
-    let manifest = load_manifest(kind, name, namespace)?;
-    let status = describe_status(&manifest)?;
-    let envelope = DescribeEnvelope {
-        manifest: serde_json::to_value(&manifest).context("failed to encode manifest")?,
-        status,
-    };
-    match output {
-        ControlPlaneOutput::Json => {
-            serde_json::to_string_pretty(&envelope).context("failed to encode describe payload")
-        }
-        ControlPlaneOutput::Yaml | ControlPlaneOutput::Table => {
-            serde_yaml::to_string(&envelope).context("failed to encode describe payload")
-        }
-    }
-}
-
-pub fn sync_application_resource(
-    application_name: &str,
-    namespace: Option<&str>,
-) -> anyhow::Result<String> {
-    let control_namespace = normalize_namespaced_resource_namespace(namespace);
-    let manifest = load_manifest(
-        ResourceKind::Application,
-        application_name,
-        Some(&control_namespace),
-    )?;
-    let ResourceManifest::Application(application) = manifest else {
-        bail!(
-            "resource '{}/{}' is not an Application",
-            control_namespace,
-            application_name
-        );
-    };
-    sync_application(&application, true)
-}
-
-pub fn render_application_diff_output(
-    application_name: &str,
-    namespace: Option<&str>,
-    output: ControlPlaneOutput,
-) -> anyhow::Result<String> {
-    let diff = application_diff(application_name, namespace)?;
-    match output {
-        ControlPlaneOutput::Json => {
-            serde_json::to_string_pretty(&diff).context("failed to encode application diff")
-        }
-        ControlPlaneOutput::Yaml => {
-            serde_yaml::to_string(&diff).context("failed to encode application diff")
-        }
-        ControlPlaneOutput::Table => Ok(render_application_diff_table(&diff)),
-    }
-}
-
-pub fn render_rollout_status_output(
-    deployment_name: &str,
-    namespace: Option<&str>,
-    output: ControlPlaneOutput,
-) -> anyhow::Result<String> {
-    let (_, deployment, status) =
-        load_rollout_status(deployment_name, namespace).with_context(|| {
-            format!(
-                "failed to load rollout status for Deployment '{}/{}'",
-                normalize_namespaced_resource_namespace(namespace),
-                deployment_name
-            )
-        })?;
-    match output {
-        ControlPlaneOutput::Json => {
-            serde_json::to_string_pretty(&status).context("failed to encode rollout status")
-        }
-        ControlPlaneOutput::Yaml => {
-            serde_yaml::to_string(&status).context("failed to encode rollout status")
-        }
-        ControlPlaneOutput::Table => Ok(render_rollout_status_table(
-            deployment.namespace_key(),
-            &deployment.metadata.name,
-            &status,
-        )),
-    }
-}
-
-pub fn wait_for_rollout_status_output(
-    deployment_name: &str,
-    namespace: Option<&str>,
-    output: ControlPlaneOutput,
-    timeout: Duration,
-) -> anyhow::Result<String> {
-    let started_at = Instant::now();
-    loop {
-        let (resolved_namespace, deployment, status) =
-            load_rollout_status(deployment_name, namespace)?;
-        if deployment_rollout_complete(&status) {
-            return match output {
-                ControlPlaneOutput::Json => {
-                    serde_json::to_string_pretty(&status).context("failed to encode rollout status")
-                }
-                ControlPlaneOutput::Yaml => {
-                    serde_yaml::to_string(&status).context("failed to encode rollout status")
-                }
-                ControlPlaneOutput::Table => Ok(render_rollout_status_table(
-                    deployment.namespace_key(),
-                    &deployment.metadata.name,
-                    &status,
-                )),
-            };
-        }
-        if status.failed {
-            let failure_message = deployment_rollout_failure_message(&status)
-                .unwrap_or_else(|| "rollout failed".to_string());
-            bail!(
-                "deployment '{}/{}' rollout failed: {}",
-                resolved_namespace,
-                deployment_name,
-                failure_message
-            );
-        }
-        if started_at.elapsed() >= timeout {
-            bail!(
-                "timed out waiting for deployment '{}/{}' rollout after {}s",
-                resolved_namespace,
-                deployment_name,
-                timeout.as_secs()
-            );
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-}
-
-fn load_rollout_status(
-    deployment_name: &str,
-    namespace: Option<&str>,
-) -> anyhow::Result<(String, ResourceEnvelope<DeploymentSpec>, DeploymentStatus)> {
-    let _ = reconcile_control_plane()?;
-    let resolved_namespace = normalize_namespaced_resource_namespace(namespace);
-    let manifest = load_manifest(
-        ResourceKind::Deployment,
-        deployment_name,
-        Some(&resolved_namespace),
-    )?;
-    let ResourceManifest::Deployment(deployment) = manifest else {
-        bail!("resource '{}' is not a Deployment", deployment_name);
-    };
-    let status = deployment_status(&deployment)?;
-    Ok((resolved_namespace, deployment, status))
-}
-
-pub fn render_rollout_history_output(
-    deployment_name: &str,
-    namespace: Option<&str>,
-    output: ControlPlaneOutput,
-) -> anyhow::Result<String> {
-    let _ = reconcile_control_plane()?;
-    let manifest = load_manifest(
-        ResourceKind::Deployment,
-        deployment_name,
-        Some(&normalize_namespaced_resource_namespace(namespace)),
-    )?;
-    let ResourceManifest::Deployment(deployment) = manifest else {
-        bail!("resource '{}' is not a Deployment", deployment_name);
-    };
-    let history = deployment_rollout_history(&deployment)?;
-    match output {
-        ControlPlaneOutput::Json => {
-            serde_json::to_string_pretty(&history).context("failed to encode rollout history")
-        }
-        ControlPlaneOutput::Yaml => {
-            serde_yaml::to_string(&history).context("failed to encode rollout history")
-        }
-        ControlPlaneOutput::Table => Ok(render_rollout_history_table(&history)),
     }
 }
 
@@ -3837,45 +1954,6 @@ fn resolve_service_target_for_source(
     })
 }
 
-fn resolve_worker_candidates_for_service(
-    service_name: &str,
-    control_namespace: Option<&str>,
-    source_control_namespace: &str,
-    source_labels: &BTreeMap<String, String>,
-    intent: Option<&str>,
-) -> anyhow::Result<(
-    ResourceEnvelope<ServiceSpec>,
-    Vec<ResourceEnvelope<WorkerSpec>>,
-)> {
-    let namespace = normalize_namespaced_resource_namespace(control_namespace);
-    let manifest = load_manifest(ResourceKind::Service, service_name, Some(&namespace))?;
-    let ResourceManifest::Service(service) = manifest else {
-        bail!("resource '{}' is not a Service", service_name);
-    };
-    ensure!(
-        effective_service_target_kind(&service.spec) == ServiceTargetKind::Worker,
-        "service '{}/{}' does not target workers",
-        namespace,
-        service_name
-    );
-    ensure!(
-        service_allows_intent(&service.spec, intent),
-        "service '{}/{}' does not allow intent '{}'",
-        namespace,
-        service_name,
-        intent.unwrap_or("task_offload")
-    );
-    ensure!(
-        service_allows_source_workload(&service.spec, source_control_namespace, source_labels),
-        "service '{}/{}' denies source workload in namespace '{}' by access policy",
-        namespace,
-        service_name,
-        source_control_namespace
-    );
-    let workers = load_workers_for_service(&service, &namespace)?;
-    Ok((service, workers))
-}
-
 fn parse_manifest_documents(raw: &str) -> anyhow::Result<Vec<ResourceManifest>> {
     let mut manifests = Vec::new();
     for document in serde_yaml::Deserializer::from_str(raw) {
@@ -3893,15 +1971,8 @@ fn parse_manifest_documents(raw: &str) -> anyhow::Result<Vec<ResourceManifest>> 
 }
 
 fn resolve_manifest_relative_paths(manifests: &mut [ResourceManifest], base_dir: &Path) {
-    for manifest in manifests {
-        if let ResourceManifest::Application(application) = manifest {
-            let source_path = PathBuf::from(&application.spec.source.path);
-            if application.spec.source.repo_url.is_none() && source_path.is_relative() {
-                application.spec.source.path =
-                    base_dir.join(source_path).to_string_lossy().into_owned();
-            }
-        }
-    }
+    let _ = manifests;
+    let _ = base_dir;
 }
 
 fn parse_manifest_value(value: Value) -> anyhow::Result<ResourceManifest> {
@@ -3910,6 +1981,15 @@ fn parse_manifest_value(value: Value) -> anyhow::Result<ResourceManifest> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("manifest is missing kind"))?;
     match kind {
+        "Node" => {
+            let mut manifest: ResourceEnvelope<NodeSpec> =
+                serde_yaml::from_value(value).context("failed to decode Node manifest")?;
+            normalize_metadata(&mut manifest.metadata, true)?;
+            validate_node(&manifest)?;
+            manifest.api_version = API_VERSION.to_string();
+            manifest.kind = "Node".to_string();
+            Ok(ResourceManifest::Node(manifest))
+        }
         "Namespace" => {
             let mut manifest: ResourceEnvelope<NamespaceSpec> =
                 serde_yaml::from_value(value).context("failed to decode Namespace manifest")?;
@@ -3936,33 +2016,10 @@ fn parse_manifest_value(value: Value) -> anyhow::Result<ResourceManifest> {
             manifest.kind = "ReplicaSet".to_string();
             Ok(ResourceManifest::ReplicaSet(manifest))
         }
-        "Job" => {
-            let mut manifest: ResourceEnvelope<JobSpec> =
-                serde_yaml::from_value(value).context("failed to decode Job manifest")?;
-            normalize_metadata(&mut manifest.metadata, false)?;
-            validate_job(&manifest)?;
-            manifest.api_version = API_VERSION.to_string();
-            manifest.kind = "Job".to_string();
-            Ok(ResourceManifest::Job(manifest))
-        }
-        "CronJob" => {
-            let mut manifest: ResourceEnvelope<CronJobSpec> =
-                serde_yaml::from_value(value).context("failed to decode CronJob manifest")?;
-            normalize_metadata(&mut manifest.metadata, false)?;
-            validate_cron_job(&manifest)?;
-            manifest.api_version = API_VERSION.to_string();
-            manifest.kind = "CronJob".to_string();
-            Ok(ResourceManifest::CronJob(manifest))
-        }
-        "Application" => {
-            let mut manifest: ResourceEnvelope<ApplicationSpec> =
-                serde_yaml::from_value(value).context("failed to decode Application manifest")?;
-            normalize_metadata(&mut manifest.metadata, false)?;
-            validate_application(&manifest)?;
-            manifest.api_version = API_VERSION.to_string();
-            manifest.kind = "Application".to_string();
-            Ok(ResourceManifest::Application(manifest))
-        }
+        "Job" | "CronJob" | "Application" => bail!(
+            "manifest kind '{}' is no longer part of the supported jarvisctl product surface; keep jarvisctl focused on Codex runtimes, operator control, and repeatable workspaces",
+            kind
+        ),
         "Service" => {
             let mut manifest: ResourceEnvelope<ServiceSpec> =
                 serde_yaml::from_value(value).context("failed to decode Service manifest")?;
@@ -4006,15 +2063,9 @@ fn parse_manifest_value(value: Value) -> anyhow::Result<ResourceManifest> {
             manifest.kind = "Volume".to_string();
             Ok(ResourceManifest::Volume(manifest))
         }
-        "Worker" => {
-            let mut manifest: ResourceEnvelope<WorkerSpec> =
-                serde_yaml::from_value(value).context("failed to decode Worker manifest")?;
-            normalize_metadata(&mut manifest.metadata, false)?;
-            validate_worker(&manifest)?;
-            manifest.api_version = API_VERSION.to_string();
-            manifest.kind = "Worker".to_string();
-            Ok(ResourceManifest::Worker(manifest))
-        }
+        "Worker" => bail!(
+            "Worker resources are no longer part of the supported jarvisctl product surface; keep jarvisctl focused on Codex runtimes, session control, and repeatable workspaces"
+        ),
         other => bail!("unsupported control-plane resource kind '{}'", other),
     }
 }
@@ -4032,6 +2083,33 @@ fn normalize_metadata(metadata: &mut ResourceMetadata, cluster_scoped: bool) -> 
             metadata.namespace.as_deref(),
         ));
     }
+    Ok(())
+}
+
+fn validate_node(manifest: &ResourceEnvelope<NodeSpec>) -> anyhow::Result<()> {
+    ensure!(
+        manifest.spec.max_sessions.unwrap_or(1) > 0,
+        "Node '{}' must set spec.maxSessions > 0",
+        manifest.metadata.name
+    );
+    ensure!(
+        !manifest
+            .spec
+            .roles
+            .iter()
+            .any(|role| role.trim().is_empty()),
+        "Node '{}' has an empty role",
+        manifest.metadata.name
+    );
+    ensure!(
+        !manifest
+            .spec
+            .taints
+            .iter()
+            .any(|taint| taint.trim().is_empty()),
+        "Node '{}' has an empty taint",
+        manifest.metadata.name
+    );
     Ok(())
 }
 
@@ -4132,203 +2210,12 @@ fn validate_replica_set(manifest: &ResourceEnvelope<ReplicaSetSpec>) -> anyhow::
     Ok(())
 }
 
-fn validate_job(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<()> {
-    ensure!(
-        manifest.spec.parallelism > 0,
-        "Job '{}' must set spec.parallelism > 0",
-        manifest.metadata.name
-    );
-    ensure!(
-        manifest.spec.completions > 0,
-        "Job '{}' must set spec.completions > 0",
-        manifest.metadata.name
-    );
-    ensure!(
-        manifest.spec.agents > 0,
-        "Job '{}' must set spec.agents > 0",
-        manifest.metadata.name
-    );
-    let has_worker = manifest.spec.worker.is_some();
-    let has_runtime_template = !manifest.spec.template.task_note.trim().is_empty();
-    ensure!(
-        has_worker || has_runtime_template,
-        "Job '{}' must set either spec.template.task_note or spec.worker",
-        manifest.metadata.name
-    );
-    ensure!(
-        !(has_worker && has_runtime_template),
-        "Job '{}' must choose either spec.template.task_note or spec.worker, not both",
-        manifest.metadata.name
-    );
-    if let Some(worker) = manifest.spec.worker.as_ref() {
-        ensure!(
-            worker
-                .name
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_some()
-                || worker
-                    .class_name
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .is_some()
-                || worker
-                    .service_name
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .is_some()
-                || worker.selector.is_some()
-                || !worker.required_capabilities.is_empty(),
-            "Job '{}' must set spec.worker.name, spec.worker.className, spec.worker.serviceName, spec.worker.selector, or spec.worker.requiredCapabilities",
-            manifest.metadata.name
-        );
-        if let Some(name) = worker.name.as_deref() {
-            ensure!(
-                !name.trim().is_empty(),
-                "Job '{}' has an empty spec.worker.name",
-                manifest.metadata.name
-            );
-        }
-        if let Some(class_name) = worker.class_name.as_deref() {
-            ensure!(
-                !class_name.trim().is_empty(),
-                "Job '{}' has an empty spec.worker.className",
-                manifest.metadata.name
-            );
-        }
-        if let Some(service_name) = worker.service_name.as_deref() {
-            ensure!(
-                !service_name.trim().is_empty(),
-                "Job '{}' has an empty spec.worker.serviceName",
-                manifest.metadata.name
-            );
-        }
-        ensure!(
-            !worker.prompt.trim().is_empty(),
-            "Job '{}' must set spec.worker.prompt",
-            manifest.metadata.name
-        );
-        if let Some(timeout_seconds) = worker.timeout_seconds {
-            ensure!(
-                timeout_seconds > 0,
-                "Job '{}' must set spec.worker.timeoutSeconds > 0",
-                manifest.metadata.name
-            );
-        }
-        if let Some(output_path) = worker.output_path.as_deref() {
-            ensure!(
-                !output_path.trim().is_empty(),
-                "Job '{}' has an empty spec.worker.outputPath",
-                manifest.metadata.name
-            );
-        }
-        if let Some(validation) = worker.validation.as_ref() {
-            if let Some(shell_command) = validation.shell_command.as_deref() {
-                ensure!(
-                    !shell_command.trim().is_empty(),
-                    "Job '{}' has an empty spec.worker.validation.shellCommand",
-                    manifest.metadata.name
-                );
-            }
-        }
-        if let Some(intent) = worker.intent.as_deref() {
-            ensure!(
-                !intent.trim().is_empty(),
-                "Job '{}' has an empty spec.worker.intent",
-                manifest.metadata.name
-            );
-        }
-    } else {
-        validate_template_bindings(&manifest.spec.template, "Job", &manifest.metadata.name)?;
-    }
-    Ok(())
-}
-
-fn validate_cron_job(manifest: &ResourceEnvelope<CronJobSpec>) -> anyhow::Result<()> {
-    parse_kubernetes_cron_schedule(&manifest.spec.schedule).with_context(|| {
-        format!(
-            "CronJob '{}' has an invalid spec.schedule '{}'",
-            manifest.metadata.name, manifest.spec.schedule
-        )
-    })?;
-    let job_manifest = ResourceEnvelope {
-        api_version: API_VERSION.to_string(),
-        kind: "Job".to_string(),
-        metadata: manifest.metadata.clone(),
-        spec: manifest.spec.job_template.spec.clone(),
-    };
-    validate_job(&job_manifest)?;
-    Ok(())
-}
-
-fn validate_application(manifest: &ResourceEnvelope<ApplicationSpec>) -> anyhow::Result<()> {
-    ensure!(
-        !manifest.spec.source.path.trim().is_empty(),
-        "Application '{}' must set spec.source.path",
-        manifest.metadata.name
-    );
-    if let Some(repo_url) = manifest.spec.source.repo_url.as_deref() {
-        ensure!(
-            !repo_url.trim().is_empty(),
-            "Application '{}' has an empty spec.source.repoURL",
-            manifest.metadata.name
-        );
-        ensure!(
-            !Path::new(&manifest.spec.source.path).is_absolute(),
-            "Application '{}' must use a repo-relative spec.source.path when spec.source.repoURL is set",
-            manifest.metadata.name
-        );
-    }
-    Ok(())
-}
-
 fn validate_service(manifest: &ResourceEnvelope<ServiceSpec>) -> anyhow::Result<()> {
-    let target_kind = effective_service_target_kind(&manifest.spec);
     ensure!(
-        !manifest.spec.selector.is_empty()
-            || manifest.spec.class_name.is_some()
-            || !manifest.spec.required_capabilities.is_empty(),
-        "Service '{}' must set spec.selector, spec.className, or spec.requiredCapabilities",
+        !manifest.spec.selector.is_empty(),
+        "Service '{}' must set spec.selector",
         manifest.metadata.name
     );
-    if target_kind == ServiceTargetKind::Runtime {
-        ensure!(
-            manifest.spec.class_name.is_none(),
-            "Service '{}' cannot set spec.className when targetKind=runtime",
-            manifest.metadata.name
-        );
-        ensure!(
-            manifest.spec.fallback_class_names.is_empty(),
-            "Service '{}' cannot set spec.fallbackClassNames when targetKind=runtime",
-            manifest.metadata.name
-        );
-        ensure!(
-            manifest.spec.required_capabilities.is_empty(),
-            "Service '{}' cannot set spec.requiredCapabilities when targetKind=runtime",
-            manifest.metadata.name
-        );
-        ensure!(
-            manifest.spec.preferred_providers.is_empty(),
-            "Service '{}' cannot set spec.preferredProviders when targetKind=runtime",
-            manifest.metadata.name
-        );
-        ensure!(
-            !manifest.spec.prefer_local,
-            "Service '{}' cannot set spec.preferLocal when targetKind=runtime",
-            manifest.metadata.name
-        );
-    } else {
-        if let Some(class_name) = manifest.spec.class_name.as_deref() {
-            ensure!(
-                !class_name.trim().is_empty(),
-                "Service '{}' has an empty spec.className",
-                manifest.metadata.name
-            );
-        }
-    }
     Ok(())
 }
 
@@ -4348,84 +2235,6 @@ fn validate_volume(manifest: &ResourceEnvelope<VolumeSpec>) -> anyhow::Result<()
         "Volume '{}' must define at least one path",
         manifest.metadata.name
     );
-    Ok(())
-}
-
-fn validate_worker(manifest: &ResourceEnvelope<WorkerSpec>) -> anyhow::Result<()> {
-    ensure!(
-        !manifest.spec.model.trim().is_empty(),
-        "Worker '{}' must set spec.model",
-        manifest.metadata.name
-    );
-    if let Some(endpoint) = manifest.spec.endpoint.as_deref() {
-        ensure!(
-            endpoint.starts_with("http://") || endpoint.starts_with("https://"),
-            "Worker '{}' has invalid spec.endpoint '{}'",
-            manifest.metadata.name,
-            endpoint
-        );
-    }
-    if let Some(api_key_env) = manifest.spec.api_key_env.as_deref() {
-        ensure!(
-            !api_key_env.trim().is_empty(),
-            "Worker '{}' has an empty spec.apiKeyEnv",
-            manifest.metadata.name
-        );
-    }
-    if let Some(secret_ref) = manifest.spec.api_key_secret_ref.as_ref() {
-        ensure!(
-            !secret_ref.name.trim().is_empty(),
-            "Worker '{}' has an empty spec.apiKeySecretRef.name",
-            manifest.metadata.name
-        );
-        ensure!(
-            !secret_ref.key.trim().is_empty(),
-            "Worker '{}' has an empty spec.apiKeySecretRef.key",
-            manifest.metadata.name
-        );
-        if let Some(namespace) = secret_ref.namespace.as_deref() {
-            ensure!(
-                !namespace.trim().is_empty(),
-                "Worker '{}' has an empty spec.apiKeySecretRef.namespace",
-                manifest.metadata.name
-            );
-        }
-    }
-    if let Some(max_concurrent) = manifest.spec.max_concurrent {
-        ensure!(
-            max_concurrent > 0,
-            "Worker '{}' must set spec.maxConcurrent > 0",
-            manifest.metadata.name
-        );
-    }
-    if let Some(memory_mib) = manifest.spec.memory_mib {
-        ensure!(
-            memory_mib > 0,
-            "Worker '{}' must set spec.memoryMiB > 0",
-            manifest.metadata.name
-        );
-    }
-    if let Some(gpu_memory_mib) = manifest.spec.gpu_memory_mib {
-        ensure!(
-            gpu_memory_mib > 0,
-            "Worker '{}' must set spec.gpuMemoryMiB > 0",
-            manifest.metadata.name
-        );
-    }
-    if let Some(top_p) = manifest.spec.top_p {
-        ensure!(
-            (0.0..=1.0).contains(&top_p),
-            "Worker '{}' must set spec.topP between 0.0 and 1.0",
-            manifest.metadata.name
-        );
-    }
-    if let Some(pool) = manifest.spec.pool.as_deref() {
-        ensure!(
-            !pool.trim().is_empty(),
-            "Worker '{}' has an empty spec.pool",
-            manifest.metadata.name
-        );
-    }
     Ok(())
 }
 
@@ -4472,180 +2281,8 @@ fn validate_template_bindings(
     Ok(())
 }
 
-fn validate_kubernetes_runtime(
-    runtime: &KubernetesRuntimeSpec,
-    kind: &str,
-    name: &str,
-) -> anyhow::Result<()> {
-    if let Some(image) = runtime.image.as_deref() {
-        ensure!(
-            !image.trim().is_empty(),
-            "{} '{}' has an empty kubernetes.image",
-            kind,
-            name
-        );
-    }
-    if let Some(policy) = runtime.image_pull_policy.as_deref() {
-        ensure!(
-            !policy.trim().is_empty(),
-            "{} '{}' has an empty kubernetes.imagePullPolicy",
-            kind,
-            name
-        );
-    }
-    if let Some(service_account_name) = runtime.service_account_name.as_deref() {
-        ensure!(
-            !service_account_name.trim().is_empty(),
-            "{} '{}' has an empty kubernetes.serviceAccountName",
-            kind,
-            name
-        );
-    }
-    if let Some(control_port) = runtime.control_port {
-        ensure!(
-            control_port > 0,
-            "{} '{}' must set kubernetes.controlPort > 0",
-            kind,
-            name
-        );
-    }
-    if runtime.workspace_host_path.is_some() || runtime.workspace_mount_path.is_some() {
-        ensure!(
-            runtime
-                .workspace_host_path
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty()),
-            "{} '{}' must set both kubernetes.workspaceHostPath and kubernetes.workspaceMountPath together",
-            kind,
-            name
-        );
-        ensure!(
-            runtime
-                .workspace_mount_path
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty()),
-            "{} '{}' must set both kubernetes.workspaceHostPath and kubernetes.workspaceMountPath together",
-            kind,
-            name
-        );
-    }
-    for mount in &runtime.host_path_mounts {
-        ensure!(
-            !mount.host_path.trim().is_empty(),
-            "{} '{}' has a kubernetes.hostPathMounts entry with an empty hostPath",
-            kind,
-            name
-        );
-        ensure!(
-            !mount.mount_path.trim().is_empty(),
-            "{} '{}' has a kubernetes.hostPathMounts entry with an empty mountPath",
-            kind,
-            name
-        );
-    }
-    for (key, value) in &runtime.env {
-        ensure!(
-            !key.trim().is_empty(),
-            "{} '{}' has an empty kubernetes.env key",
-            kind,
-            name
-        );
-        ensure!(
-            !value.trim().is_empty(),
-            "{} '{}' has an empty kubernetes.env value for '{}'",
-            kind,
-            name,
-            key
-        );
-    }
-    Ok(())
-}
-
-fn save_manifest(manifest: &ResourceManifest) -> anyhow::Result<()> {
-    let path = manifest_path(manifest.kind(), manifest.name(), manifest.namespace())?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create '{}'", parent.display()))?;
-    }
-    let raw = serde_yaml::to_string(manifest).context("failed to encode manifest")?;
-    atomic_write_string(&path, &raw)
-}
-
-fn atomic_write_string(path: &Path, raw: &str) -> anyhow::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("path '{}' has no parent", path.display()))?;
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| anyhow!("path '{}' has no file name", path.display()))?;
-    let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or_default();
-    let temp_candidates = [
-        parent.join(format!(
-            ".{}.tmp.{}.{}",
-            file_name,
-            std::process::id(),
-            timestamp
-        )),
-        parent.join(format!(
-            "{}.tmp.{}.{}",
-            file_name,
-            std::process::id(),
-            timestamp
-        )),
-    ];
-    let mut last_error = None;
-
-    for temp_path in &temp_candidates {
-        match fs::write(temp_path, raw) {
-            Ok(()) => {
-                return fs::rename(temp_path, path).with_context(|| {
-                    format!(
-                        "failed to rename '{}' to '{}'",
-                        temp_path.display(),
-                        path.display()
-                    )
-                });
-            }
-            Err(error) => {
-                last_error = Some(anyhow!(
-                    "failed to write '{}': {}",
-                    temp_path.display(),
-                    error
-                ));
-            }
-        }
-    }
-
-    fs::write(path, raw).with_context(|| {
-        if let Some(error) = &last_error {
-            format!(
-                "failed to write '{}' after temp-file fallbacks ({error})",
-                path.display()
-            )
-        } else {
-            format!("failed to write '{}'", path.display())
-        }
-    })
-}
-
 fn reconcile_control_plane() -> anyhow::Result<Vec<String>> {
     let mut messages = Vec::new();
-
-    reconcile_manifest_batch(
-        load_manifests_by_kind(ResourceKind::Application, None)?,
-        &mut messages,
-    );
-    reconcile_manifest_batch(
-        load_manifests_by_kind(ResourceKind::CronJob, None)?,
-        &mut messages,
-    );
-    reconcile_manifest_batch(
-        load_manifests_by_kind(ResourceKind::Job, None)?,
-        &mut messages,
-    );
     reconcile_manifest_batch(
         load_manifests_by_kind(ResourceKind::Deployment, None)?,
         &mut messages,
@@ -4678,10 +2315,6 @@ fn reconcile_manifest_batch(manifests: Vec<ResourceManifest>, messages: &mut Vec
 fn reconcile_manifest(manifest: &ResourceManifest) -> anyhow::Result<Option<String>> {
     match manifest {
         ResourceManifest::Deployment(deployment) => reconcile_deployment(deployment).map(Some),
-        ResourceManifest::Job(job) => reconcile_job(job).map(Some),
-        ResourceManifest::CronJob(cron_job) => reconcile_cron_job(cron_job).map(Some),
-        ResourceManifest::Application(application) => reconcile_application(application).map(Some),
-        ResourceManifest::Worker(_) => Ok(None),
         _ => Ok(None),
     }
 }
@@ -5192,6 +2825,7 @@ fn launch_replica_set_replica(
         .working_directory
         .clone()
         .map(PathBuf::from);
+    let scheduled_node = select_node_for_template(&replica_set.spec.template)?;
 
     let config_maps = load_config_map_values(
         &control_namespace,
@@ -5220,12 +2854,13 @@ fn launch_replica_set_replica(
             replica_set.spec.revision,
             runtime_namespace,
             ordinal,
+            scheduled_node.as_ref(),
         ),
     );
     let context_overlay = RuntimeContextMetadata {
         control_namespace: Some(control_namespace.clone()),
         deployment: Some(replica_set.spec.deployment_name.clone()),
-        labels: replica_set_runtime_labels(replica_set, ordinal),
+        labels: replica_set_runtime_labels(replica_set, ordinal, scheduled_node.as_ref()),
         config_maps: replica_set
             .spec
             .template
@@ -5265,6 +2900,20 @@ fn launch_replica_set_replica(
         .map(PathBuf::from)
         .collect::<Vec<_>>();
 
+    if let Some(node) = scheduled_node.as_ref().filter(|node| !node_is_local(node)) {
+        return launch_remote_replica_set_replica(
+            node,
+            replica_set,
+            runtime_namespace,
+            working_directory,
+            operator_message.or_else(|| replica_set.spec.template.operator_message.clone()),
+            images,
+            environment,
+            context_overlay.labels.clone(),
+            startup_delay_ms,
+        );
+    }
+
     launch_codex_ticket(CodexLaunchOptions {
         backend: SessionBackend::Native,
         driver,
@@ -5285,6 +2934,114 @@ fn launch_replica_set_replica(
         startup_delay_ms,
         command: replica_set.spec.template.command.clone(),
     })?;
+    Ok(())
+}
+
+fn launch_remote_replica_set_replica(
+    node: &ResourceEnvelope<NodeSpec>,
+    replica_set: &ResourceEnvelope<ReplicaSetSpec>,
+    runtime_namespace: &str,
+    working_directory: Option<PathBuf>,
+    operator_message: Option<String>,
+    images: Vec<PathBuf>,
+    environment: BTreeMap<String, String>,
+    runtime_labels: BTreeMap<String, String>,
+    startup_delay_ms: u64,
+) -> anyhow::Result<()> {
+    let target = node_ssh_target(&node.spec)
+        .ok_or_else(|| anyhow!("Node '{}' has no SSH target", node.metadata.name))?;
+    let driver = replica_set
+        .spec
+        .driver
+        .unwrap_or(CodexRuntimeDriver::AppServer);
+    ensure!(
+        matches!(driver, CodexRuntimeDriver::AppServer),
+        "remote Node '{}' currently supports only the codex app-server driver",
+        node.metadata.name
+    );
+    let auth_files = local_codex_auth_files()?;
+    sync_codex_auth_to_remote_node_for_namespace(node, &auth_files, runtime_namespace)
+        .with_context(|| {
+            format!(
+                "failed to sync Codex auth before launching remote runtime '{}' on Node '{}'",
+                runtime_namespace, node.metadata.name
+            )
+        })?;
+
+    let mut remote_args = vec![
+        "jarvisctl".to_string(),
+        "codex".to_string(),
+        "--driver".to_string(),
+        "app-server".to_string(),
+        "--task-note".to_string(),
+        replica_set.spec.template.task_note.clone(),
+        "--namespace".to_string(),
+        runtime_namespace.to_string(),
+        "--control-namespace".to_string(),
+        replica_set.namespace_key().to_string(),
+        "--deployment".to_string(),
+        replica_set.spec.deployment_name.clone(),
+        "--agents".to_string(),
+        replica_set.spec.agents.to_string(),
+        "--agent".to_string(),
+        "agent0".to_string(),
+        "--fresh".to_string(),
+        "--startup-delay-ms".to_string(),
+        startup_delay_ms.to_string(),
+    ];
+    if let Some(working_directory) = working_directory {
+        remote_args.push("--working-directory".to_string());
+        remote_args.push(working_directory.display().to_string());
+    }
+    if let Some(operator_message) = operator_message {
+        remote_args.push("--message".to_string());
+        remote_args.push(operator_message);
+    }
+    for (key, value) in runtime_labels {
+        remote_args.push("--runtime-label".to_string());
+        remote_args.push(format!("{key}={value}"));
+    }
+    for image in images {
+        remote_args.push("--image".to_string());
+        remote_args.push(image.display().to_string());
+    }
+    if !replica_set.spec.template.command.is_empty() {
+        remote_args.push("--".to_string());
+        remote_args.extend(replica_set.spec.template.command.clone());
+    }
+
+    let mut command_parts = vec!["env".to_string()];
+    for (key, value) in environment {
+        command_parts.push(format!("{key}={value}"));
+    }
+    command_parts.extend(remote_args);
+    let remote_command = shell_words::join(command_parts);
+    let output = ProcessCommand::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            &target,
+            &remote_command,
+        ])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to launch remote runtime '{}' on Node '{}'",
+                runtime_namespace, node.metadata.name
+            )
+        })?;
+    if !output.status.success() {
+        let _ = cleanup_codex_auth_lease_on_remote_node(node, runtime_namespace);
+        bail!(
+            "remote launch '{}' on Node '{}' failed with status {}: {}",
+            runtime_namespace,
+            node.metadata.name,
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
     Ok(())
 }
 
@@ -5451,9 +3208,90 @@ fn replica_set_runtime_namespaces(
         .collect()
 }
 
+fn select_node_for_template(
+    template: &DeploymentTemplateSpec,
+) -> anyhow::Result<Option<ResourceEnvelope<NodeSpec>>> {
+    let mut nodes = load_manifests_by_kind(ResourceKind::Node, None)?
+        .into_iter()
+        .filter_map(|manifest| match manifest {
+            ResourceManifest::Node(node) => Some(node),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    nodes.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
+    if nodes.is_empty() {
+        return Ok(None);
+    }
+
+    if template.node_selector.is_empty() {
+        return Ok(nodes.into_iter().find(node_is_local));
+    }
+
+    nodes
+        .into_iter()
+        .find(|node| node_matches_template(node, template))
+        .map(Some)
+        .ok_or_else(|| {
+            anyhow!(
+                "no schedulable Node matched nodeSelector {}",
+                format_selector(&template.node_selector)
+            )
+        })
+}
+
+fn node_matches_template(
+    node: &ResourceEnvelope<NodeSpec>,
+    template: &DeploymentTemplateSpec,
+) -> bool {
+    if node.spec.cordoned {
+        return false;
+    }
+    if !node
+        .spec
+        .taints
+        .iter()
+        .all(|taint| template.tolerations.contains(taint))
+    {
+        return false;
+    }
+    let labels = node_effective_labels(node);
+    template
+        .node_selector
+        .iter()
+        .all(|(key, value)| labels.get(key) == Some(value))
+}
+
+fn node_effective_labels(node: &ResourceEnvelope<NodeSpec>) -> BTreeMap<String, String> {
+    let mut labels = node.metadata.labels.clone();
+    labels.insert(
+        "kubernetes.io/hostname".to_string(),
+        node.metadata.name.clone(),
+    );
+    labels.insert("jarvisctl.io/node".to_string(), node.metadata.name.clone());
+    for role in &node.spec.roles {
+        labels.insert(format!("node-role.jarvisctl.io/{role}"), "true".to_string());
+    }
+    for (key, value) in &node.spec.capabilities {
+        labels.entry(key.clone()).or_insert_with(|| value.clone());
+        labels
+            .entry(format!("capability.jarvisctl.io/{key}"))
+            .or_insert_with(|| value.clone());
+    }
+    labels
+}
+
+fn format_selector(selector: &BTreeMap<String, String>) -> String {
+    selector
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn replica_set_runtime_labels(
     replica_set: &ResourceEnvelope<ReplicaSetSpec>,
     ordinal: usize,
+    scheduled_node: Option<&ResourceEnvelope<NodeSpec>>,
 ) -> BTreeMap<String, String> {
     let mut labels = replica_set.metadata.labels.clone();
     labels.extend(replica_set.spec.template.labels.clone());
@@ -5477,6 +3315,9 @@ fn replica_set_runtime_labels(
         "jarvisctl.io/replica-ordinal".to_string(),
         ordinal.to_string(),
     );
+    if let Some(node) = scheduled_node {
+        labels.insert("jarvisctl.io/node".to_string(), node.metadata.name.clone());
+    }
     labels
 }
 
@@ -5487,6 +3328,7 @@ fn deployment_runtime_environment(
     revision: u64,
     runtime_namespace: &str,
     ordinal: usize,
+    scheduled_node: Option<&ResourceEnvelope<NodeSpec>>,
 ) -> BTreeMap<String, String> {
     let mut environment = runtime_identity_environment(
         control_namespace,
@@ -5502,1487 +3344,13 @@ fn deployment_runtime_environment(
         "JARVIS_DEPLOYMENT_REVISION".to_string(),
         revision.to_string(),
     );
+    if let Some(node) = scheduled_node {
+        environment.insert("JARVIS_NODE_NAME".to_string(), node.metadata.name.clone());
+        if let Some(address) = node.spec.address.as_deref() {
+            environment.insert("JARVIS_NODE_ADDRESS".to_string(), address.to_string());
+        }
+    }
     environment
-}
-
-fn reconcile_job(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<String> {
-    let mut state = refreshed_job_state(manifest)?;
-    attempt_pending_worker_job_runs(manifest, &mut state)?;
-    let mut status = job_status_from_state(manifest, &state);
-
-    if !manifest.spec.suspend
-        && status.succeeded < manifest.spec.completions
-        && status.failed <= manifest.spec.backoff_limit
-    {
-        let desired_active = manifest
-            .spec
-            .parallelism
-            .min(manifest.spec.completions.saturating_sub(status.succeeded));
-        while status.active + status.pending < desired_active
-            && status.failed <= manifest.spec.backoff_limit
-        {
-            let run_index = state.runs.len();
-            let runtime_namespace =
-                job_runtime_namespace(manifest.namespace_key(), &manifest.metadata.name, run_index);
-            let now = now_epoch_ms();
-            let mut run = JobRunState {
-                name: format!("run-{}", run_index),
-                runtime_namespace,
-                created_at_epoch_ms: now,
-                backend: if manifest.spec.worker.is_some() {
-                    JobRunBackend::Worker
-                } else {
-                    JobRunBackend::Runtime
-                },
-                worker_name: manifest
-                    .spec
-                    .worker
-                    .as_ref()
-                    .and_then(|worker| worker.name.clone()),
-                worker_namespace: None,
-                service_name: manifest
-                    .spec
-                    .worker
-                    .as_ref()
-                    .and_then(|worker| worker.service_name.clone()),
-                intent: manifest
-                    .spec
-                    .worker
-                    .as_ref()
-                    .and_then(|worker| worker.intent.clone()),
-                selected_class: manifest
-                    .spec
-                    .worker
-                    .as_ref()
-                    .and_then(|worker| worker.class_name.clone()),
-                fallback_class: false,
-                worker_locality: None,
-                admission_state: if manifest.spec.worker.is_some() {
-                    Some(JobRunAdmissionState::Pending)
-                } else {
-                    None
-                },
-                admission_code: None,
-                validation_state: None,
-                validation_message: None,
-                validation_enforced: false,
-                admission_reason: None,
-                last_active_epoch_ms: Some(now),
-                completed_at_epoch_ms: None,
-                artifact_path: None,
-                output_path: manifest
-                    .spec
-                    .worker
-                    .as_ref()
-                    .and_then(|worker| worker.output_path.clone()),
-                last_error: None,
-                status: if manifest.spec.worker.is_some() {
-                    JobRunPhase::Pending
-                } else {
-                    JobRunPhase::Active
-                },
-            };
-            if manifest.spec.worker.is_some() {
-                admit_worker_job_run(manifest, &state, &mut run)?;
-            } else {
-                launch_job_run(manifest, run_index, &run.runtime_namespace)?;
-            }
-            state.runs.push(run);
-            status = job_status_from_state(manifest, &state);
-        }
-    }
-
-    save_job_controller_state(manifest.namespace_key(), &manifest.metadata.name, &state)?;
-    let status = job_status_from_state(manifest, &state);
-    Ok(format!(
-        "applied job {}/{} (pending {}, active {}, succeeded {}/{}, failed {})",
-        manifest.namespace_key(),
-        manifest.metadata.name,
-        status.pending,
-        status.active,
-        status.succeeded,
-        status.completions,
-        status.failed
-    ))
-}
-
-fn launch_job_run(
-    manifest: &ResourceEnvelope<JobSpec>,
-    run_index: usize,
-    runtime_namespace: &str,
-) -> anyhow::Result<()> {
-    let control_namespace = manifest.namespace_key().to_string();
-    let namespace_defaults = load_namespace_defaults(&control_namespace)?;
-    let driver = manifest
-        .spec
-        .driver
-        .or(namespace_defaults.default_driver)
-        .unwrap_or(CodexRuntimeDriver::AppServer);
-    let startup_delay_ms = manifest
-        .spec
-        .startup_delay_ms
-        .or(namespace_defaults.default_startup_delay_ms)
-        .unwrap_or(1500);
-    let working_directory = manifest
-        .spec
-        .template
-        .working_directory
-        .clone()
-        .or(namespace_defaults.default_working_directory)
-        .map(PathBuf::from);
-
-    let config_maps = load_config_map_values(
-        &control_namespace,
-        &manifest.spec.template.config_maps,
-        &manifest.spec.template.labels,
-    )?;
-    let secrets = load_secret_values(
-        &control_namespace,
-        &manifest.spec.template.secrets,
-        &manifest.spec.template.labels,
-    )?;
-    let volumes = load_volume_paths(
-        &control_namespace,
-        &manifest.spec.template.volumes,
-        &manifest.spec.template.labels,
-    )?;
-    let service_environment = service_discovery_environment(&control_namespace)?;
-    let environment = merged_environment(
-        &config_maps,
-        &secrets,
-        &service_environment,
-        &job_runtime_identity_environment(
-            &control_namespace,
-            &manifest.metadata.name,
-            runtime_namespace,
-            run_index,
-        ),
-    );
-    let context_overlay = RuntimeContextMetadata {
-        control_namespace: Some(control_namespace.clone()),
-        labels: job_labels(manifest, run_index),
-        config_maps: manifest
-            .spec
-            .template
-            .config_maps
-            .iter()
-            .map(|reference| env_binding_name(reference).to_string())
-            .collect(),
-        secrets: manifest
-            .spec
-            .template
-            .secrets
-            .iter()
-            .map(|reference| env_binding_name(reference).to_string())
-            .collect(),
-        volumes: manifest
-            .spec
-            .template
-            .volumes
-            .iter()
-            .map(|reference| volume_binding_name(reference).to_string())
-            .collect(),
-        ..RuntimeContextMetadata::default()
-    };
-    let operator_message = build_job_operator_message(
-        manifest,
-        run_index,
-        &config_maps,
-        &secrets,
-        &volumes,
-        &service_environment,
-    );
-    let images = manifest
-        .spec
-        .template
-        .images
-        .iter()
-        .map(PathBuf::from)
-        .collect::<Vec<_>>();
-
-    if let Err(error) = launch_codex_ticket(CodexLaunchOptions {
-        backend: SessionBackend::Native,
-        driver,
-        task_note: PathBuf::from(&manifest.spec.template.task_note),
-        namespace: Some(runtime_namespace.to_string()),
-        agents: manifest.spec.agents,
-        agent: "agent0".to_string(),
-        fresh_session: true,
-        resume_session_id: None,
-        working_directory,
-        prompt_file: None,
-        operator_message: operator_message
-            .or_else(|| manifest.spec.template.operator_message.clone()),
-        images,
-        environment,
-        context_overlay,
-        extra_runtime_args: volume_runtime_args(&volumes),
-        startup_delay_ms,
-        command: manifest.spec.template.command.clone(),
-    }) {
-        if native_session_completion(runtime_namespace)?.is_some() {
-            return Ok(());
-        }
-        return Err(error);
-    }
-    Ok(())
-}
-
-fn admit_worker_job_run(
-    manifest: &ResourceEnvelope<JobSpec>,
-    state: &JobControllerState,
-    run: &mut JobRunState,
-) -> anyhow::Result<()> {
-    let Some(worker_request) = manifest.spec.worker.as_ref() else {
-        return Ok(());
-    };
-    let now = now_epoch_ms();
-    let selection = select_worker_for_job_run(manifest, state)?;
-
-    if !is_worker_admissible(selection.admission_code)
-        || selection.name.is_none()
-        || selection.namespace.is_none()
-    {
-        run.status = JobRunPhase::Pending;
-        run.worker_name = selection.name;
-        run.worker_namespace = selection.namespace;
-        run.service_name = selection.service_name;
-        run.intent = selection.intent;
-        run.selected_class = selection.selected_class;
-        run.fallback_class = selection.fallback_class;
-        run.worker_locality = selection.locality;
-        run.admission_state = Some(JobRunAdmissionState::Pending);
-        run.admission_code = Some(selection.admission_code);
-        run.admission_reason = Some(selection.reason);
-        return Ok(());
-    }
-
-    launch_worker_job_run(
-        manifest,
-        worker_request,
-        selection.name.as_deref().expect("selection name set"),
-        selection
-            .namespace
-            .as_deref()
-            .expect("selection namespace set"),
-        &run.runtime_namespace,
-    )?;
-    run.status = JobRunPhase::Active;
-    run.worker_name = selection.name;
-    run.worker_namespace = selection.namespace;
-    run.service_name = selection.service_name;
-    run.intent = selection.intent;
-    run.selected_class = selection.selected_class;
-    run.fallback_class = selection.fallback_class;
-    run.worker_locality = selection.locality;
-    run.admission_state = Some(JobRunAdmissionState::Granted);
-    run.admission_code = Some(selection.admission_code);
-    run.admission_reason = Some(selection.reason);
-    run.last_active_epoch_ms = Some(now);
-    Ok(())
-}
-
-fn attempt_pending_worker_job_runs(
-    manifest: &ResourceEnvelope<JobSpec>,
-    state: &mut JobControllerState,
-) -> anyhow::Result<()> {
-    if manifest.spec.worker.is_none() {
-        return Ok(());
-    }
-    let timeout_seconds = manifest
-        .spec
-        .worker
-        .as_ref()
-        .and_then(|worker| worker.timeout_seconds)
-        .unwrap_or(300);
-    let now = now_epoch_ms();
-    let pending_indexes = state
-        .runs
-        .iter()
-        .enumerate()
-        .filter_map(|(index, run)| {
-            (run.backend == JobRunBackend::Worker && run.status == JobRunPhase::Pending)
-                .then_some(index)
-        })
-        .collect::<Vec<_>>();
-
-    for index in pending_indexes {
-        let age_ms = now.saturating_sub(state.runs[index].created_at_epoch_ms);
-        if age_ms > u128::from(timeout_seconds).saturating_mul(1000) {
-            let run = &mut state.runs[index];
-            run.status = JobRunPhase::Failed;
-            run.completed_at_epoch_ms = Some(now);
-            run.admission_state = Some(JobRunAdmissionState::Rejected);
-            let reason = format!(
-                "worker admission timed out for '{}' after {}s",
-                run.runtime_namespace, timeout_seconds
-            );
-            run.admission_reason = Some(reason.clone());
-            run.last_error = Some(reason);
-            continue;
-        }
-        let snapshot = JobControllerState {
-            runs: state.runs.clone(),
-        };
-        let run = &mut state.runs[index];
-        admit_worker_job_run(manifest, &snapshot, run)?;
-    }
-    Ok(())
-}
-
-fn launch_worker_job_run(
-    manifest: &ResourceEnvelope<JobSpec>,
-    worker: &WorkerJobSpec,
-    worker_name: &str,
-    worker_namespace: &str,
-    execution_id: &str,
-) -> anyhow::Result<()> {
-    let launch = WorkerRunLaunchManifest {
-        control_namespace: manifest.namespace_key().to_string(),
-        job_name: manifest.metadata.name.clone(),
-        execution_id: execution_id.to_string(),
-        worker_name: worker_name.to_string(),
-        worker_namespace: worker_namespace.to_string(),
-        prompt: worker.prompt.clone(),
-        timeout_seconds: worker.timeout_seconds,
-        output_path: worker.output_path.clone(),
-        validation: worker.validation.clone(),
-    };
-    spawn_worker_run(launch)
-}
-
-fn build_job_operator_message(
-    manifest: &ResourceEnvelope<JobSpec>,
-    run_index: usize,
-    config_maps: &BTreeMap<String, BTreeMap<String, String>>,
-    secrets: &BTreeMap<String, BTreeMap<String, String>>,
-    volumes: &[String],
-    service_environment: &BTreeMap<String, String>,
-) -> Option<String> {
-    let mut blocks = Vec::new();
-    if let Some(message) = manifest.spec.template.operator_message.as_deref() {
-        let trimmed = message.trim();
-        if !trimmed.is_empty() {
-            blocks.push(trimmed.to_string());
-        }
-    }
-
-    let mut lines = vec![
-        "Control plane contract:".to_string(),
-        format!("- Control namespace: {}", manifest.namespace_key()),
-        format!("- Job: {}", manifest.metadata.name),
-        format!("- Job run: {}", run_index),
-    ];
-    if !config_maps.is_empty() {
-        lines.push("- ConfigMaps:".to_string());
-        for (name, data) in config_maps {
-            lines.push(format!("  - {}:", name));
-            for (key, value) in data {
-                lines.push(format!("    - {}={}", key, value));
-            }
-        }
-    }
-    if !secrets.is_empty() {
-        lines.push("- Secrets available as environment variables:".to_string());
-        for (name, data) in secrets {
-            let keys = data.keys().cloned().collect::<Vec<_>>().join(", ");
-            lines.push(format!("  - {} -> {}", name, keys));
-        }
-    }
-    if !volumes.is_empty() {
-        lines.push("- Accessible volumes:".to_string());
-        for volume in volumes {
-            lines.push(format!("  - {}", volume));
-        }
-    }
-    let service_targets = service_environment
-        .iter()
-        .filter_map(|(key, value)| {
-            key.strip_suffix("_TARGET")
-                .filter(|_| key.starts_with("JARVIS_SERVICE_"))
-                .map(|_| value.as_str())
-        })
-        .collect::<Vec<_>>();
-    if !service_targets.is_empty() {
-        lines.push("- Discoverable services:".to_string());
-        for target in service_targets {
-            lines.push(format!("  - {}", target));
-        }
-    }
-    blocks.push(lines.join("\n"));
-    Some(blocks.join("\n\n"))
-}
-
-fn job_runtime_identity_environment(
-    control_namespace: &str,
-    job_name: &str,
-    runtime_namespace: &str,
-    run_index: usize,
-) -> BTreeMap<String, String> {
-    let mut environment =
-        runtime_identity_environment(control_namespace, job_name, runtime_namespace, run_index);
-    environment.insert("JARVIS_JOB".to_string(), job_name.to_string());
-    environment.insert("JARVIS_JOB_RUN".to_string(), run_index.to_string());
-    environment
-}
-
-fn job_labels(manifest: &ResourceEnvelope<JobSpec>, run_index: usize) -> BTreeMap<String, String> {
-    let mut labels = manifest.metadata.labels.clone();
-    labels.extend(manifest.spec.template.labels.clone());
-    labels.insert(
-        "jarvisctl.io/control-namespace".to_string(),
-        manifest.namespace_key().to_string(),
-    );
-    labels.insert(
-        "jarvisctl.io/job".to_string(),
-        manifest.metadata.name.clone(),
-    );
-    labels.insert("jarvisctl.io/job-run".to_string(), run_index.to_string());
-    labels
-}
-
-fn job_runtime_namespace(control_namespace: &str, job_name: &str, run_index: usize) -> String {
-    format!(
-        "{}--{}--j{}",
-        slugify(control_namespace),
-        slugify(job_name),
-        run_index
-    )
-}
-
-fn job_controller_state_path(control_namespace: &str, job_name: &str) -> anyhow::Result<PathBuf> {
-    Ok(control_plane_root()?
-        .join("state")
-        .join("jobs")
-        .join(control_namespace)
-        .join(format!("{}.json", slugify(job_name))))
-}
-
-fn load_job_controller_state(
-    control_namespace: &str,
-    job_name: &str,
-) -> anyhow::Result<JobControllerState> {
-    let path = job_controller_state_path(control_namespace, job_name)?;
-    if !path.exists() {
-        return Ok(JobControllerState::default());
-    }
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read '{}'", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| format!("failed to parse '{}'", path.display()))
-}
-
-fn save_job_controller_state(
-    control_namespace: &str,
-    job_name: &str,
-    state: &JobControllerState,
-) -> anyhow::Result<()> {
-    let path = job_controller_state_path(control_namespace, job_name)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create '{}'", parent.display()))?;
-    }
-    let raw =
-        serde_json::to_string_pretty(state).context("failed to encode job controller state")?;
-    atomic_write_string(&path, &raw)
-}
-
-fn worker_run_root(control_namespace: &str, job_name: &str) -> anyhow::Result<PathBuf> {
-    Ok(control_plane_root()?
-        .join("state")
-        .join("worker-runs")
-        .join(control_namespace)
-        .join(slugify(job_name)))
-}
-
-fn worker_run_manifest_path(
-    control_namespace: &str,
-    job_name: &str,
-    execution_id: &str,
-) -> anyhow::Result<PathBuf> {
-    Ok(worker_run_root(control_namespace, job_name)?
-        .join("manifests")
-        .join(format!("{}.json", slugify(execution_id))))
-}
-
-fn worker_run_completion_path(
-    control_namespace: &str,
-    job_name: &str,
-    execution_id: &str,
-) -> anyhow::Result<PathBuf> {
-    Ok(worker_run_root(control_namespace, job_name)?
-        .join("results")
-        .join(format!("{}.json", slugify(execution_id))))
-}
-
-fn worker_run_artifact_path(
-    control_namespace: &str,
-    job_name: &str,
-    execution_id: &str,
-) -> anyhow::Result<PathBuf> {
-    Ok(worker_run_root(control_namespace, job_name)?
-        .join("artifacts")
-        .join(format!("{}.out", slugify(execution_id))))
-}
-
-fn worker_validation_state_name(state: WorkerRunValidationState) -> &'static str {
-    match state {
-        WorkerRunValidationState::Passed => "passed",
-        WorkerRunValidationState::Failed => "failed",
-    }
-}
-
-fn run_worker_output_validation(
-    manifest: &WorkerRunLaunchManifest,
-    artifact_path: &Path,
-) -> anyhow::Result<Option<WorkerValidationOutcome>> {
-    let Some(validation) = manifest.validation.as_ref() else {
-        return Ok(None);
-    };
-    let Some(shell_command) = validation
-        .shell_command
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(None);
-    };
-
-    let worker_manifest = match load_manifest(
-        ResourceKind::Worker,
-        &manifest.worker_name,
-        Some(&manifest.worker_namespace),
-    ) {
-        Ok(ResourceManifest::Worker(worker)) => Some(worker),
-        _ => None,
-    };
-    let mut command = ProcessCommand::new("bash");
-    command.arg("-lc").arg(shell_command);
-    command.env(
-        "JARVIS_WORKER_ARTIFACT_PATH",
-        artifact_path.display().to_string(),
-    );
-    command.env(
-        "JARVIS_WORKER_OUTPUT_PATH",
-        manifest
-            .output_path
-            .clone()
-            .unwrap_or_else(|| artifact_path.display().to_string()),
-    );
-    command.env("JARVIS_WORKER_NAME", &manifest.worker_name);
-    command.env("JARVIS_WORKER_NAMESPACE", &manifest.worker_namespace);
-    command.env("JARVIS_WORKER_EXECUTION_ID", &manifest.execution_id);
-    if let Some(worker_manifest) = worker_manifest.as_ref() {
-        command.env(
-            "JARVIS_WORKER_PROVIDER",
-            worker_provider_name(worker_manifest.spec.provider),
-        );
-        command.env("JARVIS_WORKER_MODEL", &worker_manifest.spec.model);
-    }
-    let output = command
-        .output()
-        .context("failed to execute worker validation command")?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let message = if output.status.success() {
-        if stdout.is_empty() {
-            "validation passed".to_string()
-        } else {
-            stdout
-        }
-    } else {
-        let mut parts = Vec::new();
-        if !stdout.is_empty() {
-            parts.push(stdout);
-        }
-        if !stderr.is_empty() {
-            parts.push(stderr);
-        }
-        if parts.is_empty() {
-            parts.push(
-                output
-                    .status
-                    .code()
-                    .map(|code| format!("validation command exited with status {}", code))
-                    .unwrap_or_else(|| "validation command terminated by signal".to_string()),
-            );
-        }
-        parts.join(" | ")
-    };
-    Ok(Some(WorkerValidationOutcome {
-        state: if output.status.success() {
-            WorkerRunValidationState::Passed
-        } else {
-            WorkerRunValidationState::Failed
-        },
-        message,
-    }))
-}
-
-fn load_worker_run_completion(
-    control_namespace: &str,
-    job_name: &str,
-    execution_id: &str,
-) -> anyhow::Result<Option<WorkerRunCompletion>> {
-    let path = worker_run_completion_path(control_namespace, job_name, execution_id)?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read '{}'", path.display()))?;
-    let completion = serde_json::from_str(&raw)
-        .with_context(|| format!("failed to parse '{}'", path.display()))?;
-    Ok(Some(completion))
-}
-
-fn save_worker_run_completion(
-    control_namespace: &str,
-    job_name: &str,
-    completion: &WorkerRunCompletion,
-) -> anyhow::Result<()> {
-    let path = worker_run_completion_path(control_namespace, job_name, &completion.execution_id)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create '{}'", parent.display()))?;
-    }
-    let raw =
-        serde_json::to_string_pretty(completion).context("failed to encode worker completion")?;
-    atomic_write_string(&path, &raw)
-}
-
-fn worker_run_launch_needs_recovery(run: &JobRunState, manifest_exists: bool, now: u128) -> bool {
-    if run.backend != JobRunBackend::Worker || run.status != JobRunPhase::Active || !manifest_exists
-    {
-        return false;
-    }
-    let last_attempt_epoch_ms = run.last_active_epoch_ms.unwrap_or(run.created_at_epoch_ms);
-    now.saturating_sub(last_attempt_epoch_ms) >= WORKER_RUN_STARTUP_GRACE_MS
-}
-
-fn recover_unconsumed_worker_run_launch(
-    control_namespace: &str,
-    job_name: &str,
-    run: &mut JobRunState,
-    now: u128,
-) -> anyhow::Result<()> {
-    let manifest_path =
-        worker_run_manifest_path(control_namespace, job_name, &run.runtime_namespace)?;
-    if !worker_run_launch_needs_recovery(run, manifest_path.exists(), now) {
-        return Ok(());
-    }
-    let raw = fs::read_to_string(&manifest_path)
-        .with_context(|| format!("failed to read '{}'", manifest_path.display()))?;
-    let launch: WorkerRunLaunchManifest =
-        serde_json::from_str(&raw).context("failed to parse worker-run manifest")?;
-    spawn_worker_run(launch)?;
-    run.last_active_epoch_ms = Some(now);
-    let suffix = "launch manifest was still present; requeued worker helper";
-    run.admission_reason = Some(match run.admission_reason.as_deref() {
-        Some(existing) if existing.contains(suffix) => existing.to_string(),
-        Some(existing) if !existing.trim().is_empty() => format!("{existing}; {suffix}"),
-        _ => suffix.to_string(),
-    });
-    Ok(())
-}
-
-fn spawn_worker_run(manifest: WorkerRunLaunchManifest) -> anyhow::Result<()> {
-    let manifest_path = worker_run_manifest_path(
-        &manifest.control_namespace,
-        &manifest.job_name,
-        &manifest.execution_id,
-    )?;
-    if let Some(parent) = manifest_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create '{}'", parent.display()))?;
-    }
-    let raw =
-        serde_json::to_string_pretty(&manifest).context("failed to encode worker-run manifest")?;
-    atomic_write_string(&manifest_path, &raw)?;
-    let mut command =
-        ProcessCommand::new(env::current_exe().context("failed to resolve current executable")?);
-    command
-        .arg("worker-run-serve")
-        .arg("--manifest")
-        .arg(&manifest_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    command
-        .spawn()
-        .context("failed to spawn worker-run helper process")?;
-    Ok(())
-}
-
-pub fn serve_worker_run(manifest_path: PathBuf) -> anyhow::Result<()> {
-    let raw = fs::read_to_string(&manifest_path)
-        .with_context(|| format!("failed to read '{}'", manifest_path.display()))?;
-    let manifest: WorkerRunLaunchManifest =
-        serde_json::from_str(&raw).context("failed to parse worker-run manifest")?;
-    let _ = fs::remove_file(&manifest_path);
-
-    let artifact_path = worker_run_artifact_path(
-        &manifest.control_namespace,
-        &manifest.job_name,
-        &manifest.execution_id,
-    )?;
-    if let Some(parent) = artifact_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create '{}'", parent.display()))?;
-    }
-
-    let timeout = Duration::from_secs(manifest.timeout_seconds.unwrap_or(300));
-    let (tx, rx) = mpsc::channel();
-    let worker_name = manifest.worker_name.clone();
-    let worker_namespace = manifest.worker_namespace.clone();
-    let prompt = manifest.prompt.clone();
-    thread::spawn(move || {
-        let result = invoke_worker(&worker_name, Some(&worker_namespace), &prompt);
-        let _ = tx.send(result);
-    });
-
-    let outcome = match rx.recv_timeout(timeout) {
-        Ok(result) => result.map_err(|error| error.to_string()),
-        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
-            "worker run '{}' timed out after {}s",
-            manifest.execution_id,
-            timeout.as_secs()
-        )),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Err(format!(
-            "worker run '{}' disconnected before reporting a result",
-            manifest.execution_id
-        )),
-    };
-
-    let completed_at_epoch_ms = now_epoch_ms();
-    let completion = match outcome {
-        Ok(output) => {
-            fs::write(&artifact_path, &output)
-                .with_context(|| format!("failed to write '{}'", artifact_path.display()))?;
-            if let Some(output_path) = manifest.output_path.as_deref() {
-                let output_path = PathBuf::from(output_path);
-                if let Some(parent) = output_path.parent() {
-                    fs::create_dir_all(parent)
-                        .with_context(|| format!("failed to create '{}'", parent.display()))?;
-                }
-                fs::write(&output_path, &output)
-                    .with_context(|| format!("failed to write '{}'", output_path.display()))?;
-            }
-            let validation = run_worker_output_validation(&manifest, &artifact_path)?;
-            let validation_enforced = manifest
-                .validation
-                .as_ref()
-                .map(|spec| spec.fail_job_on_failure)
-                .unwrap_or(false);
-            let validation_failed = validation
-                .as_ref()
-                .is_some_and(|outcome| outcome.state == WorkerRunValidationState::Failed);
-            WorkerRunCompletion {
-                execution_id: manifest.execution_id.clone(),
-                worker_name: manifest.worker_name.clone(),
-                status: if validation_failed && validation_enforced {
-                    JobRunPhase::Failed
-                } else {
-                    JobRunPhase::Succeeded
-                },
-                completed_at_epoch_ms,
-                artifact_path: artifact_path.display().to_string(),
-                output_path: manifest.output_path.clone(),
-                validation_state: validation.as_ref().map(|outcome| outcome.state),
-                validation_message: validation.as_ref().map(|outcome| outcome.message.clone()),
-                validation_enforced,
-                error: validation.as_ref().and_then(|outcome| {
-                    (outcome.state == WorkerRunValidationState::Failed && validation_enforced)
-                        .then(|| format!("worker output validation failed: {}", outcome.message))
-                }),
-            }
-        }
-        Err(error) => {
-            fs::write(&artifact_path, format!("ERROR: {error}\n"))
-                .with_context(|| format!("failed to write '{}'", artifact_path.display()))?;
-            WorkerRunCompletion {
-                execution_id: manifest.execution_id.clone(),
-                worker_name: manifest.worker_name.clone(),
-                status: JobRunPhase::Failed,
-                completed_at_epoch_ms,
-                artifact_path: artifact_path.display().to_string(),
-                output_path: manifest.output_path.clone(),
-                validation_state: None,
-                validation_message: None,
-                validation_enforced: false,
-                error: Some(error),
-            }
-        }
-    };
-
-    save_worker_run_completion(&manifest.control_namespace, &manifest.job_name, &completion)
-}
-
-fn reconcile_cron_job(manifest: &ResourceEnvelope<CronJobSpec>) -> anyhow::Result<String> {
-    let control_namespace = manifest.namespace_key().to_string();
-    let mut state = load_cron_job_controller_state(&control_namespace, &manifest.metadata.name)?;
-    let schedule = parse_kubernetes_cron_schedule(&manifest.spec.schedule).with_context(|| {
-        format!(
-            "failed to parse schedule '{}' for CronJob '{}/{}'",
-            manifest.spec.schedule, control_namespace, manifest.metadata.name
-        )
-    })?;
-
-    if !manifest.spec.suspend {
-        let now = Utc::now();
-        let last_schedule = state
-            .last_schedule_epoch_ms
-            .and_then(|last_epoch_ms| {
-                chrono::DateTime::<Utc>::from_timestamp_millis(last_epoch_ms as i64)
-            })
-            .unwrap_or_else(|| now - chrono::TimeDelta::minutes(1));
-        let mut due_times = schedule.after(&last_schedule).take(16).collect::<Vec<_>>();
-        due_times.retain(|scheduled_at| *scheduled_at <= now);
-        due_times.sort();
-        for scheduled_at in due_times {
-            if !cron_job_allows_new_run(manifest, &state)? {
-                break;
-            }
-            let job_name = cron_job_run_name(&manifest.metadata.name, scheduled_at.timestamp());
-            if load_manifest(
-                ResourceKind::Job,
-                &job_name,
-                manifest.metadata.namespace.as_deref(),
-            )
-            .is_ok()
-            {
-                state.last_schedule_epoch_ms = Some(scheduled_at.timestamp_millis() as u128);
-                continue;
-            }
-            let job_manifest = cron_job_to_job(manifest, &job_name);
-            save_manifest(&ResourceManifest::Job(job_manifest.clone()))?;
-            state.jobs.push(job_name.clone());
-            state.last_schedule_epoch_ms = Some(scheduled_at.timestamp_millis() as u128);
-        }
-    }
-
-    prune_cron_job_history(manifest, &mut state)?;
-    save_cron_job_controller_state(&control_namespace, &manifest.metadata.name, &state)?;
-    let status = cron_job_status(manifest)?;
-    Ok(format!(
-        "applied cronjob {}/{} ({} active jobs)",
-        control_namespace,
-        manifest.metadata.name,
-        status.active_jobs.len()
-    ))
-}
-
-fn cron_job_allows_new_run(
-    manifest: &ResourceEnvelope<CronJobSpec>,
-    state: &CronJobControllerState,
-) -> anyhow::Result<bool> {
-    let active_jobs = state
-        .jobs
-        .iter()
-        .filter(|job_name| {
-            load_manifest(
-                ResourceKind::Job,
-                job_name,
-                manifest.metadata.namespace.as_deref(),
-            )
-            .ok()
-            .and_then(|resource| match resource {
-                ResourceManifest::Job(job) => job_status(&job).ok(),
-                _ => None,
-            })
-            .map(|status| status.active > 0)
-            .unwrap_or(false)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-
-    match manifest.spec.concurrency_policy {
-        CronJobConcurrencyPolicy::Allow => Ok(true),
-        CronJobConcurrencyPolicy::Forbid => Ok(active_jobs.is_empty()),
-        CronJobConcurrencyPolicy::Replace => {
-            for job_name in active_jobs {
-                delete_job_resources(manifest.namespace_key(), &job_name)?;
-            }
-            Ok(true)
-        }
-    }
-}
-
-fn cron_job_to_job(
-    manifest: &ResourceEnvelope<CronJobSpec>,
-    job_name: &str,
-) -> ResourceEnvelope<JobSpec> {
-    let mut metadata = manifest.metadata.clone();
-    metadata.name = job_name.to_string();
-    metadata.labels.insert(
-        "jarvisctl.io/cronjob".to_string(),
-        manifest.metadata.name.clone(),
-    );
-    ResourceEnvelope {
-        api_version: API_VERSION.to_string(),
-        kind: "Job".to_string(),
-        metadata,
-        spec: manifest.spec.job_template.spec.clone(),
-    }
-}
-
-fn cron_job_run_name(cron_job_name: &str, timestamp_secs: i64) -> String {
-    format!("{}-{}", slugify(cron_job_name), timestamp_secs)
-}
-
-fn prune_cron_job_history(
-    manifest: &ResourceEnvelope<CronJobSpec>,
-    state: &mut CronJobControllerState,
-) -> anyhow::Result<()> {
-    let mut succeeded = Vec::new();
-    let mut failed = Vec::new();
-    let mut retained = Vec::new();
-
-    for job_name in &state.jobs {
-        let Ok(ResourceManifest::Job(job)) = load_manifest(
-            ResourceKind::Job,
-            job_name,
-            manifest.metadata.namespace.as_deref(),
-        ) else {
-            continue;
-        };
-        let status = job_status(&job)?;
-        if status.active > 0 {
-            retained.push(job_name.clone());
-            continue;
-        }
-        if status.succeeded >= status.completions {
-            succeeded.push(job_name.clone());
-        } else {
-            failed.push(job_name.clone());
-        }
-    }
-
-    succeeded.sort();
-    failed.sort();
-
-    while succeeded.len() > manifest.spec.successful_jobs_history_limit {
-        if let Some(job_name) = succeeded.first().cloned() {
-            delete_job_resources(manifest.namespace_key(), &job_name)?;
-            succeeded.remove(0);
-        }
-    }
-    while failed.len() > manifest.spec.failed_jobs_history_limit {
-        if let Some(job_name) = failed.first().cloned() {
-            delete_job_resources(manifest.namespace_key(), &job_name)?;
-            failed.remove(0);
-        }
-    }
-
-    retained.extend(succeeded);
-    retained.extend(failed);
-    retained.sort();
-    retained.dedup();
-    state.jobs = retained;
-    Ok(())
-}
-
-fn cron_job_controller_state_path(
-    control_namespace: &str,
-    cron_job_name: &str,
-) -> anyhow::Result<PathBuf> {
-    Ok(control_plane_root()?
-        .join("state")
-        .join("cronjobs")
-        .join(control_namespace)
-        .join(format!("{}.json", slugify(cron_job_name))))
-}
-
-fn load_cron_job_controller_state(
-    control_namespace: &str,
-    cron_job_name: &str,
-) -> anyhow::Result<CronJobControllerState> {
-    let path = cron_job_controller_state_path(control_namespace, cron_job_name)?;
-    if !path.exists() {
-        return Ok(CronJobControllerState::default());
-    }
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read '{}'", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| format!("failed to parse '{}'", path.display()))
-}
-
-fn save_cron_job_controller_state(
-    control_namespace: &str,
-    cron_job_name: &str,
-    state: &CronJobControllerState,
-) -> anyhow::Result<()> {
-    let path = cron_job_controller_state_path(control_namespace, cron_job_name)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create '{}'", parent.display()))?;
-    }
-    let raw =
-        serde_json::to_string_pretty(state).context("failed to encode cronjob controller state")?;
-    atomic_write_string(&path, &raw)
-}
-
-fn parse_kubernetes_cron_schedule(raw: &str) -> anyhow::Result<Schedule> {
-    let trimmed = raw.trim();
-    let normalized = match trimmed {
-        "@yearly" | "@annually" => "0 0 0 1 1 *",
-        "@monthly" => "0 0 0 1 * *",
-        "@weekly" => "0 0 0 * * 0",
-        "@daily" | "@midnight" => "0 0 0 * * *",
-        "@hourly" => "0 0 * * * *",
-        _ => {
-            let fields = trimmed.split_whitespace().collect::<Vec<_>>();
-            match fields.len() {
-                5 => {
-                    return Schedule::from_str(&format!("0 {}", trimmed))
-                        .context("invalid 5-field cron schedule");
-                }
-                6 | 7 => {
-                    return Schedule::from_str(trimmed).context("invalid cron schedule");
-                }
-                _ => bail!("expected a 5-field Kubernetes cron schedule or supported macro"),
-            }
-        }
-    };
-    Schedule::from_str(normalized).context("invalid cron macro")
-}
-
-fn reconcile_application(manifest: &ResourceEnvelope<ApplicationSpec>) -> anyhow::Result<String> {
-    sync_application(manifest, false)
-}
-
-fn sync_application(
-    manifest: &ResourceEnvelope<ApplicationSpec>,
-    force: bool,
-) -> anyhow::Result<String> {
-    let control_namespace = manifest.namespace_key().to_string();
-    let mut state = load_application_controller_state(&control_namespace, &manifest.metadata.name)?;
-    if !force && !application_sync_enabled(manifest) {
-        return Ok(format!(
-            "application {}/{} sync disabled",
-            control_namespace, manifest.metadata.name
-        ));
-    }
-
-    let desired = build_application_desired_state(manifest)?;
-
-    if application_prune_enabled(manifest) {
-        for old_ref in &state.rendered_resources {
-            if !desired.rendered_resources.contains(old_ref) {
-                delete_rendered_resource(old_ref)?;
-            }
-        }
-    }
-
-    for rendered_manifest in &desired.rendered {
-        save_manifest(rendered_manifest)?;
-    }
-
-    let synced_at_epoch_ms = now_epoch_ms();
-    state.last_sync_epoch_ms = Some(synced_at_epoch_ms);
-    state.rendered_resources = desired.rendered_resources.into_iter().collect();
-    state.last_attempted_revision = Some(desired.resolved_revision.clone());
-    state.last_applied_revision = Some(desired.resolved_revision.clone());
-    if state.history.last().map(|entry| entry.revision.as_str())
-        != Some(desired.resolved_revision.as_str())
-    {
-        state.history.push(ApplicationSyncHistoryEntry {
-            revision: desired.resolved_revision.clone(),
-            synced_at_epoch_ms,
-            rendered_resources: state.rendered_resources.len(),
-            source_path: manifest.spec.source.path.clone(),
-        });
-        if state.history.len() > default_application_history_limit() {
-            let remove_count = state.history.len() - default_application_history_limit();
-            state.history.drain(0..remove_count);
-        }
-    }
-    save_application_controller_state(&control_namespace, &manifest.metadata.name, &state)?;
-
-    Ok(format!(
-        "synced application {}/{} to {} from {}{} ({} resources)",
-        control_namespace,
-        manifest.metadata.name,
-        short_revision(&desired.resolved_revision),
-        short_revision(&desired.source.source_revision),
-        if desired.source.source_dirty {
-            " dirty"
-        } else {
-            ""
-        },
-        state.rendered_resources.len()
-    ))
-}
-
-fn application_resolved_revision(
-    manifest: &ResourceEnvelope<ApplicationSpec>,
-    source: &ApplicationSourceResolution,
-    rendered: &[ResourceManifest],
-) -> anyhow::Result<String> {
-    let manifests = rendered
-        .iter()
-        .map(serde_json::to_value)
-        .collect::<Result<Vec<_>, _>>()
-        .context("failed to encode rendered manifests for application revision")?;
-    let value = json!({
-        "sourcePath": manifest.spec.source.path,
-        "repoURL": manifest.spec.source.repo_url,
-        "sourceType": source.source_type,
-        "sourceRoot": source.source_root,
-        "sourceRevision": source.source_revision,
-        "sourceDirty": source.source_dirty,
-        "targetRevision": manifest
-            .spec
-            .source
-            .target_revision
-            .clone()
-            .unwrap_or_else(|| "HEAD".to_string()),
-        "destinationNamespace": effective_application_destination_namespace(manifest),
-        "manifests": manifests,
-    });
-    hash_json_value(&value)
-}
-
-fn build_application_desired_state(
-    manifest: &ResourceEnvelope<ApplicationSpec>,
-) -> anyhow::Result<ApplicationDesiredState> {
-    let initial_source = application_source_resolution(manifest, &[])?;
-    let rendered = render_source_path(
-        &initial_source.render_path,
-        effective_application_destination_namespace(manifest).as_deref(),
-        &application_management_labels(manifest),
-    )?;
-    let source = application_source_resolution(manifest, &rendered)?;
-    let rendered_resources = rendered
-        .iter()
-        .map(RenderedResourceRef::from_manifest)
-        .collect::<BTreeSet<_>>();
-    let resolved_revision = application_resolved_revision(manifest, &source, &rendered)?;
-    Ok(ApplicationDesiredState {
-        source,
-        rendered,
-        rendered_resources,
-        resolved_revision,
-    })
-}
-
-fn application_target_revision(manifest: &ResourceEnvelope<ApplicationSpec>) -> String {
-    manifest
-        .spec
-        .source
-        .target_revision
-        .clone()
-        .unwrap_or_else(|| "HEAD".to_string())
-}
-
-fn application_source_resolution(
-    manifest: &ResourceEnvelope<ApplicationSpec>,
-    rendered: &[ResourceManifest],
-) -> anyhow::Result<ApplicationSourceResolution> {
-    if let Some(repo_url) = manifest.spec.source.repo_url.as_deref() {
-        let source_root = prepare_remote_application_source(manifest)?;
-        let render_path = source_root.join(&manifest.spec.source.path);
-        ensure!(
-            render_path.exists(),
-            "Application '{}/{}' path '{}' does not exist in repository '{}'",
-            manifest.namespace_key(),
-            manifest.metadata.name,
-            manifest.spec.source.path,
-            repo_url
-        );
-        let source_revision = git_resolve_revision(&source_root, "HEAD")?;
-        return Ok(ApplicationSourceResolution {
-            repo_url: Some(repo_url.to_string()),
-            source_type: "git_remote".to_string(),
-            source_root: Some(source_root.display().to_string()),
-            source_revision,
-            source_dirty: false,
-            render_path,
-        });
-    }
-
-    let render_path = resolve_application_source_path(&manifest.spec.source.path)?;
-    if let Some(source_root) = git_repo_root_containing(&render_path)? {
-        return Ok(ApplicationSourceResolution {
-            repo_url: None,
-            source_type: "git".to_string(),
-            source_root: Some(source_root.display().to_string()),
-            source_revision: git_resolve_revision(
-                &source_root,
-                &application_target_revision(manifest),
-            )?,
-            source_dirty: git_worktree_dirty(&source_root)?,
-            render_path,
-        });
-    }
-
-    let manifests = rendered
-        .iter()
-        .map(serde_json::to_value)
-        .collect::<Result<Vec<_>, _>>()
-        .context("failed to encode rendered manifests for application source revision")?;
-    Ok(ApplicationSourceResolution {
-        repo_url: None,
-        source_type: "path".to_string(),
-        source_root: None,
-        source_revision: hash_json_value(&json!({
-            "sourcePath": manifest.spec.source.path,
-            "repoURL": manifest.spec.source.repo_url,
-            "targetRevision": application_target_revision(manifest),
-            "manifests": manifests,
-        }))?,
-        source_dirty: false,
-        render_path,
-    })
-}
-
-fn resolve_application_source_path(raw: &str) -> anyhow::Result<PathBuf> {
-    let path = PathBuf::from(raw);
-    if path.is_absolute() {
-        Ok(path)
-    } else {
-        Ok(env::current_dir()
-            .context("failed to resolve current directory for application source path")?
-            .join(path))
-    }
-}
-
-fn prepare_remote_application_source(
-    manifest: &ResourceEnvelope<ApplicationSpec>,
-) -> anyhow::Result<PathBuf> {
-    let repo_url = manifest.spec.source.repo_url.as_deref().ok_or_else(|| {
-        anyhow!(
-            "Application '{}/{}' is missing spec.source.repoURL",
-            manifest.namespace_key(),
-            manifest.metadata.name
-        )
-    })?;
-    let checkout_root = application_repo_checkout_path(manifest)?;
-    if !checkout_root.join(".git").exists() {
-        if checkout_root.exists() {
-            let _ = fs::remove_dir_all(&checkout_root);
-        }
-        let parent = checkout_root.parent().ok_or_else(|| {
-            anyhow!(
-                "failed to resolve cache parent for Application '{}/{}'",
-                manifest.namespace_key(),
-                manifest.metadata.name
-            )
-        })?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create '{}'", parent.display()))?;
-        git_run(
-            None,
-            &[
-                "clone",
-                repo_url,
-                checkout_root
-                    .to_str()
-                    .ok_or_else(|| anyhow!("non-utf8 cache path"))?,
-            ],
-        )?;
-    } else if let Ok(origin_url) =
-        git_capture_stdout(&checkout_root, &["remote", "get-url", "origin"])
-    {
-        if origin_url.trim() != repo_url.trim() {
-            let _ = fs::remove_dir_all(&checkout_root);
-            let parent = checkout_root
-                .parent()
-                .ok_or_else(|| anyhow!("missing cache parent"))?;
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create '{}'", parent.display()))?;
-            git_run(
-                None,
-                &[
-                    "clone",
-                    repo_url,
-                    checkout_root
-                        .to_str()
-                        .ok_or_else(|| anyhow!("non-utf8 cache path"))?,
-                ],
-            )?;
-        }
-    }
-
-    git_run(
-        Some(&checkout_root),
-        &["fetch", "--all", "--tags", "--prune"],
-    )?;
-    let checkout_target = if application_target_revision(manifest).eq_ignore_ascii_case("HEAD") {
-        "origin/HEAD".to_string()
-    } else {
-        application_target_revision(manifest)
-    };
-    git_run(
-        Some(&checkout_root),
-        &["checkout", "--detach", "--force", &checkout_target],
-    )?;
-    Ok(checkout_root)
-}
-
-fn application_repo_checkout_path(
-    manifest: &ResourceEnvelope<ApplicationSpec>,
-) -> anyhow::Result<PathBuf> {
-    Ok(control_plane_root()?
-        .join("cache")
-        .join("applications")
-        .join(manifest.namespace_key())
-        .join(slugify(&manifest.metadata.name))
-        .join("repo"))
-}
-
-fn git_repo_root_containing(path: &Path) -> anyhow::Result<Option<PathBuf>> {
-    let workdir = if path.is_dir() {
-        path
-    } else {
-        path.parent().unwrap_or(path)
-    };
-    let output = ProcessCommand::new("git")
-        .arg("-C")
-        .arg(workdir)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .with_context(|| format!("failed to run git for '{}'", workdir.display()))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let stdout = String::from_utf8(output.stdout).context("git returned non-utf8 repo root")?;
-    let root = stdout.trim();
-    if root.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(PathBuf::from(root)))
-}
-
-fn git_run(repo_root: Option<&Path>, args: &[&str]) -> anyhow::Result<()> {
-    let mut command = ProcessCommand::new("git");
-    if let Some(repo_root) = repo_root {
-        command.arg("-C").arg(repo_root);
-    }
-    let output = command.args(args).output().with_context(|| {
-        let repo_display = repo_root
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "<cwd>".to_string());
-        format!("failed to run git {:?} in '{}'", args, repo_display)
-    })?;
-    ensure!(
-        output.status.success(),
-        "git {:?} failed: {}",
-        args,
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(())
-}
-
-fn git_capture_stdout(repo_root: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let output = ProcessCommand::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to run git {:?} in '{}'", args, repo_root.display()))?;
-    ensure!(
-        output.status.success(),
-        "git {:?} failed in '{}': {}",
-        args,
-        repo_root.display(),
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(String::from_utf8(output.stdout)
-        .context("git returned non-utf8 stdout")?
-        .trim()
-        .to_string())
-}
-
-fn git_resolve_revision(repo_root: &Path, target_revision: &str) -> anyhow::Result<String> {
-    let output = ProcessCommand::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["rev-parse", &format!("{}^{{commit}}", target_revision)])
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to resolve git revision in '{}'",
-                repo_root.display()
-            )
-        })?;
-    ensure!(
-        output.status.success(),
-        "failed to resolve git revision '{}' in '{}': {}",
-        target_revision,
-        repo_root.display(),
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(String::from_utf8(output.stdout)
-        .context("git returned non-utf8 revision")?
-        .trim()
-        .to_string())
-}
-
-fn git_worktree_dirty(repo_root: &Path) -> anyhow::Result<bool> {
-    let output = ProcessCommand::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["status", "--porcelain"])
-        .output()
-        .with_context(|| format!("failed to inspect git status in '{}'", repo_root.display()))?;
-    ensure!(
-        output.status.success(),
-        "failed to inspect git worktree in '{}': {}",
-        repo_root.display(),
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(!String::from_utf8(output.stdout)
-        .context("git returned non-utf8 status")?
-        .trim()
-        .is_empty())
-}
-
-fn short_revision(revision: &str) -> String {
-    revision.chars().take(12).collect()
-}
-
-fn application_sync_enabled(manifest: &ResourceEnvelope<ApplicationSpec>) -> bool {
-    manifest
-        .spec
-        .sync_policy
-        .automated
-        .as_ref()
-        .map(|automated| automated.enable)
-        .unwrap_or(true)
-}
-
-fn application_prune_enabled(manifest: &ResourceEnvelope<ApplicationSpec>) -> bool {
-    manifest
-        .spec
-        .sync_policy
-        .automated
-        .as_ref()
-        .map(|automated| automated.prune)
-        .unwrap_or(true)
-}
-
-fn effective_application_destination_namespace(
-    manifest: &ResourceEnvelope<ApplicationSpec>,
-) -> Option<String> {
-    manifest
-        .spec
-        .destination
-        .namespace
-        .clone()
-        .or_else(|| manifest.metadata.namespace.clone())
-}
-
-fn application_management_labels(
-    manifest: &ResourceEnvelope<ApplicationSpec>,
-) -> BTreeMap<String, String> {
-    BTreeMap::from([
-        (
-            "jarvisctl.io/application".to_string(),
-            manifest.metadata.name.clone(),
-        ),
-        (
-            "jarvisctl.io/application-namespace".to_string(),
-            manifest.namespace_key().to_string(),
-        ),
-    ])
 }
 
 fn render_source_path(
@@ -7251,137 +3619,6 @@ fn merge_yaml(target: &mut Value, patch: &Value) {
     }
 }
 
-fn delete_rendered_resource(resource: &RenderedResourceRef) -> anyhow::Result<()> {
-    let kind = ResourceKind::from_manifest_kind(&resource.kind)?;
-    match kind {
-        ResourceKind::Deployment => delete_deployment_resources(
-            resource.namespace.as_deref().unwrap_or("default"),
-            &resource.name,
-        ),
-        ResourceKind::ReplicaSet => {
-            if let Ok(ResourceManifest::ReplicaSet(replica_set)) = load_manifest(
-                ResourceKind::ReplicaSet,
-                &resource.name,
-                resource.namespace.as_deref(),
-            ) {
-                delete_replica_set_resources(
-                    resource.namespace.as_deref().unwrap_or("default"),
-                    &replica_set.spec.deployment_name,
-                    &resource.name,
-                )
-            } else {
-                delete_manifest_only(kind, &resource.name, resource.namespace.as_deref())
-            }
-        }
-        ResourceKind::Job => delete_job_resources(
-            resource.namespace.as_deref().unwrap_or("default"),
-            &resource.name,
-        ),
-        ResourceKind::CronJob => delete_cron_job_resources(
-            resource.namespace.as_deref().unwrap_or("default"),
-            &resource.name,
-        ),
-        ResourceKind::Application => delete_application_resources(
-            resource.namespace.as_deref().unwrap_or("default"),
-            &resource.name,
-        ),
-        _ => delete_manifest_only(kind, &resource.name, resource.namespace.as_deref()),
-    }
-}
-
-fn delete_deployment_resources(
-    control_namespace: &str,
-    deployment_name: &str,
-) -> anyhow::Result<()> {
-    for session in collect_runtime_sessions()?.into_iter().filter(|session| {
-        let Some(context) = session.context.as_ref() else {
-            return false;
-        };
-        context.control_namespace.as_deref() == Some(control_namespace)
-            && context.deployment.as_deref() == Some(deployment_name)
-    }) {
-        let _ = delete_runtime_session(&session);
-    }
-    for replica_set in load_replica_sets_for_deployment(control_namespace, deployment_name)? {
-        let _ = delete_manifest_only(
-            ResourceKind::ReplicaSet,
-            &replica_set.metadata.name,
-            Some(control_namespace),
-        );
-    }
-    delete_manifest_only(
-        ResourceKind::Deployment,
-        deployment_name,
-        Some(control_namespace),
-    )
-}
-
-fn delete_job_resources(control_namespace: &str, job_name: &str) -> anyhow::Result<()> {
-    let state = load_job_controller_state(control_namespace, job_name).unwrap_or_default();
-    for run in &state.runs {
-        match run.backend {
-            JobRunBackend::Runtime => {
-                let _ = delete_runtime_session_by_namespace(&run.runtime_namespace);
-            }
-            JobRunBackend::Worker => {}
-        }
-    }
-    let state_path = job_controller_state_path(control_namespace, job_name)?;
-    if state_path.exists() {
-        let _ = fs::remove_file(&state_path);
-    }
-    let worker_run_root = worker_run_root(control_namespace, job_name)?;
-    if worker_run_root.exists() {
-        let _ = fs::remove_dir_all(&worker_run_root);
-    }
-    delete_manifest_only(ResourceKind::Job, job_name, Some(control_namespace))
-}
-
-fn delete_cron_job_resources(control_namespace: &str, cron_job_name: &str) -> anyhow::Result<()> {
-    let state =
-        load_cron_job_controller_state(control_namespace, cron_job_name).unwrap_or_default();
-    for job_name in state.jobs {
-        let _ = delete_job_resources(control_namespace, &job_name);
-    }
-    let state_path = cron_job_controller_state_path(control_namespace, cron_job_name)?;
-    if state_path.exists() {
-        let _ = fs::remove_file(&state_path);
-    }
-    delete_manifest_only(
-        ResourceKind::CronJob,
-        cron_job_name,
-        Some(control_namespace),
-    )
-}
-
-fn delete_application_resources(
-    control_namespace: &str,
-    application_name: &str,
-) -> anyhow::Result<()> {
-    let state =
-        load_application_controller_state(control_namespace, application_name).unwrap_or_default();
-    for rendered_resource in &state.rendered_resources {
-        let _ = delete_rendered_resource(rendered_resource);
-    }
-    let state_path = application_controller_state_path(control_namespace, application_name)?;
-    if state_path.exists() {
-        let _ = fs::remove_file(&state_path);
-    }
-    let cache_path = control_plane_root()?
-        .join("cache")
-        .join("applications")
-        .join(control_namespace)
-        .join(slugify(application_name));
-    if cache_path.exists() {
-        let _ = fs::remove_dir_all(&cache_path);
-    }
-    delete_manifest_only(
-        ResourceKind::Application,
-        application_name,
-        Some(control_namespace),
-    )
-}
-
 fn delete_manifest_only(
     kind: ResourceKind,
     name: &str,
@@ -7399,61 +3636,6 @@ fn delete_manifest_only(
         }
     }
     Ok(())
-}
-
-fn delete_runtime_session_by_namespace(namespace: &str) -> anyhow::Result<()> {
-    if let Ok(session) = load_runtime_session_by_namespace(namespace) {
-        let _ = delete_runtime_session(&session);
-    }
-    let home = env::var_os("HOME").context("HOME is not set")?;
-    let codex_app_dir = PathBuf::from(&home)
-        .join(".jarvis")
-        .join("codex-app")
-        .join("sessions")
-        .join(namespace);
-    if codex_app_dir.exists() {
-        let _ = fs::remove_dir_all(&codex_app_dir);
-    }
-    Ok(())
-}
-
-fn application_controller_state_path(
-    control_namespace: &str,
-    application_name: &str,
-) -> anyhow::Result<PathBuf> {
-    Ok(control_plane_root()?
-        .join("state")
-        .join("applications")
-        .join(control_namespace)
-        .join(format!("{}.json", slugify(application_name))))
-}
-
-fn load_application_controller_state(
-    control_namespace: &str,
-    application_name: &str,
-) -> anyhow::Result<ApplicationControllerState> {
-    let path = application_controller_state_path(control_namespace, application_name)?;
-    if !path.exists() {
-        return Ok(ApplicationControllerState::default());
-    }
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read '{}'", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| format!("failed to parse '{}'", path.display()))
-}
-
-fn save_application_controller_state(
-    control_namespace: &str,
-    application_name: &str,
-    state: &ApplicationControllerState,
-) -> anyhow::Result<()> {
-    let path = application_controller_state_path(control_namespace, application_name)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create '{}'", parent.display()))?;
-    }
-    let raw = serde_json::to_string_pretty(state)
-        .context("failed to encode application controller state")?;
-    atomic_write_string(&path, &raw)
 }
 
 fn load_namespace_defaults(control_namespace: &str) -> anyhow::Result<NamespaceSpec> {
@@ -7756,3694 +3938,6 @@ fn service_env_key(name: &str) -> String {
     value.trim_matches('_').to_string()
 }
 
-fn list_resource_summaries(
-    kind_arg: ControlPlaneResourceKindArg,
-    namespace: Option<&str>,
-) -> anyhow::Result<Vec<ResourceSummary>> {
-    let manifests = match kind_arg {
-        ControlPlaneResourceKindArg::All => load_all_manifests(namespace)?,
-        _ => load_manifests_by_kind(parse_specific_kind(kind_arg)?, namespace)?,
-    };
-
-    let mut summaries = manifests
-        .iter()
-        .map(resource_summary)
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    summaries.sort_by(|left, right| {
-        left.kind
-            .cmp(&right.kind)
-            .then_with(|| left.namespace.cmp(&right.namespace))
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    Ok(summaries)
-}
-
-fn resource_summary(manifest: &ResourceManifest) -> anyhow::Result<ResourceSummary> {
-    match manifest {
-        ResourceManifest::Namespace(namespace) => {
-            let status = namespace_status(&namespace.metadata.name)?;
-            Ok(ResourceSummary {
-                kind: "Namespace".to_string(),
-                namespace: None,
-                name: namespace.metadata.name.clone(),
-                status: format!("{} sessions", status.sessions),
-                detail: format!("{} resources", status.resources),
-            })
-        }
-        ResourceManifest::Deployment(deployment) => {
-            let status = deployment_status(deployment)?;
-            Ok(ResourceSummary {
-                kind: "Deployment".to_string(),
-                namespace: deployment.metadata.namespace.clone(),
-                name: deployment.metadata.name.clone(),
-                status: format!("{}/{} ready", status.ready_replicas, status.replicas),
-                detail: status
-                    .current_replica_set
-                    .map(|replica_set| {
-                        format!(
-                            "{} rev {}",
-                            replica_set,
-                            status.current_revision.unwrap_or(0)
-                        )
-                    })
-                    .unwrap_or_else(|| "no active ReplicaSet".to_string()),
-            })
-        }
-        ResourceManifest::ReplicaSet(replica_set) => {
-            let status = replica_set_status(replica_set)?;
-            Ok(ResourceSummary {
-                kind: "ReplicaSet".to_string(),
-                namespace: replica_set.metadata.namespace.clone(),
-                name: replica_set.metadata.name.clone(),
-                status: format!("{}/{} ready", status.ready_replicas, status.replicas),
-                detail: format!(
-                    "{} rev {}{}",
-                    status.deployment_name,
-                    status.revision,
-                    if status.active { " active" } else { "" }
-                ),
-            })
-        }
-        ResourceManifest::Job(job) => {
-            let status = job_status(job)?;
-            Ok(ResourceSummary {
-                kind: "Job".to_string(),
-                namespace: job.metadata.namespace.clone(),
-                name: job.metadata.name.clone(),
-                status: format!("{}/{} succeeded", status.succeeded, status.completions),
-                detail: format!("active {}, failed {}", status.active, status.failed),
-            })
-        }
-        ResourceManifest::CronJob(cron_job) => {
-            let status = cron_job_status(cron_job)?;
-            Ok(ResourceSummary {
-                kind: "CronJob".to_string(),
-                namespace: cron_job.metadata.namespace.clone(),
-                name: cron_job.metadata.name.clone(),
-                status: format!("{} active jobs", status.active_jobs.len()),
-                detail: status.schedule,
-            })
-        }
-        ResourceManifest::Application(application) => {
-            let status = application_status(application)?;
-            Ok(ResourceSummary {
-                kind: "Application".to_string(),
-                namespace: application.metadata.namespace.clone(),
-                name: application.metadata.name.clone(),
-                status: format!("{}/{}", status.sync_status, status.health_status),
-                detail: format!(
-                    "{} resources @ {} from {}{}",
-                    status.rendered_resources,
-                    short_revision(&status.resolved_revision),
-                    short_revision(&status.source_revision),
-                    if status.source_dirty { " dirty" } else { "" }
-                ),
-            })
-        }
-        ResourceManifest::Service(service) => {
-            let status = service_status(service)?;
-            Ok(ResourceSummary {
-                kind: "Service".to_string(),
-                namespace: service.metadata.namespace.clone(),
-                name: service.metadata.name.clone(),
-                status: format!(
-                    "{} {} endpoints",
-                    status.target_kind,
-                    status.endpoints.len()
-                ),
-                detail: if status.endpoints.is_empty() {
-                    "no resolved endpoints".to_string()
-                } else {
-                    status.endpoints.join(", ")
-                },
-            })
-        }
-        ResourceManifest::NetworkPolicy(network_policy) => {
-            let status = network_policy_status(network_policy)?;
-            let policy_types = status
-                .policy_types
-                .iter()
-                .map(|value| match value {
-                    NetworkPolicyType::Ingress => "Ingress",
-                    NetworkPolicyType::Egress => "Egress",
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            Ok(ResourceSummary {
-                kind: "NetworkPolicy".to_string(),
-                namespace: network_policy.metadata.namespace.clone(),
-                name: network_policy.metadata.name.clone(),
-                status: format!("{} selected", status.selected_sessions.len()),
-                detail: policy_types,
-            })
-        }
-        ResourceManifest::ConfigMap(config_map) => Ok(ResourceSummary {
-            kind: "ConfigMap".to_string(),
-            namespace: config_map.metadata.namespace.clone(),
-            name: config_map.metadata.name.clone(),
-            status: format!("{} entries", config_map.spec.data.len()),
-            detail: if config_map.spec.access_policy.is_empty() {
-                config_map
-                    .spec
-                    .data
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            } else {
-                format!(
-                    "{} keys; scoped to {}",
-                    config_map.spec.data.len(),
-                    access_policy_summary(&config_map.spec.access_policy)
-                )
-            },
-        }),
-        ResourceManifest::Secret(secret) => Ok(ResourceSummary {
-            kind: "Secret".to_string(),
-            namespace: secret.metadata.namespace.clone(),
-            name: secret.metadata.name.clone(),
-            status: format!("{} keys", secret.spec.string_data.len()),
-            detail: if secret.spec.access_policy.is_empty() {
-                secret
-                    .spec
-                    .string_data
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            } else {
-                format!(
-                    "{} keys; scoped to {}",
-                    secret.spec.string_data.len(),
-                    access_policy_summary(&secret.spec.access_policy)
-                )
-            },
-        }),
-        ResourceManifest::Volume(volume) => Ok(ResourceSummary {
-            kind: "Volume".to_string(),
-            namespace: volume.metadata.namespace.clone(),
-            name: volume.metadata.name.clone(),
-            status: format!("{} paths", volume.spec.paths.len()),
-            detail: if volume.spec.access_policy.is_empty() {
-                volume.spec.paths.join(", ")
-            } else {
-                format!(
-                    "{} paths; scoped to {}",
-                    volume.spec.paths.len(),
-                    access_policy_summary(&volume.spec.access_policy)
-                )
-            },
-        }),
-        ResourceManifest::Worker(worker) => {
-            let status = worker_status(worker)?;
-            Ok(ResourceSummary {
-                kind: "Worker".to_string(),
-                namespace: worker.metadata.namespace.clone(),
-                name: worker.metadata.name.clone(),
-                status: format!(
-                    "{}{} [{}]",
-                    status.model,
-                    status
-                        .role
-                        .as_deref()
-                        .map(|role| format!(" ({})", role))
-                        .unwrap_or_default(),
-                    status.admission
-                ),
-                detail: format!(
-                    "{} {} {}/{} active{}{}",
-                    status.provider,
-                    status.locality,
-                    status.active_runs,
-                    status.max_concurrent,
-                    status
-                        .pool
-                        .as_deref()
-                        .map(|pool| format!(" pool:{}", pool))
-                        .unwrap_or_default(),
-                    if status.classes.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" classes:{}", status.classes.join("|"))
-                    }
-                ),
-            })
-        }
-    }
-}
-
-fn namespace_status(control_namespace: &str) -> anyhow::Result<NamespaceStatus> {
-    let resources = load_all_manifests(Some(control_namespace))?;
-    let sessions = collect_runtime_sessions()?
-        .into_iter()
-        .filter(|session| {
-            session
-                .context
-                .as_ref()
-                .and_then(|context| context.control_namespace.as_deref())
-                == Some(control_namespace)
-        })
-        .count();
-    Ok(NamespaceStatus {
-        resources: resources.len(),
-        sessions,
-    })
-}
-
-fn deployment_status(
-    manifest: &ResourceEnvelope<DeploymentSpec>,
-) -> anyhow::Result<DeploymentStatus> {
-    let control_namespace = manifest.namespace_key();
-    let namespace_defaults = load_namespace_defaults(control_namespace)?;
-    let desired_hash = deployment_template_hash(manifest, &namespace_defaults)?;
-    let replica_sets =
-        load_replica_sets_for_deployment(control_namespace, &manifest.metadata.name)?;
-    let sessions = collect_runtime_sessions()?;
-    let target_replica_set = replica_sets
-        .iter()
-        .find(|replica_set| replica_set.spec.template_hash == desired_hash)
-        .or_else(|| current_deployment_replica_set(&replica_sets));
-    let replica_sets = replica_sets
-        .iter()
-        .map(|replica_set| replica_set_status_with_sessions(replica_set, &sessions))
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let updated_replicas = target_replica_set
-        .and_then(|replica_set| {
-            replica_sets
-                .iter()
-                .find(|status| status.revision == replica_set.spec.revision)
-        })
-        .map(|status| status.replicas)
-        .unwrap_or(0);
-    let ready_replicas = replica_sets
-        .iter()
-        .filter(|status| status.active)
-        .map(|status| status.ready_replicas)
-        .sum();
-    let unavailable_replicas = manifest.spec.replicas.saturating_sub(ready_replicas);
-    let active_sessions = replica_sets
-        .iter()
-        .filter(|status| status.active)
-        .flat_map(|status| status.sessions.clone())
-        .collect::<Vec<_>>();
-    let available = ready_replicas >= manifest.spec.replicas
-        && updated_replicas >= manifest.spec.replicas
-        && replica_sets.iter().filter(|status| status.active).count() <= 1;
-    let failed = deployment_progress_deadline_exceeded(manifest, target_replica_set, available);
-    let progressing = manifest.spec.paused || (!available && !failed) || updated_replicas > 0;
-    let conditions = deployment_conditions(
-        manifest,
-        target_replica_set,
-        &replica_sets,
-        updated_replicas,
-        ready_replicas,
-        available,
-        failed,
-    );
-    let events = deployment_events(manifest, target_replica_set, &conditions);
-    Ok(DeploymentStatus {
-        replicas: manifest.spec.replicas,
-        ready_replicas,
-        updated_replicas,
-        unavailable_replicas,
-        paused: manifest.spec.paused,
-        progressing,
-        available,
-        failed,
-        strategy: deployment_strategy_summary(manifest)?,
-        progress_deadline_seconds: manifest.spec.progress_deadline_seconds,
-        current_revision: target_replica_set.map(|replica_set| replica_set.spec.revision),
-        current_replica_set: target_replica_set
-            .map(|replica_set| replica_set.metadata.name.clone()),
-        config_maps: env_binding_statuses(&manifest.spec.template.config_maps),
-        secrets: env_binding_statuses(&manifest.spec.template.secrets),
-        volumes: volume_binding_statuses(&manifest.spec.template.volumes),
-        replica_sets,
-        sessions: active_sessions,
-        conditions,
-        events,
-    })
-}
-
-fn deployment_rollout_history(
-    manifest: &ResourceEnvelope<DeploymentSpec>,
-) -> anyhow::Result<Vec<DeploymentRolloutHistoryEntry>> {
-    let mut history =
-        load_replica_sets_for_deployment(manifest.namespace_key(), &manifest.metadata.name)?
-            .into_iter()
-            .map(|replica_set| {
-                let status = replica_set_status(&replica_set)?;
-                Ok(DeploymentRolloutHistoryEntry {
-                    revision: replica_set.spec.revision,
-                    replica_set: replica_set.metadata.name,
-                    template_hash: replica_set.spec.template_hash,
-                    replicas: status.replicas,
-                    ready_replicas: status.ready_replicas,
-                    created_at_epoch_ms: replica_set
-                        .metadata
-                        .annotations
-                        .get("jarvisctl.io/created-at-epoch-ms")
-                        .and_then(|value| value.parse::<u128>().ok()),
-                    active: status.active,
-                })
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-    history.sort_by(|left, right| right.revision.cmp(&left.revision));
-    Ok(history)
-}
-
-fn deployment_progress_deadline_exceeded(
-    manifest: &ResourceEnvelope<DeploymentSpec>,
-    target_replica_set: Option<&ResourceEnvelope<ReplicaSetSpec>>,
-    available: bool,
-) -> bool {
-    if manifest.spec.paused || available {
-        return false;
-    }
-    let Some(replica_set) = target_replica_set else {
-        return false;
-    };
-    let Some(created_at_epoch_ms) = replica_set
-        .metadata
-        .annotations
-        .get("jarvisctl.io/created-at-epoch-ms")
-        .and_then(|value| value.parse::<u128>().ok())
-    else {
-        return false;
-    };
-    now_epoch_ms().saturating_sub(created_at_epoch_ms)
-        > (manifest.spec.progress_deadline_seconds as u128).saturating_mul(1000)
-}
-
-fn deployment_conditions(
-    manifest: &ResourceEnvelope<DeploymentSpec>,
-    target_replica_set: Option<&ResourceEnvelope<ReplicaSetSpec>>,
-    replica_sets: &[ReplicaSetStatus],
-    updated_replicas: usize,
-    ready_replicas: usize,
-    available: bool,
-    failed: bool,
-) -> Vec<StatusCondition> {
-    let now = now_epoch_ms();
-    let current_replica_set_name = target_replica_set
-        .map(|replica_set| replica_set.metadata.name.as_str())
-        .unwrap_or("unknown");
-    let mut conditions = Vec::new();
-    conditions.push(StatusCondition {
-        condition_type: "Available".to_string(),
-        status: if available {
-            "True".to_string()
-        } else {
-            "False".to_string()
-        },
-        reason: if available {
-            "MinimumReplicasAvailable".to_string()
-        } else {
-            "MinimumReplicasUnavailable".to_string()
-        },
-        message: if available {
-            format!(
-                "Deployment has {} ready replica(s) and is fully available",
-                ready_replicas
-            )
-        } else {
-            format!(
-                "Deployment has {}/{} ready replica(s)",
-                ready_replicas, manifest.spec.replicas
-            )
-        },
-        last_transition_epoch_ms: now,
-    });
-
-    let progressing_condition = if manifest.spec.paused {
-        StatusCondition {
-            condition_type: "Progressing".to_string(),
-            status: "Unknown".to_string(),
-            reason: "DeploymentPaused".to_string(),
-            message: format!(
-                "Deployment rollout is paused at revision {}",
-                target_replica_set
-                    .map(|replica_set| replica_set.spec.revision.to_string())
-                    .unwrap_or_else(|| "0".to_string())
-            ),
-            last_transition_epoch_ms: now,
-        }
-    } else if failed {
-        StatusCondition {
-            condition_type: "Progressing".to_string(),
-            status: "False".to_string(),
-            reason: "ProgressDeadlineExceeded".to_string(),
-            message: format!(
-                "ReplicaSet '{}' has not reached {} updated/ready replica(s) within {}s",
-                current_replica_set_name,
-                manifest.spec.replicas,
-                manifest.spec.progress_deadline_seconds
-            ),
-            last_transition_epoch_ms: now,
-        }
-    } else if available {
-        StatusCondition {
-            condition_type: "Progressing".to_string(),
-            status: "True".to_string(),
-            reason: "NewReplicaSetAvailable".to_string(),
-            message: format!(
-                "ReplicaSet '{}' is serving revision {}",
-                current_replica_set_name,
-                target_replica_set
-                    .map(|replica_set| replica_set.spec.revision)
-                    .unwrap_or(0)
-            ),
-            last_transition_epoch_ms: now,
-        }
-    } else {
-        let active_replica_sets = replica_sets
-            .iter()
-            .filter(|replica_set| replica_set.active)
-            .count();
-        StatusCondition {
-            condition_type: "Progressing".to_string(),
-            status: "True".to_string(),
-            reason: "ReplicaSetUpdating".to_string(),
-            message: format!(
-                "Waiting for ReplicaSet '{}' to reach {}/{} updated replica(s); {} active ReplicaSet(s)",
-                current_replica_set_name,
-                updated_replicas,
-                manifest.spec.replicas,
-                active_replica_sets
-            ),
-            last_transition_epoch_ms: now,
-        }
-    };
-    conditions.push(progressing_condition);
-    conditions
-}
-
-fn status_event(
-    event_type: impl Into<String>,
-    reason: impl Into<String>,
-    message: impl Into<String>,
-    epoch_ms: u128,
-    related: Option<String>,
-) -> StatusEvent {
-    StatusEvent {
-        event_type: event_type.into(),
-        reason: reason.into(),
-        message: message.into(),
-        epoch_ms,
-        related,
-    }
-}
-
-fn sort_status_events_desc(events: &mut Vec<StatusEvent>) {
-    events.sort_by(|left, right| {
-        right
-            .epoch_ms
-            .cmp(&left.epoch_ms)
-            .then_with(|| left.event_type.cmp(&right.event_type))
-    });
-}
-
-fn deployment_events(
-    manifest: &ResourceEnvelope<DeploymentSpec>,
-    target_replica_set: Option<&ResourceEnvelope<ReplicaSetSpec>>,
-    conditions: &[StatusCondition],
-) -> Vec<StatusEvent> {
-    let mut events = conditions
-        .iter()
-        .map(|condition| {
-            status_event(
-                format!(
-                    "deployment_{}",
-                    condition.condition_type.to_ascii_lowercase()
-                ),
-                condition.reason.clone(),
-                condition.message.clone(),
-                condition.last_transition_epoch_ms,
-                Some(manifest.metadata.name.clone()),
-            )
-        })
-        .collect::<Vec<_>>();
-
-    if let Some(replica_set) = target_replica_set {
-        let created_at_epoch_ms = replica_set
-            .metadata
-            .annotations
-            .get("jarvisctl.io/created-at-epoch-ms")
-            .and_then(|value| value.parse::<u128>().ok())
-            .unwrap_or_else(now_epoch_ms);
-        events.push(status_event(
-            "deployment_rollout",
-            "TargetReplicaSet",
-            format!(
-                "Deployment targets ReplicaSet '{}' at revision {}",
-                replica_set.metadata.name, replica_set.spec.revision
-            ),
-            created_at_epoch_ms,
-            Some(replica_set.metadata.name.clone()),
-        ));
-    }
-
-    sort_status_events_desc(&mut events);
-    events.truncate(16);
-    events
-}
-
-fn replica_set_status(
-    manifest: &ResourceEnvelope<ReplicaSetSpec>,
-) -> anyhow::Result<ReplicaSetStatus> {
-    let sessions = collect_runtime_sessions()?;
-    replica_set_status_with_sessions(manifest, &sessions)
-}
-
-fn replica_set_status_with_sessions(
-    manifest: &ResourceEnvelope<ReplicaSetSpec>,
-    sessions: &[NativeSessionMetadata],
-) -> anyhow::Result<ReplicaSetStatus> {
-    let desired_namespaces = replica_set_runtime_namespaces(
-        manifest.namespace_key(),
-        &manifest.spec.deployment_name,
-        manifest.spec.revision,
-        manifest.spec.replicas,
-    );
-    let desired_set: HashSet<String> = desired_namespaces.iter().cloned().collect();
-    let ready_replicas = sessions
-        .iter()
-        .filter(|session| desired_set.contains(&session.namespace))
-        .filter(|session| {
-            session
-                .context
-                .as_ref()
-                .and_then(|context| context.labels.get("jarvisctl.io/replicaset"))
-                == Some(&manifest.metadata.name)
-        })
-        .filter(|session| session.agents.iter().any(|agent| agent.running))
-        .count();
-    Ok(ReplicaSetStatus {
-        deployment_name: manifest.spec.deployment_name.clone(),
-        revision: manifest.spec.revision,
-        template_hash: manifest.spec.template_hash.clone(),
-        replicas: manifest.spec.replicas,
-        ready_replicas,
-        config_maps: env_binding_statuses(&manifest.spec.template.config_maps),
-        secrets: env_binding_statuses(&manifest.spec.template.secrets),
-        volumes: volume_binding_statuses(&manifest.spec.template.volumes),
-        sessions: desired_namespaces,
-        active: manifest.spec.replicas > 0,
-    })
-}
-
-fn render_rollout_status_table(
-    control_namespace: &str,
-    deployment_name: &str,
-    status: &DeploymentStatus,
-) -> String {
-    let sessions = if status.sessions.is_empty() {
-        "-".to_string()
-    } else {
-        status.sessions.join(", ")
-    };
-    let rollout_state = if status.failed {
-        "failed"
-    } else if deployment_rollout_complete(status) {
-        "complete"
-    } else if status.paused {
-        "paused"
-    } else {
-        "progressing"
-    };
-    format!(
-        "DEPLOYMENT\tNAMESPACE\tSTATE\tPAUSED\tSTRATEGY\tREVISION\tUPDATED\tREADY\tACTIVE_REPLICASET\tSESSIONS\n{}\t{}\t{}\t{}\t{}\t{}\t{}/{}\t{}/{}\t{}\t{}",
-        deployment_name,
-        control_namespace,
-        rollout_state,
-        if status.paused { "yes" } else { "no" },
-        status.strategy,
-        status
-            .current_revision
-            .map(|revision| revision.to_string())
-            .unwrap_or_else(|| "-".to_string()),
-        status.updated_replicas,
-        status.replicas,
-        status.ready_replicas,
-        status.replicas,
-        status
-            .current_replica_set
-            .clone()
-            .unwrap_or_else(|| "-".to_string()),
-        sessions
-    )
-}
-
-fn deployment_rollout_complete(status: &DeploymentStatus) -> bool {
-    !status.failed
-        && status.available
-        && status.ready_replicas >= status.replicas
-        && status.updated_replicas >= status.replicas
-        && status
-            .replica_sets
-            .iter()
-            .filter(|replica_set| replica_set.active)
-            .count()
-            <= 1
-}
-
-fn deployment_rollout_failure_message(status: &DeploymentStatus) -> Option<String> {
-    status
-        .conditions
-        .iter()
-        .find(|condition| {
-            condition.condition_type == "Progressing"
-                && condition.reason == "ProgressDeadlineExceeded"
-        })
-        .map(|condition| condition.message.clone())
-}
-
-fn render_rollout_history_table(history: &[DeploymentRolloutHistoryEntry]) -> String {
-    if history.is_empty() {
-        return "No rollout history found.".to_string();
-    }
-    let mut lines =
-        vec!["REVISION\tACTIVE\tREPLICASET\tREADY\tCREATED_AT_EPOCH_MS\tTEMPLATE".to_string()];
-    for entry in history {
-        lines.push(format!(
-            "{}\t{}\t{}\t{}/{}\t{}\t{}",
-            entry.revision,
-            if entry.active { "yes" } else { "no" },
-            entry.replica_set,
-            entry.ready_replicas,
-            entry.replicas,
-            entry
-                .created_at_epoch_ms
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "-".to_string()),
-            short_revision(&entry.template_hash)
-        ));
-    }
-    lines.join("\n")
-}
-
-fn job_status(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<JobStatus> {
-    let state = refreshed_job_state(manifest)?;
-    Ok(job_status_from_state(manifest, &state))
-}
-
-fn cron_job_status(manifest: &ResourceEnvelope<CronJobSpec>) -> anyhow::Result<CronJobStatus> {
-    let state = load_cron_job_controller_state(manifest.namespace_key(), &manifest.metadata.name)?;
-    let mut active_jobs = Vec::new();
-    for job_name in &state.jobs {
-        if let Ok(ResourceManifest::Job(job)) = load_manifest(
-            ResourceKind::Job,
-            job_name,
-            manifest.metadata.namespace.as_deref(),
-        ) {
-            let status = job_status(&job)?;
-            if status.active > 0 {
-                active_jobs.push(job_name.clone());
-            }
-        }
-    }
-    active_jobs.sort();
-    let history = cron_job_history_entries(manifest, &state)?;
-    let mut status = CronJobStatus {
-        schedule: manifest.spec.schedule.clone(),
-        active_jobs,
-        last_schedule_epoch_ms: state.last_schedule_epoch_ms,
-        successful_jobs: history
-            .iter()
-            .filter(|entry| entry.phase == "succeeded")
-            .count(),
-        failed_jobs: history
-            .iter()
-            .filter(|entry| entry.phase == "failed")
-            .count(),
-        history,
-        conditions: Vec::new(),
-        events: Vec::new(),
-    };
-    status.conditions = cron_job_conditions(manifest, &status);
-    status.events = cron_job_events(manifest, &status);
-    Ok(status)
-}
-
-fn application_status(
-    manifest: &ResourceEnvelope<ApplicationSpec>,
-) -> anyhow::Result<ApplicationStatus> {
-    let state =
-        load_application_controller_state(manifest.namespace_key(), &manifest.metadata.name)?;
-    let desired = build_application_desired_state(manifest)?;
-    let sync_status = if state.last_applied_revision.as_deref()
-        == Some(desired.resolved_revision.as_str())
-        && application_resources_present(&state.rendered_resources)?
-    {
-        "Synced".to_string()
-    } else {
-        "OutOfSync".to_string()
-    };
-    let mut status = ApplicationStatus {
-        source_path: manifest.spec.source.path.clone(),
-        repo_url: desired.source.repo_url,
-        source_type: desired.source.source_type,
-        source_root: desired.source.source_root,
-        target_revision: application_target_revision(manifest),
-        source_revision: desired.source.source_revision,
-        source_dirty: desired.source.source_dirty,
-        resolved_revision: desired.resolved_revision,
-        last_applied_revision: state.last_applied_revision.clone(),
-        sync_status,
-        health_status: application_health_status(&state.rendered_resources)?,
-        destination_namespace: effective_application_destination_namespace(manifest),
-        rendered_resources: state.rendered_resources.len(),
-        last_sync_epoch_ms: state.last_sync_epoch_ms,
-        history: state.history.clone(),
-        conditions: Vec::new(),
-        events: Vec::new(),
-    };
-    status.conditions = application_conditions(manifest, &status);
-    status.events = application_events(manifest, &status);
-    Ok(status)
-}
-
-fn application_diff(
-    application_name: &str,
-    namespace: Option<&str>,
-) -> anyhow::Result<ApplicationDiffResult> {
-    let control_namespace = normalize_namespaced_resource_namespace(namespace);
-    let manifest = load_manifest(
-        ResourceKind::Application,
-        application_name,
-        Some(&control_namespace),
-    )?;
-    let ResourceManifest::Application(application) = manifest else {
-        bail!(
-            "resource '{}/{}' is not an Application",
-            control_namespace,
-            application_name
-        );
-    };
-    let state =
-        load_application_controller_state(application.namespace_key(), &application.metadata.name)?;
-    let desired = build_application_desired_state(&application)?;
-    let changes = application_diff_entries(&desired.rendered, &state.rendered_resources)?;
-    let creates = changes
-        .iter()
-        .filter(|entry| entry.action == "create")
-        .count();
-    let updates = changes
-        .iter()
-        .filter(|entry| entry.action == "update")
-        .count();
-    let deletes = changes
-        .iter()
-        .filter(|entry| entry.action == "delete")
-        .count();
-    Ok(ApplicationDiffResult {
-        application: application.metadata.name.clone(),
-        namespace: control_namespace,
-        repo_url: desired.source.repo_url,
-        source_type: desired.source.source_type,
-        source_revision: desired.source.source_revision,
-        source_dirty: desired.source.source_dirty,
-        target_revision: application_target_revision(&application),
-        resolved_revision: desired.resolved_revision,
-        creates,
-        updates,
-        deletes,
-        changes,
-    })
-}
-
-fn application_diff_entries(
-    desired_manifests: &[ResourceManifest],
-    previous_resources: &[RenderedResourceRef],
-) -> anyhow::Result<Vec<ApplicationDiffEntry>> {
-    let mut changes = Vec::new();
-    let mut desired_refs = BTreeSet::new();
-
-    for desired_manifest in desired_manifests {
-        let resource_ref = RenderedResourceRef::from_manifest(desired_manifest);
-        desired_refs.insert(resource_ref.clone());
-        let kind = ResourceKind::from_manifest_kind(&resource_ref.kind)?;
-        match load_manifest(kind, &resource_ref.name, resource_ref.namespace.as_deref()) {
-            Ok(current_manifest) => {
-                if manifests_equivalent(desired_manifest, &current_manifest)? {
-                    continue;
-                }
-                changes.push(ApplicationDiffEntry {
-                    action: "update".to_string(),
-                    kind: resource_ref.kind,
-                    namespace: resource_ref.namespace,
-                    name: resource_ref.name,
-                    detail: "live manifest differs from desired source".to_string(),
-                });
-            }
-            Err(_) => changes.push(ApplicationDiffEntry {
-                action: "create".to_string(),
-                kind: resource_ref.kind,
-                namespace: resource_ref.namespace,
-                name: resource_ref.name,
-                detail: "resource is missing from the control plane".to_string(),
-            }),
-        }
-    }
-
-    for previous_resource in previous_resources {
-        if desired_refs.contains(previous_resource) {
-            continue;
-        }
-        let kind = ResourceKind::from_manifest_kind(&previous_resource.kind)?;
-        if load_manifest(
-            kind,
-            &previous_resource.name,
-            previous_resource.namespace.as_deref(),
-        )
-        .is_ok()
-        {
-            changes.push(ApplicationDiffEntry {
-                action: "delete".to_string(),
-                kind: previous_resource.kind.clone(),
-                namespace: previous_resource.namespace.clone(),
-                name: previous_resource.name.clone(),
-                detail: "resource is owned by the application but absent from desired source"
-                    .to_string(),
-            });
-        }
-    }
-
-    changes.sort_by(|left, right| {
-        left.action
-            .cmp(&right.action)
-            .then_with(|| left.kind.cmp(&right.kind))
-            .then_with(|| left.namespace.cmp(&right.namespace))
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    Ok(changes)
-}
-
-fn manifests_equivalent(left: &ResourceManifest, right: &ResourceManifest) -> anyhow::Result<bool> {
-    Ok(
-        serde_json::to_value(left).context("failed to encode desired manifest")?
-            == serde_json::to_value(right).context("failed to encode live manifest")?,
-    )
-}
-
-fn render_application_diff_table(diff: &ApplicationDiffResult) -> String {
-    if diff.changes.is_empty() {
-        return format!(
-            "APPLICATION\tNAMESPACE\tSOURCE\tREVISION\tDIRTY\tCHANGES\n{}\t{}\t{}\t{}\t{}\t0",
-            diff.application,
-            diff.namespace,
-            diff.source_type,
-            short_revision(&diff.source_revision),
-            if diff.source_dirty { "yes" } else { "no" },
-        );
-    }
-
-    let mut lines =
-        vec!["APPLICATION\tNAMESPACE\tACTION\tKIND\tRESOURCE_NAMESPACE\tNAME\tDETAIL".to_string()];
-    for change in &diff.changes {
-        lines.push(format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            diff.application,
-            diff.namespace,
-            change.action,
-            change.kind,
-            change.namespace.clone().unwrap_or_else(|| "-".to_string()),
-            change.name,
-            change.detail
-        ));
-    }
-    lines.join("\n")
-}
-
-fn application_resources_present(resources: &[RenderedResourceRef]) -> anyhow::Result<bool> {
-    for resource in resources {
-        let kind = ResourceKind::from_manifest_kind(&resource.kind)?;
-        if load_manifest(kind, &resource.name, resource.namespace.as_deref()).is_err() {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn application_health_status(resources: &[RenderedResourceRef]) -> anyhow::Result<String> {
-    if resources.is_empty() {
-        return Ok("Missing".to_string());
-    }
-
-    let mut missing = false;
-    let mut degraded = false;
-    let mut progressing = false;
-
-    for resource in resources {
-        let kind = ResourceKind::from_manifest_kind(&resource.kind)?;
-        let manifest = match load_manifest(kind, &resource.name, resource.namespace.as_deref()) {
-            Ok(manifest) => manifest,
-            Err(_) => {
-                missing = true;
-                continue;
-            }
-        };
-        match manifest {
-            ResourceManifest::Deployment(deployment) => {
-                let status = deployment_status(&deployment)?;
-                if status.ready_replicas < status.replicas {
-                    progressing = true;
-                }
-            }
-            ResourceManifest::ReplicaSet(replica_set) => {
-                let status = replica_set_status(&replica_set)?;
-                if status.ready_replicas < status.replicas {
-                    progressing = true;
-                }
-            }
-            ResourceManifest::Job(job) => {
-                let status = job_status(&job)?;
-                if status.succeeded < status.completions {
-                    if status.failed > 0 && status.active == 0 && status.pending == 0 {
-                        degraded = true;
-                    } else {
-                        progressing = true;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if missing {
-        Ok("Missing".to_string())
-    } else if degraded {
-        Ok("Degraded".to_string())
-    } else if progressing {
-        Ok("Progressing".to_string())
-    } else {
-        Ok("Healthy".to_string())
-    }
-}
-
-fn latest_job_epoch_ms(state: &JobControllerState) -> Option<u128> {
-    state.runs.iter().fold(None, |latest, run| {
-        let candidate = run
-            .completed_at_epoch_ms
-            .or(run.last_active_epoch_ms)
-            .unwrap_or(run.created_at_epoch_ms);
-        Some(latest.map_or(candidate, |value| value.max(candidate)))
-    })
-}
-
-fn job_terminal_failure(manifest: &ResourceEnvelope<JobSpec>, status: &JobStatus) -> bool {
-    status.failed > manifest.spec.backoff_limit
-}
-
-fn job_conditions(
-    manifest: &ResourceEnvelope<JobSpec>,
-    state: &JobControllerState,
-    status: &JobStatus,
-) -> Vec<StatusCondition> {
-    let transition_epoch_ms = latest_job_epoch_ms(state).unwrap_or_else(now_epoch_ms);
-    let complete = status.succeeded >= status.completions;
-    let failed = job_terminal_failure(manifest, status);
-    let complete_reason = if complete {
-        "CompletionsReached"
-    } else if status.pending > 0 {
-        "WaitingForWorkerAdmission"
-    } else if status.active > 0 {
-        "RunsActive"
-    } else if status.failed > 0 {
-        "RetryingAfterFailure"
-    } else {
-        "PendingCompletions"
-    };
-    let complete_message = if complete {
-        format!(
-            "Job reached {}/{} required completion(s)",
-            status.succeeded, status.completions
-        )
-    } else if status.pending > 0 {
-        format!(
-            "Job has {} pending run(s) waiting for worker admission",
-            status.pending
-        )
-    } else if status.active > 0 {
-        format!("Job has {} active run(s)", status.active)
-    } else if status.failed > 0 {
-        format!(
-            "Job has {} failed run(s) but remains within backoff limit {}",
-            status.failed, manifest.spec.backoff_limit
-        )
-    } else {
-        "Job has not reached the required completions yet".to_string()
-    };
-    let failed_reason = if failed {
-        "BackoffLimitExceeded"
-    } else {
-        "NoFailure"
-    };
-    let failed_message = if failed {
-        format!(
-            "Job exceeded backoff limit {} with {} failed run(s)",
-            manifest.spec.backoff_limit, status.failed
-        )
-    } else {
-        "Job has not exceeded its backoff limit".to_string()
-    };
-    vec![
-        StatusCondition {
-            condition_type: "Complete".to_string(),
-            status: if complete {
-                "True".to_string()
-            } else {
-                "False".to_string()
-            },
-            reason: complete_reason.to_string(),
-            message: complete_message,
-            last_transition_epoch_ms: transition_epoch_ms,
-        },
-        StatusCondition {
-            condition_type: "Failed".to_string(),
-            status: if failed {
-                "True".to_string()
-            } else {
-                "False".to_string()
-            },
-            reason: failed_reason.to_string(),
-            message: failed_message,
-            last_transition_epoch_ms: transition_epoch_ms,
-        },
-        StatusCondition {
-            condition_type: "Suspended".to_string(),
-            status: if manifest.spec.suspend {
-                "True".to_string()
-            } else {
-                "False".to_string()
-            },
-            reason: if manifest.spec.suspend {
-                "JobSuspended".to_string()
-            } else {
-                "JobActive".to_string()
-            },
-            message: if manifest.spec.suspend {
-                "Job reconciliation is suspended".to_string()
-            } else {
-                "Job reconciliation is active".to_string()
-            },
-            last_transition_epoch_ms: transition_epoch_ms,
-        },
-    ]
-}
-
-fn job_run_events(run: &JobRunState) -> Vec<StatusEvent> {
-    let related = Some(run.runtime_namespace.clone());
-    let mut events = vec![status_event(
-        "job_run_created",
-        match run.backend {
-            JobRunBackend::Runtime => "RuntimeRunCreated",
-            JobRunBackend::Worker => "WorkerRunCreated",
-        },
-        format!("Run '{}' was created", run.runtime_namespace),
-        run.created_at_epoch_ms,
-        related.clone(),
-    )];
-
-    if matches!(
-        run.admission_state,
-        Some(JobRunAdmissionState::Pending) | Some(JobRunAdmissionState::Rejected)
-    ) || run.status == JobRunPhase::Pending
-    {
-        events.push(status_event(
-            "job_run_admission",
-            run.admission_code
-                .map(worker_admission_code_name)
-                .unwrap_or("pending"),
-            run.admission_reason
-                .clone()
-                .unwrap_or_else(|| format!("Run '{}' is waiting for admission", run.name)),
-            run.created_at_epoch_ms,
-            related.clone(),
-        ));
-    }
-
-    if matches!(
-        run.status,
-        JobRunPhase::Active | JobRunPhase::Succeeded | JobRunPhase::Failed
-    ) {
-        let start_epoch_ms = run.last_active_epoch_ms.unwrap_or(run.created_at_epoch_ms);
-        events.push(status_event(
-            "job_run_started",
-            match run.backend {
-                JobRunBackend::Runtime => "RuntimeStarted",
-                JobRunBackend::Worker => "WorkerAdmitted",
-            },
-            run.admission_reason
-                .clone()
-                .unwrap_or_else(|| format!("Run '{}' started", run.runtime_namespace)),
-            start_epoch_ms,
-            related.clone(),
-        ));
-    }
-
-    if let Some(completed_at_epoch_ms) = run.completed_at_epoch_ms {
-        let (event_type, reason, message) = if run.status == JobRunPhase::Succeeded {
-            (
-                "job_run_completed",
-                "RunSucceeded",
-                format!("Run '{}' completed successfully", run.runtime_namespace),
-            )
-        } else {
-            (
-                "job_run_failed",
-                "RunFailed",
-                run.last_error.clone().unwrap_or_else(|| {
-                    format!("Run '{}' completed with a failure", run.runtime_namespace)
-                }),
-            )
-        };
-        events.push(status_event(
-            event_type,
-            reason,
-            message,
-            completed_at_epoch_ms,
-            related,
-        ));
-    }
-
-    if let Some(validation_state) = run.validation_state {
-        let transition_epoch_ms = run.completed_at_epoch_ms.unwrap_or(run.created_at_epoch_ms);
-        let reason = match validation_state {
-            WorkerRunValidationState::Passed => "ValidationPassed",
-            WorkerRunValidationState::Failed => {
-                if run.validation_enforced {
-                    "ValidationFailedEnforced"
-                } else {
-                    "ValidationFailedObserved"
-                }
-            }
-        };
-        let default_message = match validation_state {
-            WorkerRunValidationState::Passed => {
-                format!(
-                    "Run '{}' passed worker output validation",
-                    run.runtime_namespace
-                )
-            }
-            WorkerRunValidationState::Failed => {
-                format!(
-                    "Run '{}' failed worker output validation",
-                    run.runtime_namespace
-                )
-            }
-        };
-        events.push(status_event(
-            "job_run_validation",
-            reason,
-            run.validation_message.clone().unwrap_or(default_message),
-            transition_epoch_ms,
-            Some(run.runtime_namespace.clone()),
-        ));
-    }
-
-    sort_status_events_desc(&mut events);
-    events
-}
-
-fn job_events(
-    manifest: &ResourceEnvelope<JobSpec>,
-    state: &JobControllerState,
-    status: &JobStatus,
-) -> Vec<StatusEvent> {
-    let mut events = state
-        .runs
-        .iter()
-        .flat_map(job_run_events)
-        .collect::<Vec<_>>();
-    let summary_epoch_ms = latest_job_epoch_ms(state).unwrap_or_else(now_epoch_ms);
-    if status.succeeded >= status.completions {
-        events.push(status_event(
-            "job_complete",
-            "CompletionsReached",
-            format!(
-                "Job reached {}/{} completion(s)",
-                status.succeeded, status.completions
-            ),
-            summary_epoch_ms,
-            Some(manifest.metadata.name.clone()),
-        ));
-    } else if job_terminal_failure(manifest, status) {
-        events.push(status_event(
-            "job_failed",
-            "BackoffLimitExceeded",
-            format!(
-                "Job exceeded backoff limit {} with {} failed run(s)",
-                manifest.spec.backoff_limit, status.failed
-            ),
-            summary_epoch_ms,
-            Some(manifest.metadata.name.clone()),
-        ));
-    } else if manifest.spec.suspend {
-        events.push(status_event(
-            "job_suspended",
-            "JobSuspended",
-            "Job reconciliation is suspended",
-            summary_epoch_ms,
-            Some(manifest.metadata.name.clone()),
-        ));
-    } else if status.pending > 0 {
-        events.push(status_event(
-            "job_pending",
-            "WaitingForWorkerAdmission",
-            format!("Job has {} pending run(s)", status.pending),
-            summary_epoch_ms,
-            Some(manifest.metadata.name.clone()),
-        ));
-    } else if status.active > 0 {
-        events.push(status_event(
-            "job_active",
-            "RunsActive",
-            format!("Job has {} active run(s)", status.active),
-            summary_epoch_ms,
-            Some(manifest.metadata.name.clone()),
-        ));
-    }
-    sort_status_events_desc(&mut events);
-    events.truncate(32);
-    events
-}
-
-fn cron_job_run_phase(status: &JobStatus) -> &'static str {
-    if status.active > 0 {
-        "active"
-    } else if status.pending > 0 {
-        "pending"
-    } else if status.succeeded >= status.completions {
-        "succeeded"
-    } else if status.failed > 0 {
-        "failed"
-    } else {
-        "idle"
-    }
-}
-
-fn cron_job_scheduled_at_epoch_ms(cron_job_name: &str, job_name: &str) -> Option<u128> {
-    let prefix = format!("{}-", slugify(cron_job_name));
-    job_name
-        .strip_prefix(&prefix)?
-        .parse::<i64>()
-        .ok()
-        .map(|seconds| (seconds as i128).saturating_mul(1000))
-        .and_then(|value| u128::try_from(value).ok())
-}
-
-fn cron_job_history_entries(
-    manifest: &ResourceEnvelope<CronJobSpec>,
-    state: &CronJobControllerState,
-) -> anyhow::Result<Vec<CronJobJobHistoryEntry>> {
-    let mut history = Vec::new();
-    for job_name in &state.jobs {
-        let Ok(ResourceManifest::Job(job)) = load_manifest(
-            ResourceKind::Job,
-            job_name,
-            manifest.metadata.namespace.as_deref(),
-        ) else {
-            continue;
-        };
-        let status = job_status(&job)?;
-        let mut workers = status
-            .run_details
-            .iter()
-            .filter_map(|detail| detail.worker.clone())
-            .collect::<Vec<_>>();
-        workers.sort();
-        workers.dedup();
-        let last_transition_epoch_ms = status
-            .run_details
-            .iter()
-            .filter_map(|detail| {
-                detail
-                    .completed_at_epoch_ms
-                    .or(Some(detail.created_at_epoch_ms))
-            })
-            .max();
-        history.push(CronJobJobHistoryEntry {
-            job_name: job_name.clone(),
-            phase: cron_job_run_phase(&status).to_string(),
-            scheduled_at_epoch_ms: cron_job_scheduled_at_epoch_ms(
-                &manifest.metadata.name,
-                job_name,
-            ),
-            last_transition_epoch_ms,
-            pending: status.pending,
-            active: status.active,
-            succeeded: status.succeeded,
-            failed: status.failed,
-            worker_backed: job.spec.worker.is_some(),
-            workers,
-        });
-    }
-    history.sort_by(|left, right| {
-        right
-            .scheduled_at_epoch_ms
-            .cmp(&left.scheduled_at_epoch_ms)
-            .then_with(|| {
-                right
-                    .last_transition_epoch_ms
-                    .cmp(&left.last_transition_epoch_ms)
-            })
-            .then_with(|| left.job_name.cmp(&right.job_name))
-    });
-    Ok(history)
-}
-
-fn cron_job_conditions(
-    manifest: &ResourceEnvelope<CronJobSpec>,
-    status: &CronJobStatus,
-) -> Vec<StatusCondition> {
-    let now = status.last_schedule_epoch_ms.unwrap_or_else(now_epoch_ms);
-    let last_terminal = status
-        .history
-        .iter()
-        .find(|entry| entry.phase == "succeeded" || entry.phase == "failed");
-    vec![
-        StatusCondition {
-            condition_type: "Suspended".to_string(),
-            status: if manifest.spec.suspend {
-                "True".to_string()
-            } else {
-                "False".to_string()
-            },
-            reason: if manifest.spec.suspend {
-                "CronJobSuspended".to_string()
-            } else {
-                "CronJobActive".to_string()
-            },
-            message: if manifest.spec.suspend {
-                "CronJob scheduling is suspended".to_string()
-            } else {
-                "CronJob scheduling is active".to_string()
-            },
-            last_transition_epoch_ms: now,
-        },
-        StatusCondition {
-            condition_type: "Active".to_string(),
-            status: if status.active_jobs.is_empty() {
-                "False".to_string()
-            } else {
-                "True".to_string()
-            },
-            reason: if status.active_jobs.is_empty() {
-                "NoActiveJobs".to_string()
-            } else {
-                "JobsRunning".to_string()
-            },
-            message: if status.active_jobs.is_empty() {
-                "CronJob has no active child jobs".to_string()
-            } else {
-                format!(
-                    "CronJob has {} active child job(s)",
-                    status.active_jobs.len()
-                )
-            },
-            last_transition_epoch_ms: now,
-        },
-        StatusCondition {
-            condition_type: "LastRunSucceeded".to_string(),
-            status: match last_terminal {
-                Some(entry) if entry.phase == "succeeded" => "True".to_string(),
-                Some(entry) if entry.phase == "failed" => "False".to_string(),
-                _ => "Unknown".to_string(),
-            },
-            reason: match last_terminal {
-                Some(entry) if entry.phase == "succeeded" => "LastRunSucceeded".to_string(),
-                Some(entry) if entry.phase == "failed" => "LastRunFailed".to_string(),
-                _ => "NoCompletedRuns".to_string(),
-            },
-            message: match last_terminal {
-                Some(entry) if entry.phase == "succeeded" => {
-                    format!("Latest completed child job '{}' succeeded", entry.job_name)
-                }
-                Some(entry) if entry.phase == "failed" => {
-                    format!("Latest completed child job '{}' failed", entry.job_name)
-                }
-                _ => "CronJob has not completed any child jobs yet".to_string(),
-            },
-            last_transition_epoch_ms: last_terminal
-                .and_then(|entry| entry.last_transition_epoch_ms)
-                .unwrap_or(now),
-        },
-    ]
-}
-
-fn cron_job_events(
-    manifest: &ResourceEnvelope<CronJobSpec>,
-    status: &CronJobStatus,
-) -> Vec<StatusEvent> {
-    let mut events = Vec::new();
-    if let Some(last_schedule_epoch_ms) = status.last_schedule_epoch_ms {
-        events.push(status_event(
-            "cronjob_scheduled",
-            "ScheduleTriggered",
-            format!(
-                "CronJob '{}' last scheduled a child job at {}",
-                manifest.metadata.name, last_schedule_epoch_ms
-            ),
-            last_schedule_epoch_ms,
-            Some(manifest.metadata.name.clone()),
-        ));
-    }
-    if let Some(entry) = status.history.first() {
-        let reason = match entry.phase.as_str() {
-            "succeeded" => "ChildJobSucceeded",
-            "failed" => "ChildJobFailed",
-            "active" => "ChildJobActive",
-            "pending" => "ChildJobPending",
-            _ => "ChildJobObserved",
-        };
-        let message = format!("Latest child job '{}' is {}", entry.job_name, entry.phase);
-        events.push(status_event(
-            "cronjob_child_job",
-            reason,
-            message,
-            entry
-                .last_transition_epoch_ms
-                .or(entry.scheduled_at_epoch_ms)
-                .unwrap_or_else(now_epoch_ms),
-            Some(entry.job_name.clone()),
-        ));
-    }
-    if manifest.spec.suspend {
-        events.push(status_event(
-            "cronjob_suspended",
-            "CronJobSuspended",
-            "CronJob scheduling is suspended",
-            status.last_schedule_epoch_ms.unwrap_or_else(now_epoch_ms),
-            Some(manifest.metadata.name.clone()),
-        ));
-    }
-    sort_status_events_desc(&mut events);
-    events.truncate(16);
-    events
-}
-
-fn application_conditions(
-    manifest: &ResourceEnvelope<ApplicationSpec>,
-    status: &ApplicationStatus,
-) -> Vec<StatusCondition> {
-    let now = status.last_sync_epoch_ms.unwrap_or_else(now_epoch_ms);
-    let (health_condition_status, health_reason) = match status.health_status.as_str() {
-        "Healthy" => ("True", "ApplicationHealthy"),
-        "Progressing" => ("Unknown", "ResourcesProgressing"),
-        "Degraded" => ("False", "ResourcesDegraded"),
-        "Missing" => ("False", "ResourcesMissing"),
-        _ => ("Unknown", "HealthUnknown"),
-    };
-    let ready_status = status.sync_status == "Synced" && status.health_status == "Healthy";
-    vec![
-        StatusCondition {
-            condition_type: "Synced".to_string(),
-            status: if status.sync_status == "Synced" {
-                "True".to_string()
-            } else {
-                "False".to_string()
-            },
-            reason: if status.sync_status == "Synced" {
-                "DesiredRevisionApplied".to_string()
-            } else {
-                "DiffDetected".to_string()
-            },
-            message: if status.sync_status == "Synced" {
-                format!(
-                    "Application is synced to resolved revision {}",
-                    status.resolved_revision
-                )
-            } else {
-                format!(
-                    "Application resolved revision {} differs from last applied {:?}",
-                    status.resolved_revision, status.last_applied_revision
-                )
-            },
-            last_transition_epoch_ms: now,
-        },
-        StatusCondition {
-            condition_type: "Healthy".to_string(),
-            status: health_condition_status.to_string(),
-            reason: health_reason.to_string(),
-            message: format!(
-                "Application '{}' health is {}",
-                manifest.metadata.name, status.health_status
-            ),
-            last_transition_epoch_ms: now,
-        },
-        StatusCondition {
-            condition_type: "Ready".to_string(),
-            status: if ready_status {
-                "True".to_string()
-            } else if status.health_status == "Progressing" {
-                "Unknown".to_string()
-            } else {
-                "False".to_string()
-            },
-            reason: if ready_status {
-                "ApplicationReady".to_string()
-            } else if status.sync_status != "Synced" {
-                "ApplicationOutOfSync".to_string()
-            } else {
-                "ApplicationNotHealthy".to_string()
-            },
-            message: if ready_status {
-                "Application is synced and healthy".to_string()
-            } else {
-                format!(
-                    "Application is {} and {}",
-                    status.sync_status, status.health_status
-                )
-            },
-            last_transition_epoch_ms: now,
-        },
-    ]
-}
-
-fn application_events(
-    manifest: &ResourceEnvelope<ApplicationSpec>,
-    status: &ApplicationStatus,
-) -> Vec<StatusEvent> {
-    let mut events = status
-        .history
-        .iter()
-        .map(|entry| {
-            status_event(
-                "application_sync",
-                "SyncApplied",
-                format!(
-                    "Applied revision {} with {} rendered resource(s)",
-                    entry.revision, entry.rendered_resources
-                ),
-                entry.synced_at_epoch_ms,
-                Some(manifest.metadata.name.clone()),
-            )
-        })
-        .collect::<Vec<_>>();
-    if status.sync_status != "Synced" {
-        events.push(status_event(
-            "application_drift",
-            "DiffDetected",
-            format!(
-                "Resolved revision {} has not been applied yet",
-                status.resolved_revision
-            ),
-            now_epoch_ms(),
-            Some(manifest.metadata.name.clone()),
-        ));
-    }
-    if status.health_status != "Healthy" {
-        events.push(status_event(
-            "application_health",
-            match status.health_status.as_str() {
-                "Progressing" => "ResourcesProgressing",
-                "Degraded" => "ResourcesDegraded",
-                "Missing" => "ResourcesMissing",
-                _ => "HealthUnknown",
-            },
-            format!(
-                "Application '{}' health is {}",
-                manifest.metadata.name, status.health_status
-            ),
-            now_epoch_ms(),
-            Some(manifest.metadata.name.clone()),
-        ));
-    }
-    sort_status_events_desc(&mut events);
-    events.truncate(16);
-    events
-}
-
-fn job_status_from_state(
-    manifest: &ResourceEnvelope<JobSpec>,
-    state: &JobControllerState,
-) -> JobStatus {
-    let mut runs = state
-        .runs
-        .iter()
-        .map(|run| format!("{} ({})", run.runtime_namespace, job_phase_name(run.status)))
-        .collect::<Vec<_>>();
-    runs.sort();
-    let base_status = JobStatus {
-        completions: manifest.spec.completions,
-        pending: state
-            .runs
-            .iter()
-            .filter(|run| run.status == JobRunPhase::Pending)
-            .count(),
-        active: state
-            .runs
-            .iter()
-            .filter(|run| run.status == JobRunPhase::Active)
-            .count(),
-        succeeded: state
-            .runs
-            .iter()
-            .filter(|run| run.status == JobRunPhase::Succeeded)
-            .count(),
-        failed: state
-            .runs
-            .iter()
-            .filter(|run| run.status == JobRunPhase::Failed)
-            .count(),
-        runs,
-        run_details: state
-            .runs
-            .iter()
-            .map(|run| {
-                let worker_manifest = run
-                    .worker_name
-                    .as_deref()
-                    .zip(run.worker_namespace.as_deref())
-                    .and_then(|(worker_name, worker_namespace)| {
-                        match load_manifest(
-                            ResourceKind::Worker,
-                            worker_name,
-                            Some(worker_namespace),
-                        ) {
-                            Ok(ResourceManifest::Worker(worker)) => Some(worker),
-                            _ => None,
-                        }
-                    });
-                JobRunDetail {
-                    name: run.name.clone(),
-                    execution_id: run.runtime_namespace.clone(),
-                    backend: match run.backend {
-                        JobRunBackend::Runtime => "runtime".to_string(),
-                        JobRunBackend::Worker => "worker".to_string(),
-                    },
-                    phase: job_phase_name(run.status).to_string(),
-                    service_name: run.service_name.clone(),
-                    intent: run.intent.clone(),
-                    selected_class: run.selected_class.clone(),
-                    fallback_class: run.fallback_class,
-                    worker: run.worker_name.clone(),
-                    worker_namespace: run.worker_namespace.clone(),
-                    worker_provider: worker_manifest
-                        .as_ref()
-                        .map(|worker| worker_provider_name(worker.spec.provider).to_string()),
-                    worker_model: worker_manifest
-                        .as_ref()
-                        .map(|worker| worker.spec.model.clone()),
-                    worker_locality: run
-                        .worker_locality
-                        .as_ref()
-                        .map(|locality| worker_locality_name(locality).to_string())
-                        .or_else(|| {
-                            worker_manifest.as_ref().map(|worker| {
-                                worker_locality_name(&effective_worker_locality(worker)).to_string()
-                            })
-                        }),
-                    worker_pool: worker_manifest
-                        .as_ref()
-                        .and_then(|worker| worker.spec.pool.clone()),
-                    worker_classes: worker_manifest
-                        .as_ref()
-                        .map(|worker| worker.spec.classes.clone())
-                        .unwrap_or_default(),
-                    admission_state: run.admission_state.map(|state| match state {
-                        JobRunAdmissionState::Pending => "pending".to_string(),
-                        JobRunAdmissionState::Granted => "granted".to_string(),
-                        JobRunAdmissionState::Rejected => "rejected".to_string(),
-                    }),
-                    admission_code: run
-                        .admission_code
-                        .map(|code| worker_admission_code_name(code).to_string()),
-                    validation_state: run
-                        .validation_state
-                        .map(|state| worker_validation_state_name(state).to_string()),
-                    validation_message: run.validation_message.clone(),
-                    validation_enforced: run.validation_enforced,
-                    reason: run
-                        .admission_reason
-                        .clone()
-                        .or_else(|| run.last_error.clone()),
-                    created_at_epoch_ms: run.created_at_epoch_ms,
-                    completed_at_epoch_ms: run.completed_at_epoch_ms,
-                    artifact_path: run.artifact_path.clone(),
-                    output_path: run.output_path.clone(),
-                    error: run.last_error.clone(),
-                    events: job_run_events(run),
-                }
-            })
-            .collect(),
-        conditions: Vec::new(),
-        events: Vec::new(),
-    };
-    let conditions = job_conditions(manifest, state, &base_status);
-    let events = job_events(manifest, state, &base_status);
-    JobStatus {
-        conditions,
-        events,
-        ..base_status
-    }
-}
-
-fn job_phase_name(phase: JobRunPhase) -> &'static str {
-    match phase {
-        JobRunPhase::Pending => "pending",
-        JobRunPhase::Active => "active",
-        JobRunPhase::Succeeded => "succeeded",
-        JobRunPhase::Failed => "failed",
-    }
-}
-
-fn refreshed_job_state(manifest: &ResourceEnvelope<JobSpec>) -> anyhow::Result<JobControllerState> {
-    let mut state = load_job_controller_state(manifest.namespace_key(), &manifest.metadata.name)?;
-    let sessions = collect_runtime_sessions()?;
-    let now = now_epoch_ms();
-    for run in &mut state.runs {
-        match run.backend {
-            JobRunBackend::Runtime => {
-                let session = sessions
-                    .iter()
-                    .find(|session| session.namespace == run.runtime_namespace);
-                let completion = if session.is_none() {
-                    native_session_completion(&run.runtime_namespace)?
-                } else {
-                    None
-                };
-                if job_session_is_active(session) {
-                    run.last_active_epoch_ms = Some(now);
-                }
-                run.status = job_run_phase(
-                    session,
-                    completion.as_ref(),
-                    run.status,
-                    run.last_active_epoch_ms.unwrap_or(run.created_at_epoch_ms),
-                    now,
-                );
-                if run.status != JobRunPhase::Active && run.completed_at_epoch_ms.is_none() {
-                    run.completed_at_epoch_ms = Some(now);
-                }
-            }
-            JobRunBackend::Worker => {
-                recover_unconsumed_worker_run_launch(
-                    manifest.namespace_key(),
-                    &manifest.metadata.name,
-                    run,
-                    now,
-                )?;
-                if let Some(completion) = load_worker_run_completion(
-                    manifest.namespace_key(),
-                    &manifest.metadata.name,
-                    &run.runtime_namespace,
-                )? {
-                    run.status = completion.status;
-                    run.completed_at_epoch_ms = Some(completion.completed_at_epoch_ms);
-                    run.artifact_path = Some(completion.artifact_path);
-                    run.output_path = completion.output_path;
-                    run.validation_state = completion.validation_state;
-                    run.validation_message = completion.validation_message;
-                    run.validation_enforced = completion.validation_enforced;
-                    run.last_error = completion.error;
-                } else if matches!(run.status, JobRunPhase::Active | JobRunPhase::Pending) {
-                    let timeout_seconds = manifest
-                        .spec
-                        .worker
-                        .as_ref()
-                        .and_then(|worker| worker.timeout_seconds)
-                        .unwrap_or(300);
-                    let max_active_ms =
-                        u128::from(timeout_seconds).saturating_mul(1000) + JOB_COMPLETION_GRACE_MS;
-                    if now.saturating_sub(run.created_at_epoch_ms) > max_active_ms {
-                        run.status = JobRunPhase::Failed;
-                        run.completed_at_epoch_ms = Some(now);
-                        run.admission_state
-                            .get_or_insert(JobRunAdmissionState::Rejected);
-                        if run.last_error.is_none() {
-                            run.last_error = Some(format!(
-                                "worker run '{}' did not report completion within {}s",
-                                run.runtime_namespace, timeout_seconds
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    save_job_controller_state(manifest.namespace_key(), &manifest.metadata.name, &state)?;
-    Ok(state)
-}
-
-fn job_session_is_active(session: Option<&NativeSessionMetadata>) -> bool {
-    session
-        .map(|session| session.agents.iter().any(|agent| agent.running))
-        .unwrap_or(false)
-}
-
-fn job_run_phase(
-    session: Option<&NativeSessionMetadata>,
-    completion: Option<&NativeSessionCompletion>,
-    previous: JobRunPhase,
-    last_active_epoch_ms: u128,
-    now_epoch_ms: u128,
-) -> JobRunPhase {
-    let Some(session) = session else {
-        if let Some(completion) = completion {
-            let succeeded = completion
-                .agents
-                .iter()
-                .all(|agent| agent.exit_code.unwrap_or(1) == 0);
-            return if succeeded {
-                JobRunPhase::Succeeded
-            } else {
-                JobRunPhase::Failed
-            };
-        }
-        return match previous {
-            JobRunPhase::Succeeded => JobRunPhase::Succeeded,
-            JobRunPhase::Active
-                if now_epoch_ms.saturating_sub(last_active_epoch_ms) < JOB_COMPLETION_GRACE_MS =>
-            {
-                JobRunPhase::Active
-            }
-            _ => JobRunPhase::Failed,
-        };
-    };
-    let Some(context) = session.context.as_ref() else {
-        return if session.agents.iter().any(|agent| agent.running) {
-            JobRunPhase::Active
-        } else if session
-            .agents
-            .iter()
-            .all(|agent| agent.exit_code.unwrap_or(1) == 0)
-        {
-            JobRunPhase::Succeeded
-        } else if session.agents.iter().all(|agent| !agent.running) {
-            JobRunPhase::Failed
-        } else {
-            previous
-        };
-    };
-
-    let turn_completed = context.turn_status.as_deref() == Some("completed");
-    let thread_idle = context.thread_status.as_deref() == Some("idle");
-    if turn_completed && context.last_error.is_some() {
-        return JobRunPhase::Failed;
-    }
-    if turn_completed && (thread_idle || context.last_error.is_none()) {
-        return JobRunPhase::Succeeded;
-    }
-    if session.agents.iter().any(|agent| agent.running) {
-        JobRunPhase::Active
-    } else if context.last_error.is_some() {
-        JobRunPhase::Failed
-    } else {
-        JobRunPhase::Succeeded
-    }
-}
-
-fn service_status(manifest: &ResourceEnvelope<ServiceSpec>) -> anyhow::Result<ServiceStatus> {
-    let target_kind = effective_service_target_kind(&manifest.spec);
-    let mut endpoints = match target_kind {
-        ServiceTargetKind::Runtime => {
-            let mut sessions = collect_runtime_sessions()?;
-            sessions.retain(|session| service_matches_session(manifest, session));
-            sessions.sort_by(|left, right| left.namespace.cmp(&right.namespace));
-            sessions
-                .into_iter()
-                .map(|session| session.namespace)
-                .collect::<Vec<_>>()
-        }
-        ServiceTargetKind::Worker => {
-            let namespace = manifest.namespace_key().to_string();
-            let mut workers = load_workers_for_service(manifest, &namespace)?;
-            workers.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
-            workers
-                .into_iter()
-                .map(|worker| format!("{}/{}", namespace, worker.metadata.name))
-                .collect::<Vec<_>>()
-        }
-    };
-    endpoints.sort();
-    Ok(ServiceStatus {
-        target_kind: match target_kind {
-            ServiceTargetKind::Runtime => "runtime".to_string(),
-            ServiceTargetKind::Worker => "worker".to_string(),
-        },
-        endpoints,
-        strategy: manifest.spec.strategy.clone(),
-        class_name: manifest.spec.class_name.clone(),
-        fallback_class_names: trimmed_vec(&manifest.spec.fallback_class_names),
-        required_capabilities: trimmed_vec(&manifest.spec.required_capabilities),
-        preferred_providers: worker_provider_labels(&manifest.spec.preferred_providers),
-        prefer_local: manifest.spec.prefer_local,
-        allowed_intents: manifest.spec.allowed_intents.clone(),
-        access_policy: resource_access_policy_status(&manifest.spec.access_policy),
-    })
-}
-
-fn network_policy_status(
-    manifest: &ResourceEnvelope<NetworkPolicySpec>,
-) -> anyhow::Result<NetworkPolicyStatus> {
-    let mut sessions = collect_runtime_sessions()?
-        .into_iter()
-        .filter(|session| network_policy_selects_session(manifest, session))
-        .map(|session| session.namespace)
-        .collect::<Vec<_>>();
-    sessions.sort();
-    Ok(NetworkPolicyStatus {
-        selected_sessions: sessions,
-        policy_types: effective_network_policy_types(&manifest.spec),
-    })
-}
-
-#[derive(Debug, Clone)]
-struct WorkerSelection {
-    name: Option<String>,
-    namespace: Option<String>,
-    service_name: Option<String>,
-    intent: Option<String>,
-    selected_class: Option<String>,
-    fallback_class: bool,
-    locality: Option<WorkerLocality>,
-    admission_code: WorkerAdmissionCode,
-    reason: String,
-}
-
-#[derive(Debug, Clone, Default)]
-struct MachineCapacitySnapshot {
-    memory_available_mib: Option<u64>,
-    gpu_memory_available_mib: Option<u64>,
-}
-
-#[derive(Debug, Clone)]
-struct WorkerAdmissionEvaluation {
-    locality: WorkerLocality,
-    max_concurrent: usize,
-    active_runs: usize,
-    pending_runs: usize,
-    available_slots: usize,
-    admission_code: WorkerAdmissionCode,
-    reason: String,
-    estimated_memory_mib: Option<u64>,
-    estimated_gpu_memory_mib: Option<u64>,
-    machine_memory_available_mib: Option<u64>,
-    machine_gpu_memory_available_mib: Option<u64>,
-}
-
-#[derive(Debug, Clone)]
-struct WorkerCandidate {
-    worker_name: String,
-    worker_namespace: String,
-    worker_provider: WorkerProvider,
-    worker_pool: Option<String>,
-    pool_active_runs: usize,
-    pool_pending_runs: usize,
-    pool_capacity: usize,
-    evaluation: WorkerAdmissionEvaluation,
-}
-
-#[derive(Debug, Clone, Default)]
-struct WorkerPoolLoad {
-    active_runs: usize,
-    pending_runs: usize,
-    capacity: usize,
-}
-
-fn effective_worker_max_concurrent(manifest: &ResourceEnvelope<WorkerSpec>) -> usize {
-    manifest.spec.max_concurrent.unwrap_or(1)
-}
-
-fn effective_worker_locality(manifest: &ResourceEnvelope<WorkerSpec>) -> WorkerLocality {
-    if let Some(locality) = manifest.spec.locality.clone() {
-        return locality;
-    }
-    let endpoint = worker_endpoint(manifest);
-    if endpoint.contains("127.0.0.1")
-        || endpoint.contains("localhost")
-        || endpoint.contains("[::1]")
-    {
-        WorkerLocality::Local
-    } else {
-        WorkerLocality::Remote
-    }
-}
-
-fn worker_locality_name(locality: &WorkerLocality) -> &'static str {
-    match locality {
-        WorkerLocality::Local => "local",
-        WorkerLocality::Remote => "remote",
-        WorkerLocality::Cloud => "cloud",
-    }
-}
-
-fn worker_provider_name(provider: WorkerProvider) -> &'static str {
-    match provider {
-        WorkerProvider::Ollama => "ollama",
-        WorkerProvider::Nvidia => "nvidia",
-        WorkerProvider::Moonshot => "moonshot",
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedSecretKeyRef {
-    namespace: String,
-    name: String,
-    key: String,
-}
-
-#[derive(Debug, Clone)]
-struct WorkerCredentialStatus {
-    present: bool,
-    missing_reason: Option<String>,
-}
-
-fn worker_explicit_api_key_env_name(manifest: &ResourceEnvelope<WorkerSpec>) -> Option<&str> {
-    manifest
-        .spec
-        .api_key_env
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-}
-
-fn worker_default_api_key_env_name(provider: WorkerProvider) -> Option<&'static str> {
-    match provider {
-        WorkerProvider::Ollama => None,
-        WorkerProvider::Nvidia => Some("NVIDIA_API_KEY"),
-        WorkerProvider::Moonshot => Some("MOONSHOT_API_KEY"),
-    }
-}
-
-fn worker_api_key_env_name(manifest: &ResourceEnvelope<WorkerSpec>) -> Option<&str> {
-    worker_explicit_api_key_env_name(manifest)
-        .or_else(|| worker_default_api_key_env_name(manifest.spec.provider))
-}
-
-fn worker_api_key_secret_ref(
-    manifest: &ResourceEnvelope<WorkerSpec>,
-) -> Option<ResolvedSecretKeyRef> {
-    manifest
-        .spec
-        .api_key_secret_ref
-        .as_ref()
-        .map(|secret_ref| ResolvedSecretKeyRef {
-            namespace: normalize_namespaced_resource_namespace(
-                secret_ref
-                    .namespace
-                    .as_deref()
-                    .or(manifest.metadata.namespace.as_deref()),
-            ),
-            name: secret_ref.name.clone(),
-            key: secret_ref.key.clone(),
-        })
-}
-
-fn load_worker_api_key_from_secret(
-    manifest: &ResourceEnvelope<WorkerSpec>,
-    secret_ref: &ResolvedSecretKeyRef,
-) -> anyhow::Result<Option<String>> {
-    let secret_manifest = load_manifest(
-        ResourceKind::Secret,
-        &secret_ref.name,
-        Some(&secret_ref.namespace),
-    )?;
-    let ResourceManifest::Secret(secret) = secret_manifest else {
-        bail!(
-            "resource '{}/{}' is not a Secret",
-            secret_ref.namespace,
-            secret_ref.name
-        );
-    };
-    ensure!(
-        access_policy_allows_workload(
-            &secret.spec.access_policy,
-            manifest.namespace_key(),
-            &manifest.metadata.labels
-        ),
-        "secret '{}/{}' is not allowed for worker '{}'",
-        secret_ref.namespace,
-        secret_ref.name,
-        manifest.metadata.name
-    );
-    Ok(secret
-        .spec
-        .string_data
-        .get(&secret_ref.key)
-        .cloned()
-        .filter(|value| !value.trim().is_empty()))
-}
-
-fn resolve_worker_credential_status(
-    manifest: &ResourceEnvelope<WorkerSpec>,
-) -> WorkerCredentialStatus {
-    if let Some(key_env) = worker_explicit_api_key_env_name(manifest) {
-        if env::var_os(key_env)
-            .and_then(|value| value.into_string().ok())
-            .is_some_and(|value| !value.trim().is_empty())
-        {
-            return WorkerCredentialStatus {
-                present: true,
-                missing_reason: None,
-            };
-        }
-    }
-
-    if let Some(secret_ref) = worker_api_key_secret_ref(manifest) {
-        return match load_worker_api_key_from_secret(manifest, &secret_ref) {
-            Ok(Some(_)) => WorkerCredentialStatus {
-                present: true,
-                missing_reason: None,
-            },
-            Ok(None) => WorkerCredentialStatus {
-                present: false,
-                missing_reason: Some(format!(
-                    "waiting for {} worker '{}' because secret '{}/{}' key '{}' is not set",
-                    worker_locality_name(&effective_worker_locality(manifest)),
-                    manifest.metadata.name,
-                    secret_ref.namespace,
-                    secret_ref.name,
-                    secret_ref.key
-                )),
-            },
-            Err(error) => WorkerCredentialStatus {
-                present: false,
-                missing_reason: Some(format!(
-                    "waiting for {} worker '{}' because secret '{}/{}' key '{}' is unavailable: {}",
-                    worker_locality_name(&effective_worker_locality(manifest)),
-                    manifest.metadata.name,
-                    secret_ref.namespace,
-                    secret_ref.name,
-                    secret_ref.key,
-                    error
-                )),
-            },
-        };
-    }
-
-    if let Some(key_env) = worker_default_api_key_env_name(manifest.spec.provider) {
-        if env::var_os(key_env)
-            .and_then(|value| value.into_string().ok())
-            .is_some_and(|value| !value.trim().is_empty())
-        {
-            return WorkerCredentialStatus {
-                present: true,
-                missing_reason: None,
-            };
-        }
-        return WorkerCredentialStatus {
-            present: false,
-            missing_reason: Some(format!(
-                "waiting for {} worker '{}' because env '{}' is not set",
-                worker_locality_name(&effective_worker_locality(manifest)),
-                manifest.metadata.name,
-                key_env
-            )),
-        };
-    }
-
-    WorkerCredentialStatus {
-        present: true,
-        missing_reason: None,
-    }
-}
-
-fn worker_admission_code_name(code: WorkerAdmissionCode) -> &'static str {
-    match code {
-        WorkerAdmissionCode::Ready => "ready",
-        WorkerAdmissionCode::CapacitySaturated => "capacity_saturated",
-        WorkerAdmissionCode::MemoryPressure => "memory_pressure",
-        WorkerAdmissionCode::GpuPressure => "gpu_pressure",
-        WorkerAdmissionCode::CredentialsMissing => "credentials_missing",
-        WorkerAdmissionCode::NoMatchingWorker => "no_matching_worker",
-        WorkerAdmissionCode::WaitingForNamedWorker => "waiting_for_named_worker",
-        WorkerAdmissionCode::RemoteFallback => "remote_fallback",
-    }
-}
-
-fn worker_admission_summary(code: WorkerAdmissionCode) -> &'static str {
-    match code {
-        WorkerAdmissionCode::Ready => "ready",
-        WorkerAdmissionCode::CapacitySaturated => "saturated",
-        WorkerAdmissionCode::MemoryPressure => "memory-pressure",
-        WorkerAdmissionCode::GpuPressure => "gpu-pressure",
-        WorkerAdmissionCode::CredentialsMissing => "credentials-missing",
-        WorkerAdmissionCode::NoMatchingWorker => "waiting",
-        WorkerAdmissionCode::WaitingForNamedWorker => "waiting",
-        WorkerAdmissionCode::RemoteFallback => "remote-fallback",
-    }
-}
-
-fn parse_capacity_override(var: &str) -> Option<u64> {
-    env::var(var).ok()?.trim().parse::<u64>().ok()
-}
-
-fn machine_capacity_snapshot() -> MachineCapacitySnapshot {
-    let memory_available_mib = parse_capacity_override("JARVISCTL_TEST_AVAILABLE_MEMORY_MIB")
-        .or_else(machine_memory_available_mib);
-    let gpu_memory_available_mib =
-        parse_capacity_override("JARVISCTL_TEST_AVAILABLE_GPU_MEMORY_MIB")
-            .or_else(machine_gpu_memory_available_mib);
-    MachineCapacitySnapshot {
-        memory_available_mib,
-        gpu_memory_available_mib,
-    }
-}
-
-fn machine_memory_available_mib() -> Option<u64> {
-    let mut system = System::new_with_specifics(
-        RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
-    );
-    system.refresh_memory();
-    let available = system.available_memory();
-    Some(available / 1024 / 1024)
-}
-
-fn machine_gpu_memory_available_mib() -> Option<u64> {
-    let output = ProcessCommand::new("nvidia-smi")
-        .args([
-            "--query-gpu=memory.total,memory.used",
-            "--format=csv,noheader,nounits",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    stdout
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split(',').map(str::trim);
-            let total = parts.next()?.parse::<u64>().ok()?;
-            let used = parts.next()?.parse::<u64>().ok()?;
-            Some(total.saturating_sub(used))
-        })
-        .max()
-}
-
-fn worker_labels_match_selector(
-    labels: &BTreeMap<String, String>,
-    selector: &LabelSelector,
-) -> bool {
-    selector
-        .match_labels
-        .iter()
-        .all(|(key, value)| labels.get(key) == Some(value))
-}
-
-fn worker_supports_required_capabilities(
-    manifest: &ResourceEnvelope<WorkerSpec>,
-    required_capabilities: &[String],
-) -> bool {
-    required_capabilities.iter().all(|required| {
-        manifest
-            .spec
-            .capabilities
-            .iter()
-            .any(|capability| capability == required)
-    })
-}
-
-fn worker_matches_class(manifest: &ResourceEnvelope<WorkerSpec>, class_name: &str) -> bool {
-    let class_name = class_name.trim();
-    !class_name.is_empty()
-        && manifest
-            .spec
-            .classes
-            .iter()
-            .any(|candidate| candidate == class_name)
-}
-
-fn worker_matches_any_class(
-    manifest: &ResourceEnvelope<WorkerSpec>,
-    class_names: &[String],
-) -> bool {
-    class_names
-        .iter()
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .any(|class_name| worker_matches_class(manifest, class_name))
-}
-
-fn trimmed_vec(values: &[String]) -> Vec<String> {
-    values
-        .iter()
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn merged_required_capabilities(request: &[String], service: Option<&[String]>) -> Vec<String> {
-    let mut merged = Vec::new();
-    for capability in service
-        .into_iter()
-        .flatten()
-        .chain(request.iter())
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-    {
-        if !merged
-            .iter()
-            .any(|existing: &String| existing == capability)
-        {
-            merged.push(capability.to_string());
-        }
-    }
-    merged
-}
-
-fn merged_preferred_providers(
-    request: &[WorkerProvider],
-    service: Option<&[WorkerProvider]>,
-) -> Vec<WorkerProvider> {
-    let mut merged = Vec::new();
-    for provider in request
-        .iter()
-        .copied()
-        .chain(service.into_iter().flatten().copied())
-    {
-        if !merged.contains(&provider) {
-            merged.push(provider);
-        }
-    }
-    merged
-}
-
-fn effective_class_policy(
-    request: &WorkerJobSpec,
-    service: Option<&ServiceSpec>,
-) -> (Option<String>, Vec<String>) {
-    let primary = request
-        .class_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            service.and_then(|service| {
-                service
-                    .class_name
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToOwned::to_owned)
-            })
-        });
-    let fallbacks = if request.fallback_class_names.is_empty() {
-        service
-            .map(|service| trimmed_vec(&service.fallback_class_names))
-            .unwrap_or_default()
-    } else {
-        trimmed_vec(&request.fallback_class_names)
-    };
-    (primary, fallbacks)
-}
-
-fn provider_preference_rank(provider: WorkerProvider, preferred: &[WorkerProvider]) -> usize {
-    preferred
-        .iter()
-        .position(|candidate| *candidate == provider)
-        .unwrap_or(preferred.len())
-}
-
-fn worker_request_namespace(request: &WorkerJobSpec, control_namespace: &str) -> String {
-    normalize_namespaced_resource_namespace(
-        request
-            .service_namespace
-            .as_deref()
-            .or(request.resource_namespace.as_deref())
-            .or(Some(control_namespace)),
-    )
-}
-
-fn worker_pool_loads(
-    worker_namespace: &str,
-    current_job: Option<(&str, &str, &JobControllerState)>,
-) -> anyhow::Result<BTreeMap<String, WorkerPoolLoad>> {
-    let mut loads: BTreeMap<String, WorkerPoolLoad> = BTreeMap::new();
-    for resource in load_manifests_by_kind(ResourceKind::Worker, Some(worker_namespace))? {
-        let ResourceManifest::Worker(worker) = resource else {
-            continue;
-        };
-        let Some(pool) = worker.spec.pool.as_ref().map(|value| value.trim()) else {
-            continue;
-        };
-        if pool.is_empty() {
-            continue;
-        }
-        let (active_runs, pending_runs) =
-            worker_run_counts(worker_namespace, &worker.metadata.name, current_job)?;
-        let entry = loads.entry(pool.to_string()).or_default();
-        entry.active_runs += active_runs;
-        entry.pending_runs += pending_runs;
-        entry.capacity += effective_worker_max_concurrent(&worker);
-    }
-    Ok(loads)
-}
-
-fn worker_pool_sort_key(candidate: &WorkerCandidate) -> (usize, usize, usize) {
-    match candidate.worker_pool.as_deref() {
-        Some(_) => (
-            candidate
-                .pool_active_runs
-                .saturating_add(candidate.pool_pending_runs),
-            candidate.pool_capacity,
-            candidate.pool_active_runs,
-        ),
-        None => (usize::MAX, usize::MAX, usize::MAX),
-    }
-}
-
-fn worker_selection_reason_prefix(
-    service_name: Option<&str>,
-    matched_class: Option<&str>,
-    fallback_class: bool,
-) -> Option<String> {
-    let mut qualifiers = Vec::new();
-    if let Some(service_name) = service_name {
-        qualifiers.push(format!("via service '{}'", service_name));
-    }
-    if let Some(class_name) = matched_class {
-        qualifiers.push(if fallback_class {
-            format!("using fallback class '{}'", class_name)
-        } else {
-            format!("for class '{}'", class_name)
-        });
-    }
-    if qualifiers.is_empty() {
-        None
-    } else {
-        Some(qualifiers.join(", "))
-    }
-}
-
-fn selection_reason(prefix: Option<&str>, base_reason: &str) -> String {
-    prefix
-        .map(|prefix| format!("{}: {}", prefix, base_reason))
-        .unwrap_or_else(|| base_reason.to_string())
-}
-
-fn waiting_reason(prefix: Option<&str>, base_reason: &str) -> String {
-    selection_reason(prefix, base_reason)
-}
-
-fn service_selection_namespace(request: &WorkerJobSpec, control_namespace: &str) -> String {
-    normalize_namespaced_resource_namespace(
-        request
-            .service_namespace
-            .as_deref()
-            .or(request.resource_namespace.as_deref())
-            .or(Some(control_namespace)),
-    )
-}
-
-fn evaluate_worker_admission(
-    manifest: &ResourceEnvelope<WorkerSpec>,
-    worker_namespace: &str,
-    current_job: Option<(&str, &str, &JobControllerState)>,
-    machine_capacity: &MachineCapacitySnapshot,
-) -> anyhow::Result<WorkerAdmissionEvaluation> {
-    let locality = effective_worker_locality(manifest);
-    let max_concurrent = effective_worker_max_concurrent(manifest);
-    let (active_runs, pending_runs) =
-        worker_run_counts(worker_namespace, &manifest.metadata.name, current_job)?;
-    let available_slots = max_concurrent.saturating_sub(active_runs);
-    let estimated_memory_mib = manifest.spec.memory_mib;
-    let estimated_gpu_memory_mib = manifest.spec.gpu_memory_mib;
-    let machine_memory_available_mib = (locality == WorkerLocality::Local)
-        .then_some(machine_capacity.memory_available_mib)
-        .flatten();
-    let machine_gpu_memory_available_mib = (locality == WorkerLocality::Local)
-        .then_some(machine_capacity.gpu_memory_available_mib)
-        .flatten();
-
-    let credential_status = resolve_worker_credential_status(manifest);
-    let (admission_code, reason) = if !credential_status.present {
-        (
-            WorkerAdmissionCode::CredentialsMissing,
-            credential_status.missing_reason.unwrap_or_else(|| {
-                format!(
-                    "waiting for {} worker '{}' because credentials are not available",
-                    worker_locality_name(&locality),
-                    manifest.metadata.name
-                )
-            }),
-        )
-    } else if available_slots == 0 {
-        (
-            WorkerAdmissionCode::CapacitySaturated,
-            format!(
-                "waiting for capacity on {} worker '{}' (active {}, max {})",
-                worker_locality_name(&locality),
-                manifest.metadata.name,
-                active_runs,
-                max_concurrent
-            ),
-        )
-    } else if locality == WorkerLocality::Local {
-        if let Some(required_memory_mib) = estimated_memory_mib {
-            match machine_memory_available_mib {
-                Some(available_memory_mib) if available_memory_mib < required_memory_mib => (
-                    WorkerAdmissionCode::MemoryPressure,
-                    format!(
-                        "waiting for local worker '{}' because it requires {} MiB RAM and the machine has {} MiB available",
-                        manifest.metadata.name, required_memory_mib, available_memory_mib
-                    ),
-                ),
-                None => (
-                    WorkerAdmissionCode::MemoryPressure,
-                    format!(
-                        "waiting for local worker '{}' because it requires {} MiB RAM and the machine memory state is unavailable",
-                        manifest.metadata.name, required_memory_mib
-                    ),
-                ),
-                _ => {
-                    if let Some(required_gpu_mib) = estimated_gpu_memory_mib {
-                        match machine_gpu_memory_available_mib {
-                            Some(available_gpu_mib) if available_gpu_mib < required_gpu_mib => (
-                                WorkerAdmissionCode::GpuPressure,
-                                format!(
-                                    "waiting for local worker '{}' because it requires {} MiB GPU memory and the machine has {} MiB available",
-                                    manifest.metadata.name, required_gpu_mib, available_gpu_mib
-                                ),
-                            ),
-                            None => (
-                                WorkerAdmissionCode::GpuPressure,
-                                format!(
-                                    "waiting for local worker '{}' because it requires {} MiB GPU memory and no GPU availability data was detected",
-                                    manifest.metadata.name, required_gpu_mib
-                                ),
-                            ),
-                            _ => (
-                                WorkerAdmissionCode::Ready,
-                                format!(
-                                    "admitted on local worker '{}' with {} slot(s) remaining",
-                                    manifest.metadata.name,
-                                    available_slots.saturating_sub(1)
-                                ),
-                            ),
-                        }
-                    } else {
-                        (
-                            WorkerAdmissionCode::Ready,
-                            format!(
-                                "admitted on local worker '{}' with {} slot(s) remaining",
-                                manifest.metadata.name,
-                                available_slots.saturating_sub(1)
-                            ),
-                        )
-                    }
-                }
-            }
-        } else if let Some(required_gpu_mib) = estimated_gpu_memory_mib {
-            match machine_gpu_memory_available_mib {
-                Some(available_gpu_mib) if available_gpu_mib < required_gpu_mib => (
-                    WorkerAdmissionCode::GpuPressure,
-                    format!(
-                        "waiting for local worker '{}' because it requires {} MiB GPU memory and the machine has {} MiB available",
-                        manifest.metadata.name, required_gpu_mib, available_gpu_mib
-                    ),
-                ),
-                None => (
-                    WorkerAdmissionCode::GpuPressure,
-                    format!(
-                        "waiting for local worker '{}' because it requires {} MiB GPU memory and no GPU availability data was detected",
-                        manifest.metadata.name, required_gpu_mib
-                    ),
-                ),
-                _ => (
-                    WorkerAdmissionCode::Ready,
-                    format!(
-                        "admitted on local worker '{}' with {} slot(s) remaining",
-                        manifest.metadata.name,
-                        available_slots.saturating_sub(1)
-                    ),
-                ),
-            }
-        } else {
-            (
-                WorkerAdmissionCode::Ready,
-                format!(
-                    "admitted on local worker '{}' with {} slot(s) remaining",
-                    manifest.metadata.name,
-                    available_slots.saturating_sub(1)
-                ),
-            )
-        }
-    } else {
-        (
-            WorkerAdmissionCode::Ready,
-            format!(
-                "admitted on {} worker '{}' with {} slot(s) remaining",
-                worker_locality_name(&locality),
-                manifest.metadata.name,
-                available_slots.saturating_sub(1)
-            ),
-        )
-    };
-
-    Ok(WorkerAdmissionEvaluation {
-        locality,
-        max_concurrent,
-        active_runs,
-        pending_runs,
-        available_slots,
-        admission_code,
-        reason,
-        estimated_memory_mib,
-        estimated_gpu_memory_mib,
-        machine_memory_available_mib,
-        machine_gpu_memory_available_mib,
-    })
-}
-
-fn is_worker_admissible(code: WorkerAdmissionCode) -> bool {
-    matches!(
-        code,
-        WorkerAdmissionCode::Ready | WorkerAdmissionCode::RemoteFallback
-    )
-}
-
-fn sort_worker_candidates(
-    candidates: &mut [WorkerCandidate],
-    preferred_providers: &[WorkerProvider],
-) {
-    candidates.sort_by(|left, right| {
-        provider_preference_rank(left.worker_provider, preferred_providers)
-            .cmp(&provider_preference_rank(
-                right.worker_provider,
-                preferred_providers,
-            ))
-            .then_with(|| worker_pool_sort_key(left).cmp(&worker_pool_sort_key(right)))
-            .then_with(|| {
-                right
-                    .evaluation
-                    .available_slots
-                    .cmp(&left.evaluation.available_slots)
-            })
-            .then_with(|| {
-                left.evaluation
-                    .active_runs
-                    .cmp(&right.evaluation.active_runs)
-            })
-            .then_with(|| left.worker_name.cmp(&right.worker_name))
-    });
-}
-
-fn count_worker_runs_in_state(
-    state: &JobControllerState,
-    worker_namespace: &str,
-    worker_name: &str,
-) -> (usize, usize) {
-    let mut active = 0;
-    let mut pending = 0;
-    for run in &state.runs {
-        if run.backend != JobRunBackend::Worker {
-            continue;
-        }
-        if run.worker_name.as_deref() != Some(worker_name)
-            || run.worker_namespace.as_deref() != Some(worker_namespace)
-        {
-            continue;
-        }
-        match run.status {
-            JobRunPhase::Active => active += 1,
-            JobRunPhase::Pending => pending += 1,
-            _ => {}
-        }
-    }
-    (active, pending)
-}
-
-fn worker_run_counts(
-    worker_namespace: &str,
-    worker_name: &str,
-    current_job: Option<(&str, &str, &JobControllerState)>,
-) -> anyhow::Result<(usize, usize)> {
-    let mut active = 0;
-    let mut pending = 0;
-    for manifest in load_manifests_by_kind(ResourceKind::Job, None)? {
-        let ResourceManifest::Job(job) = manifest else {
-            continue;
-        };
-        if current_job
-            .map(|(namespace, name, _)| {
-                namespace == job.namespace_key() && name == job.metadata.name.as_str()
-            })
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let state =
-            load_job_controller_state(job.namespace_key(), &job.metadata.name).unwrap_or_default();
-        let (job_active, job_pending) =
-            count_worker_runs_in_state(&state, worker_namespace, worker_name);
-        active += job_active;
-        pending += job_pending;
-    }
-    if let Some((_, _, state)) = current_job {
-        let (job_active, job_pending) =
-            count_worker_runs_in_state(state, worker_namespace, worker_name);
-        active += job_active;
-        pending += job_pending;
-    }
-    Ok((active, pending))
-}
-
-fn select_worker_for_job_run(
-    manifest: &ResourceEnvelope<JobSpec>,
-    state: &JobControllerState,
-) -> anyhow::Result<WorkerSelection> {
-    let request = manifest
-        .spec
-        .worker
-        .as_ref()
-        .ok_or_else(|| anyhow!("job '{}' has no worker request", manifest.metadata.name))?;
-    let mut worker_namespace = worker_request_namespace(request, manifest.namespace_key());
-    let named_worker = request
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let selector = request.selector.as_ref();
-    let service_name = request
-        .service_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let intent = request
-        .intent
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .or(Some("task_offload"));
-    let mut candidates = Vec::new();
-    let mut service_policy: Option<ServiceSpec> = None;
-    let mut matched_class: Option<String> = None;
-    let mut fallback_class = false;
-
-    if let Some(name) = named_worker {
-        if let Ok(ResourceManifest::Worker(worker)) =
-            load_manifest(ResourceKind::Worker, name, Some(&worker_namespace))
-        {
-            candidates.push(worker);
-        } else {
-            return Ok(WorkerSelection {
-                name: Some(name.to_string()),
-                namespace: Some(worker_namespace),
-                service_name: service_name.map(ToOwned::to_owned),
-                intent: intent.map(ToOwned::to_owned),
-                selected_class: matched_class.clone(),
-                fallback_class,
-                locality: None,
-                admission_code: WorkerAdmissionCode::WaitingForNamedWorker,
-                reason: format!("waiting for named worker '{}'", name),
-            });
-        }
-    } else if let Some(service_name) = service_name {
-        let service_namespace = service_selection_namespace(request, manifest.namespace_key());
-        let (service, service_workers) = resolve_worker_candidates_for_service(
-            service_name,
-            Some(&service_namespace),
-            manifest.namespace_key(),
-            &manifest.metadata.labels,
-            intent,
-        )?;
-        worker_namespace = service_namespace;
-        service_policy = Some(service.spec);
-        candidates = service_workers;
-    } else {
-        for manifest in load_manifests_by_kind(ResourceKind::Worker, Some(&worker_namespace))? {
-            let ResourceManifest::Worker(worker) = manifest else {
-                continue;
-            };
-            candidates.push(worker);
-        }
-    }
-
-    if let Some(selector) = selector {
-        candidates.retain(|worker| worker_labels_match_selector(&worker.metadata.labels, selector));
-    }
-    let required_capabilities = merged_required_capabilities(
-        &request.required_capabilities,
-        service_policy
-            .as_ref()
-            .map(|service| service.required_capabilities.as_slice()),
-    );
-    if !required_capabilities.is_empty() {
-        candidates
-            .retain(|worker| worker_supports_required_capabilities(worker, &required_capabilities));
-    }
-
-    let (effective_class_name, fallback_class_names) =
-        effective_class_policy(request, service_policy.as_ref());
-    let preferred_providers = merged_preferred_providers(
-        &request.preferred_providers,
-        service_policy
-            .as_ref()
-            .map(|service| service.preferred_providers.as_slice()),
-    );
-
-    if let Some(class_name) = effective_class_name.as_deref() {
-        let primary = candidates
-            .iter()
-            .filter(|worker| worker_matches_class(worker, class_name))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !primary.is_empty() {
-            matched_class = Some(class_name.to_string());
-            candidates = primary;
-        } else {
-            let mut fallback_candidates = None;
-            for fallback_name in &fallback_class_names {
-                let matches = candidates
-                    .iter()
-                    .filter(|worker| worker_matches_class(worker, fallback_name))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if !matches.is_empty() {
-                    matched_class = Some(fallback_name.to_string());
-                    fallback_class = true;
-                    fallback_candidates = Some(matches);
-                    break;
-                }
-            }
-            if let Some(matches) = fallback_candidates {
-                candidates = matches;
-            } else {
-                let reason_prefix =
-                    worker_selection_reason_prefix(service_name, Some(class_name), false);
-                return Ok(WorkerSelection {
-                    name: None,
-                    namespace: Some(worker_namespace),
-                    service_name: service_name.map(ToOwned::to_owned),
-                    intent: intent.map(ToOwned::to_owned),
-                    selected_class: Some(class_name.to_string()),
-                    fallback_class: false,
-                    locality: None,
-                    admission_code: WorkerAdmissionCode::NoMatchingWorker,
-                    reason: waiting_reason(
-                        reason_prefix.as_deref(),
-                        &format!("waiting for a worker in class '{}'", class_name),
-                    ),
-                });
-            }
-        }
-    } else {
-        for fallback_name in &fallback_class_names {
-            let matches = candidates
-                .iter()
-                .filter(|worker| worker_matches_class(worker, fallback_name))
-                .cloned()
-                .collect::<Vec<_>>();
-            if !matches.is_empty() {
-                matched_class = Some(fallback_name.to_string());
-                fallback_class = true;
-                candidates = matches;
-                break;
-            }
-        }
-    }
-
-    let reason_prefix =
-        worker_selection_reason_prefix(service_name, matched_class.as_deref(), fallback_class);
-
-    if candidates.is_empty() {
-        return Ok(WorkerSelection {
-            name: named_worker.map(ToOwned::to_owned),
-            namespace: Some(worker_namespace),
-            service_name: service_name.map(ToOwned::to_owned),
-            intent: intent.map(ToOwned::to_owned),
-            selected_class: matched_class.clone(),
-            fallback_class,
-            locality: None,
-            admission_code: WorkerAdmissionCode::NoMatchingWorker,
-            reason: waiting_reason(reason_prefix.as_deref(), "waiting for a matching worker"),
-        });
-    }
-
-    let machine_capacity = machine_capacity_snapshot();
-    let current_job = Some((
-        manifest.namespace_key(),
-        manifest.metadata.name.as_str(),
-        state,
-    ));
-    let pool_loads = worker_pool_loads(&worker_namespace, current_job)?;
-    let mut scored = Vec::new();
-    for worker in candidates {
-        let evaluation =
-            evaluate_worker_admission(&worker, &worker_namespace, current_job, &machine_capacity)?;
-        let worker_pool = worker
-            .spec
-            .pool
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
-        let pool_load = worker_pool
-            .as_ref()
-            .and_then(|pool| pool_loads.get(pool))
-            .cloned()
-            .unwrap_or_default();
-        scored.push(WorkerCandidate {
-            worker_name: worker.metadata.name.clone(),
-            worker_namespace: worker_namespace.clone(),
-            worker_provider: worker.spec.provider,
-            worker_pool,
-            pool_active_runs: pool_load.active_runs,
-            pool_pending_runs: pool_load.pending_runs,
-            pool_capacity: pool_load.capacity,
-            evaluation,
-        });
-    }
-    let mut any_ready = scored
-        .iter()
-        .filter(|candidate| candidate.evaluation.admission_code == WorkerAdmissionCode::Ready)
-        .cloned()
-        .collect::<Vec<_>>();
-    sort_worker_candidates(&mut any_ready, &preferred_providers);
-
-    let prefer_local = request.prefer_local
-        || service_policy
-            .as_ref()
-            .map(|service| service.prefer_local)
-            .unwrap_or(false);
-
-    if prefer_local {
-        let mut local_ready = scored
-            .iter()
-            .filter(|candidate| {
-                candidate.evaluation.locality == WorkerLocality::Local
-                    && candidate.evaluation.admission_code == WorkerAdmissionCode::Ready
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        sort_worker_candidates(&mut local_ready, &preferred_providers);
-        if let Some(candidate) = local_ready.into_iter().next() {
-            return Ok(WorkerSelection {
-                name: Some(candidate.worker_name),
-                namespace: Some(candidate.worker_namespace),
-                service_name: service_name.map(ToOwned::to_owned),
-                intent: intent.map(ToOwned::to_owned),
-                selected_class: matched_class.clone(),
-                fallback_class,
-                locality: Some(candidate.evaluation.locality),
-                admission_code: WorkerAdmissionCode::Ready,
-                reason: selection_reason(reason_prefix.as_deref(), &candidate.evaluation.reason),
-            });
-        }
-
-        let local_blocked = scored
-            .iter()
-            .filter(|candidate| candidate.evaluation.locality == WorkerLocality::Local)
-            .cloned()
-            .collect::<Vec<_>>();
-        if let Some(mut candidate) = any_ready.into_iter().next() {
-            if !local_blocked.is_empty() && candidate.evaluation.locality != WorkerLocality::Local {
-                let mut blocked = local_blocked;
-                sort_worker_candidates(&mut blocked, &preferred_providers);
-                let fallback_detail = blocked
-                    .first()
-                    .map(|blocked| blocked.evaluation.reason.clone())
-                    .unwrap_or_else(|| "preferred local workers are unavailable".to_string());
-                candidate.evaluation.reason = format!(
-                    "admitted on {} worker '{}' because preferred local workers are not admissible: {}",
-                    worker_locality_name(&candidate.evaluation.locality),
-                    candidate.worker_name,
-                    fallback_detail
-                );
-                return Ok(WorkerSelection {
-                    name: Some(candidate.worker_name),
-                    namespace: Some(candidate.worker_namespace),
-                    service_name: service_name.map(ToOwned::to_owned),
-                    intent: intent.map(ToOwned::to_owned),
-                    selected_class: matched_class.clone(),
-                    fallback_class,
-                    locality: Some(candidate.evaluation.locality),
-                    admission_code: WorkerAdmissionCode::RemoteFallback,
-                    reason: selection_reason(
-                        reason_prefix.as_deref(),
-                        &candidate.evaluation.reason,
-                    ),
-                });
-            }
-            return Ok(WorkerSelection {
-                name: Some(candidate.worker_name),
-                namespace: Some(candidate.worker_namespace),
-                service_name: service_name.map(ToOwned::to_owned),
-                intent: intent.map(ToOwned::to_owned),
-                selected_class: matched_class.clone(),
-                fallback_class,
-                locality: Some(candidate.evaluation.locality),
-                admission_code: WorkerAdmissionCode::Ready,
-                reason: selection_reason(reason_prefix.as_deref(), &candidate.evaluation.reason),
-            });
-        }
-
-        let mut blocked = local_blocked;
-        if blocked.is_empty() {
-            blocked = scored;
-        }
-        sort_worker_candidates(&mut blocked, &preferred_providers);
-        let candidate = blocked
-            .into_iter()
-            .next()
-            .expect("at least one worker candidate exists");
-        return Ok(WorkerSelection {
-            name: Some(candidate.worker_name),
-            namespace: Some(candidate.worker_namespace),
-            service_name: service_name.map(ToOwned::to_owned),
-            intent: intent.map(ToOwned::to_owned),
-            selected_class: matched_class.clone(),
-            fallback_class,
-            locality: Some(candidate.evaluation.locality),
-            admission_code: candidate.evaluation.admission_code,
-            reason: selection_reason(reason_prefix.as_deref(), &candidate.evaluation.reason),
-        });
-    }
-
-    if let Some(candidate) = any_ready.into_iter().next() {
-        return Ok(WorkerSelection {
-            name: Some(candidate.worker_name),
-            namespace: Some(candidate.worker_namespace),
-            service_name: service_name.map(ToOwned::to_owned),
-            intent: intent.map(ToOwned::to_owned),
-            selected_class: matched_class.clone(),
-            fallback_class,
-            locality: Some(candidate.evaluation.locality),
-            admission_code: WorkerAdmissionCode::Ready,
-            reason: selection_reason(reason_prefix.as_deref(), &candidate.evaluation.reason),
-        });
-    }
-
-    sort_worker_candidates(&mut scored, &preferred_providers);
-    let candidate = scored
-        .into_iter()
-        .next()
-        .expect("at least one worker candidate exists");
-    Ok(WorkerSelection {
-        name: Some(candidate.worker_name),
-        namespace: Some(candidate.worker_namespace),
-        service_name: service_name.map(ToOwned::to_owned),
-        intent: intent.map(ToOwned::to_owned),
-        selected_class: matched_class,
-        fallback_class,
-        locality: Some(candidate.evaluation.locality),
-        admission_code: candidate.evaluation.admission_code,
-        reason: selection_reason(reason_prefix.as_deref(), &candidate.evaluation.reason),
-    })
-}
-
-fn worker_status(manifest: &ResourceEnvelope<WorkerSpec>) -> anyhow::Result<WorkerStatus> {
-    let machine_capacity = machine_capacity_snapshot();
-    let evaluation =
-        evaluate_worker_admission(manifest, manifest.namespace_key(), None, &machine_capacity)?;
-    let loaded = match manifest.spec.provider {
-        WorkerProvider::Ollama if evaluation.locality == WorkerLocality::Local => {
-            ollama_model_loaded(&manifest.spec.model)?
-        }
-        WorkerProvider::Ollama | WorkerProvider::Nvidia | WorkerProvider::Moonshot => false,
-    };
-    Ok(WorkerStatus {
-        provider: worker_provider_name(manifest.spec.provider).to_string(),
-        model: manifest.spec.model.clone(),
-        endpoint: worker_endpoint(manifest),
-        locality: worker_locality_name(&evaluation.locality).to_string(),
-        role: manifest.spec.role.clone(),
-        capabilities: manifest.spec.capabilities.clone(),
-        classes: manifest.spec.classes.clone(),
-        pool: manifest.spec.pool.clone(),
-        output_mode: match effective_worker_output_mode(manifest) {
-            WorkerOutputMode::Text => "text".to_string(),
-            WorkerOutputMode::Json => "json".to_string(),
-        },
-        max_concurrent: evaluation.max_concurrent,
-        active_runs: evaluation.active_runs,
-        pending_runs: evaluation.pending_runs,
-        available_slots: evaluation.available_slots,
-        admission: worker_admission_summary(evaluation.admission_code).to_string(),
-        admission_code: worker_admission_code_name(evaluation.admission_code).to_string(),
-        admission_reason: if evaluation.admission_code == WorkerAdmissionCode::Ready {
-            format!(
-                "{} worker '{}' is ready with {} slot(s) available",
-                worker_locality_name(&evaluation.locality),
-                manifest.metadata.name,
-                evaluation.available_slots
-            )
-        } else {
-            evaluation.reason
-        },
-        estimated_memory_mib: evaluation.estimated_memory_mib,
-        estimated_gpu_memory_mib: evaluation.estimated_gpu_memory_mib,
-        machine_memory_available_mib: evaluation.machine_memory_available_mib,
-        machine_gpu_memory_available_mib: evaluation.machine_gpu_memory_available_mib,
-        loaded,
-    })
-}
-
-pub fn invoke_worker(
-    worker_name: &str,
-    namespace: Option<&str>,
-    prompt: &str,
-) -> anyhow::Result<String> {
-    let control_namespace = normalize_namespaced_resource_namespace(namespace);
-    let manifest = load_manifest(ResourceKind::Worker, worker_name, Some(&control_namespace))?;
-    let ResourceManifest::Worker(worker) = manifest else {
-        bail!(
-            "resource '{}/{}' is not a Worker",
-            control_namespace,
-            worker_name
-        );
-    };
-    match worker.spec.provider {
-        WorkerProvider::Ollama => invoke_ollama_worker(&worker, prompt),
-        WorkerProvider::Nvidia => invoke_openai_compatible_worker(&worker, prompt),
-        WorkerProvider::Moonshot => invoke_openai_compatible_worker(&worker, prompt),
-    }
-}
-
-pub fn offload_worker_task(request: WorkerOffloadRequest) -> anyhow::Result<WorkerOffloadResult> {
-    let control_namespace =
-        normalize_namespaced_resource_namespace(request.resource_namespace.as_deref());
-    let service_name = request.service_name.trim();
-    ensure!(
-        !service_name.is_empty(),
-        "worker offload requires a service name"
-    );
-    ensure!(
-        !request.prompt.trim().is_empty(),
-        "worker offload requires a prompt"
-    );
-
-    let job_name = request
-        .job_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| {
-            format!(
-                "offload-{}-{}",
-                slugify(service_name),
-                now_epoch_ms() % 1_000_000
-            )
-        });
-    let timeout_seconds = request.timeout_seconds.unwrap_or(180);
-    let mut labels = current_offload_source_labels();
-    labels.insert("jarvisctl.io/offload".to_string(), "true".to_string());
-    labels.insert("jarvisctl.io/service".to_string(), service_name.to_string());
-
-    let job = ResourceEnvelope {
-        api_version: API_VERSION.to_string(),
-        kind: "Job".to_string(),
-        metadata: ResourceMetadata {
-            name: job_name.clone(),
-            namespace: Some(control_namespace.clone()),
-            labels,
-            annotations: BTreeMap::new(),
-        },
-        spec: JobSpec {
-            backoff_limit: 0,
-            worker: Some(WorkerJobSpec {
-                service_name: Some(service_name.to_string()),
-                service_namespace: Some(control_namespace.clone()),
-                intent: request.intent.clone(),
-                prompt: request.prompt,
-                timeout_seconds: Some(timeout_seconds),
-                output_path: request.output_path.clone(),
-                ..WorkerJobSpec::default()
-            }),
-            ..JobSpec::default()
-        },
-    };
-
-    save_manifest(&ResourceManifest::Job(job.clone()))?;
-    let _ = reconcile_control_plane()?;
-
-    let wait_timeout = Duration::from_secs(timeout_seconds.saturating_add(30));
-    let start = Instant::now();
-    loop {
-        let _ = reconcile_control_plane()?;
-        let manifest = load_manifest(ResourceKind::Job, &job_name, Some(&control_namespace))?;
-        let ResourceManifest::Job(job_manifest) = manifest else {
-            bail!("resource '{}/{}' is not a Job", control_namespace, job_name);
-        };
-        let status = job_status(&job_manifest)?;
-        let complete = status.succeeded >= status.completions;
-        let failed = job_terminal_failure(&job_manifest, &status);
-        if complete || failed {
-            let result = worker_offload_result(&job_manifest, &status)?;
-            if complete {
-                return Ok(result);
-            }
-            let detail = result
-                .validation_message
-                .clone()
-                .or_else(|| result.response.clone())
-                .or_else(|| {
-                    status
-                        .run_details
-                        .iter()
-                        .find_map(|run| run.error.clone().or_else(|| run.reason.clone()))
-                })
-                .unwrap_or_else(|| "worker offload failed".to_string());
-            bail!(
-                "worker offload job '{}/{}' failed via service '{}': {}",
-                control_namespace,
-                job_name,
-                service_name,
-                detail
-            );
-        }
-        if start.elapsed() >= wait_timeout {
-            bail!(
-                "timed out waiting for worker offload job '{}/{}' after {}s",
-                control_namespace,
-                job_name,
-                wait_timeout.as_secs()
-            );
-        }
-        thread::sleep(Duration::from_millis(500));
-    }
-}
-
-fn current_offload_source_labels() -> BTreeMap<String, String> {
-    let mut labels = BTreeMap::new();
-    if let Ok(value) = env::var("JARVIS_RUNTIME_NAMESPACE") {
-        let value = value.trim();
-        if !value.is_empty() {
-            labels.insert(
-                "jarvisctl.io/source-runtime-namespace".to_string(),
-                value.to_string(),
-            );
-        }
-    }
-    if let Ok(value) = env::var("JARVIS_WORKLOAD") {
-        let value = value.trim();
-        if !value.is_empty() {
-            labels.insert("workload".to_string(), value.to_string());
-        }
-    }
-    if let Ok(value) = env::var("JARVIS_TASK_ID") {
-        let value = value.trim();
-        if !value.is_empty() {
-            labels.insert("jarvisctl.io/task-id".to_string(), value.to_string());
-        }
-    }
-    if let Ok(value) = env::var("JARVIS_DEPLOYMENT") {
-        let value = value.trim();
-        if !value.is_empty() {
-            labels.insert("jarvisctl.io/deployment".to_string(), value.to_string());
-        }
-    }
-    labels
-}
-
-fn worker_offload_result(
-    manifest: &ResourceEnvelope<JobSpec>,
-    status: &JobStatus,
-) -> anyhow::Result<WorkerOffloadResult> {
-    let detail = primary_job_run_detail(status)
-        .ok_or_else(|| anyhow!("worker offload job has no run details"))?;
-    let response_path = detail
-        .output_path
-        .as_deref()
-        .or(detail.artifact_path.as_deref());
-    let response = response_path
-        .map(PathBuf::from)
-        .filter(|path| path.exists())
-        .map(|path| {
-            fs::read_to_string(&path).with_context(|| {
-                format!("failed to read worker offload output '{}'", path.display())
-            })
-        })
-        .transpose()?;
-
-    Ok(WorkerOffloadResult {
-        job_name: manifest.metadata.name.clone(),
-        namespace: manifest.namespace_key().to_string(),
-        service_name: detail
-            .service_name
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string()),
-        phase: detail.phase.clone(),
-        selected_class: detail.selected_class.clone(),
-        fallback_class: detail.fallback_class,
-        worker: detail.worker.clone(),
-        worker_namespace: detail.worker_namespace.clone(),
-        worker_provider: detail.worker_provider.clone(),
-        worker_model: detail.worker_model.clone(),
-        worker_locality: detail.worker_locality.clone(),
-        validation_state: detail.validation_state.clone(),
-        validation_message: detail.validation_message.clone(),
-        artifact_path: detail.artifact_path.clone(),
-        output_path: detail.output_path.clone(),
-        response,
-    })
-}
-
-fn primary_job_run_detail(status: &JobStatus) -> Option<&JobRunDetail> {
-    status
-        .run_details
-        .iter()
-        .find(|run| run.phase == "succeeded")
-        .or_else(|| status.run_details.iter().find(|run| run.phase == "failed"))
-        .or_else(|| status.run_details.first())
-}
-
-fn invoke_ollama_worker(
-    manifest: &ResourceEnvelope<WorkerSpec>,
-    prompt: &str,
-) -> anyhow::Result<String> {
-    let endpoint = worker_endpoint(manifest);
-    let mut options = serde_json::Map::new();
-    if let Some(temperature) = manifest.spec.temperature {
-        options.insert("temperature".to_string(), json!(temperature));
-    }
-    if let Some(num_predict) = manifest.spec.num_predict {
-        options.insert("num_predict".to_string(), json!(num_predict));
-    }
-    if let Some(num_ctx) = manifest.spec.num_ctx {
-        options.insert("num_ctx".to_string(), json!(num_ctx));
-    }
-    let final_prompt = manifest
-        .spec
-        .system_prompt
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(|system_prompt| format!("{}\n\nTask:\n{}", system_prompt.trim(), prompt.trim()))
-        .unwrap_or_else(|| prompt.trim().to_string());
-    let mut payload = serde_json::Map::from_iter([
-        ("model".to_string(), json!(manifest.spec.model)),
-        ("prompt".to_string(), json!(final_prompt)),
-        ("stream".to_string(), json!(false)),
-    ]);
-    if !options.is_empty() {
-        payload.insert("options".to_string(), serde_json::Value::Object(options));
-    }
-    if matches!(
-        effective_worker_output_mode(manifest),
-        WorkerOutputMode::Json
-    ) {
-        payload.insert("format".to_string(), json!("json"));
-    }
-
-    let url = format!("{}/api/generate", endpoint.trim_end_matches('/'));
-    let mut response = ureq::post(&url)
-        .content_type("application/json")
-        .send_json(serde_json::Value::Object(payload))
-        .with_context(|| format!("failed to reach Ollama worker endpoint '{}'", url))?;
-    let body: serde_json::Value = response
-        .body_mut()
-        .read_json()
-        .context("failed to decode Ollama worker response")?;
-    let text = body
-        .get("response")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow!("Ollama worker response was missing 'response' text"))?
-        .trim()
-        .to_string();
-    Ok(match effective_worker_output_mode(manifest) {
-        WorkerOutputMode::Text => text,
-        WorkerOutputMode::Json => serde_json::to_string_pretty(
-            &serde_json::from_str::<serde_json::Value>(&text)
-                .context("worker declared json output but returned invalid JSON")?,
-        )
-        .context("failed to pretty-print worker JSON output")?,
-    })
-}
-
-fn invoke_openai_compatible_worker(
-    manifest: &ResourceEnvelope<WorkerSpec>,
-    prompt: &str,
-) -> anyhow::Result<String> {
-    let provider_name = worker_provider_name(manifest.spec.provider);
-    let api_key = worker_explicit_api_key_env_name(manifest)
-        .and_then(|key_env| env::var(key_env).ok())
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            worker_api_key_secret_ref(manifest).and_then(|secret_ref| {
-                load_worker_api_key_from_secret(manifest, &secret_ref)
-                    .ok()
-                    .flatten()
-            })
-        })
-        .or_else(|| {
-            worker_default_api_key_env_name(manifest.spec.provider)
-                .and_then(|key_env| env::var(key_env).ok())
-                .filter(|value| !value.trim().is_empty())
-        })
-        .ok_or_else(|| {
-            if let Some(secret_ref) = worker_api_key_secret_ref(manifest) {
-                anyhow!(
-                    "{} worker '{}' requires secret '{}/{}' key '{}' or an available API-key env override",
-                    provider_name,
-                    manifest.metadata.name,
-                    secret_ref.namespace,
-                    secret_ref.name,
-                    secret_ref.key
-                )
-            } else if let Some(key_env) = worker_api_key_env_name(manifest) {
-                anyhow!(
-                    "{} worker '{}' requires env '{}' to be set",
-                    provider_name,
-                    manifest.metadata.name,
-                    key_env
-                )
-            } else {
-                anyhow!(
-                    "{} worker '{}' requires credentials to be configured",
-                    provider_name,
-                    manifest.metadata.name
-                )
-            }
-        })?;
-    ensure!(
-        !api_key.trim().is_empty(),
-        "{} worker '{}' requires non-empty credentials",
-        provider_name,
-        manifest.metadata.name
-    );
-
-    let mut system_parts = Vec::new();
-    if let Some(system_prompt) = manifest
-        .spec
-        .system_prompt
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        system_parts.push(system_prompt.to_string());
-    }
-    if matches!(
-        effective_worker_output_mode(manifest),
-        WorkerOutputMode::Json
-    ) {
-        system_parts.push(
-            "Return only valid JSON with no markdown fences, no commentary, and no surrounding prose."
-                .to_string(),
-        );
-    }
-
-    let mut messages = Vec::new();
-    if !system_parts.is_empty() {
-        messages.push(json!({
-            "role": "system",
-            "content": system_parts.join("\n\n"),
-        }));
-    }
-    messages.push(json!({
-        "role": "user",
-        "content": prompt.trim(),
-    }));
-
-    let mut payload = serde_json::Map::from_iter([
-        ("model".to_string(), json!(manifest.spec.model)),
-        ("messages".to_string(), serde_json::Value::Array(messages)),
-        ("stream".to_string(), json!(false)),
-    ]);
-    if let Some(temperature) = manifest.spec.temperature {
-        payload.insert("temperature".to_string(), json!(temperature));
-    }
-    if let Some(top_p) = manifest.spec.top_p {
-        payload.insert("top_p".to_string(), json!(top_p));
-    }
-    if let Some(frequency_penalty) = manifest.spec.frequency_penalty {
-        payload.insert("frequency_penalty".to_string(), json!(frequency_penalty));
-    }
-    if let Some(presence_penalty) = manifest.spec.presence_penalty {
-        payload.insert("presence_penalty".to_string(), json!(presence_penalty));
-    }
-    if let Some(num_predict) = manifest.spec.num_predict {
-        payload.insert("max_tokens".to_string(), json!(num_predict));
-    }
-
-    let url = openai_compatible_worker_request_url(manifest);
-    let mut response = ureq::post(&url)
-        .header("Authorization", &format!("Bearer {}", api_key.trim()))
-        .header("Accept", "application/json")
-        .content_type("application/json")
-        .send_json(serde_json::Value::Object(payload))
-        .with_context(|| {
-            format!(
-                "failed to reach {} worker endpoint '{}'",
-                provider_name, url
-            )
-        })?;
-    let body: serde_json::Value = response
-        .body_mut()
-        .read_json()
-        .with_context(|| format!("failed to decode {} worker response", provider_name))?;
-    let text = openai_compatible_response_text(&body)?.trim().to_string();
-    Ok(match effective_worker_output_mode(manifest) {
-        WorkerOutputMode::Text => text,
-        WorkerOutputMode::Json => serde_json::to_string_pretty(
-            &serde_json::from_str::<serde_json::Value>(&text)
-                .context("worker declared json output but returned invalid JSON")?,
-        )
-        .context("failed to pretty-print worker JSON output")?,
-    })
-}
-
-fn ollama_model_loaded(model: &str) -> anyhow::Result<bool> {
-    let output = ProcessCommand::new("ollama")
-        .arg("ps")
-        .output()
-        .context("failed to execute 'ollama ps'")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if ollama_backend_unavailable(&stderr) {
-            return Ok(false);
-        }
-        ensure!(false, "'ollama ps' failed: {}", stderr);
-    }
-    let stdout = String::from_utf8(output.stdout).context("ollama ps returned non-utf8 output")?;
-    Ok(stdout
-        .lines()
-        .any(|line| line.split_whitespace().next() == Some(model)))
-}
-
-fn ollama_backend_unavailable(stderr: &str) -> bool {
-    let stderr = stderr.to_ascii_lowercase();
-    stderr.contains("could not connect to ollama server")
-        || stderr.contains("connection refused")
-        || stderr.contains("failed to connect")
-        || stderr.contains("no such file or directory")
-}
-
-fn worker_endpoint(manifest: &ResourceEnvelope<WorkerSpec>) -> String {
-    manifest
-        .spec
-        .endpoint
-        .clone()
-        .unwrap_or_else(|| default_worker_endpoint(manifest.spec.provider))
-}
-
-fn default_worker_endpoint(provider: WorkerProvider) -> String {
-    match provider {
-        WorkerProvider::Ollama => default_ollama_endpoint(),
-        WorkerProvider::Nvidia => default_nvidia_endpoint(),
-        WorkerProvider::Moonshot => default_moonshot_endpoint(),
-    }
-}
-
-fn default_ollama_endpoint() -> String {
-    "http://127.0.0.1:11434".to_string()
-}
-
-fn default_nvidia_endpoint() -> String {
-    "https://integrate.api.nvidia.com/v1/chat/completions".to_string()
-}
-
-fn default_moonshot_endpoint() -> String {
-    "https://api.moonshot.cn/v1/chat/completions".to_string()
-}
-
-fn openai_compatible_worker_request_url(manifest: &ResourceEnvelope<WorkerSpec>) -> String {
-    let endpoint = worker_endpoint(manifest);
-    if endpoint.ends_with("/chat/completions") {
-        endpoint
-    } else {
-        format!("{}/chat/completions", endpoint.trim_end_matches('/'))
-    }
-}
-
-fn openai_compatible_response_text(body: &serde_json::Value) -> anyhow::Result<String> {
-    let content = body
-        .get("choices")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.get("message"))
-        .and_then(|message| message.get("content"))
-        .ok_or_else(|| {
-            anyhow!("OpenAI-compatible worker response was missing choices[0].message.content")
-        })?;
-    match content {
-        serde_json::Value::String(text) => Ok(text.clone()),
-        serde_json::Value::Array(parts) => {
-            let combined = parts
-                .iter()
-                .filter_map(|part| {
-                    part.get("text")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToOwned::to_owned)
-                        .or_else(|| {
-                            part.get("content")
-                                .and_then(serde_json::Value::as_str)
-                                .map(ToOwned::to_owned)
-                        })
-                })
-                .collect::<Vec<_>>()
-                .join("");
-            ensure!(
-                !combined.trim().is_empty(),
-                "OpenAI-compatible worker response returned an empty message content array"
-            );
-            Ok(combined)
-        }
-        _ => bail!("OpenAI-compatible worker response returned unsupported message content"),
-    }
-}
-
-fn effective_worker_output_mode(manifest: &ResourceEnvelope<WorkerSpec>) -> WorkerOutputMode {
-    manifest.spec.output_mode.clone().unwrap_or_default()
-}
-
-fn describe_status(manifest: &ResourceManifest) -> anyhow::Result<serde_json::Value> {
-    match manifest {
-        ResourceManifest::Namespace(namespace) => Ok(serde_json::to_value(namespace_status(
-            &namespace.metadata.name,
-        )?)?),
-        ResourceManifest::Deployment(deployment) => {
-            Ok(serde_json::to_value(deployment_status(deployment)?)?)
-        }
-        ResourceManifest::ReplicaSet(replica_set) => {
-            Ok(serde_json::to_value(replica_set_status(replica_set)?)?)
-        }
-        ResourceManifest::Job(job) => Ok(serde_json::to_value(job_status(job)?)?),
-        ResourceManifest::CronJob(cron_job) => {
-            Ok(serde_json::to_value(cron_job_status(cron_job)?)?)
-        }
-        ResourceManifest::Application(application) => {
-            Ok(serde_json::to_value(application_status(application)?)?)
-        }
-        ResourceManifest::Service(service) => Ok(serde_json::to_value(service_status(service)?)?),
-        ResourceManifest::NetworkPolicy(network_policy) => Ok(serde_json::to_value(
-            network_policy_status(network_policy)?,
-        )?),
-        ResourceManifest::ConfigMap(config_map) => Ok(serde_json::to_value(ConfigMapStatus {
-            entries: config_map.spec.data.len(),
-            keys: config_map.spec.data.keys().cloned().collect::<Vec<_>>(),
-            access_policy: resource_access_policy_status(&config_map.spec.access_policy),
-        })?),
-        ResourceManifest::Secret(secret) => Ok(serde_json::to_value(SecretStatus {
-            keys: secret.spec.string_data.keys().cloned().collect::<Vec<_>>(),
-            access_policy: resource_access_policy_status(&secret.spec.access_policy),
-        })?),
-        ResourceManifest::Volume(volume) => Ok(serde_json::to_value(VolumeStatus {
-            paths: volume.spec.paths.clone(),
-            access_policy: resource_access_policy_status(&volume.spec.access_policy),
-        })?),
-        ResourceManifest::Worker(worker) => Ok(serde_json::to_value(worker_status(worker)?)?),
-    }
-}
-
 fn service_matches_session(
     manifest: &ResourceEnvelope<ServiceSpec>,
     session: &NativeSessionMetadata,
@@ -11488,108 +3982,6 @@ fn service_allows_source_workload(
     workload_labels: &BTreeMap<String, String>,
 ) -> bool {
     access_policy_allows_workload(&spec.access_policy, control_namespace, workload_labels)
-}
-
-fn worker_matches_service(
-    manifest: &ResourceEnvelope<ServiceSpec>,
-    worker: &ResourceEnvelope<WorkerSpec>,
-) -> bool {
-    if effective_service_target_kind(&manifest.spec) != ServiceTargetKind::Worker {
-        return false;
-    }
-    if worker.namespace_key() != manifest.namespace_key() {
-        return false;
-    }
-    if !manifest
-        .spec
-        .selector
-        .iter()
-        .all(|(key, value)| worker.metadata.labels.get(key) == Some(value))
-    {
-        return false;
-    }
-    if !manifest.spec.required_capabilities.is_empty()
-        && !worker_supports_required_capabilities(worker, &manifest.spec.required_capabilities)
-    {
-        return false;
-    }
-    let mut accepted_classes = Vec::new();
-    if let Some(class_name) = manifest
-        .spec
-        .class_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        accepted_classes.push(class_name.to_string());
-    }
-    accepted_classes.extend(trimmed_vec(&manifest.spec.fallback_class_names));
-    if !accepted_classes.is_empty() && !worker_matches_any_class(worker, &accepted_classes) {
-        return false;
-    }
-    true
-}
-
-fn worker_provider_labels(preferred_providers: &[WorkerProvider]) -> Vec<String> {
-    preferred_providers
-        .iter()
-        .map(|provider| worker_provider_name(*provider).to_string())
-        .collect()
-}
-
-fn worker_matches_service_class_policy(
-    worker: &ResourceEnvelope<WorkerSpec>,
-    primary_class: Option<&str>,
-    fallback_classes: &[String],
-) -> bool {
-    if let Some(primary_class) = primary_class
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        if worker_matches_class(worker, primary_class)
-            || worker_matches_any_class(worker, fallback_classes)
-        {
-            return true;
-        }
-        return false;
-    }
-    if fallback_classes.is_empty() {
-        return true;
-    }
-    worker_matches_any_class(worker, fallback_classes)
-}
-
-fn worker_matches_service_runtime_policy(
-    service: &ResourceEnvelope<ServiceSpec>,
-    worker: &ResourceEnvelope<WorkerSpec>,
-) -> bool {
-    if !worker_matches_service(service, worker) {
-        return false;
-    }
-    if !worker_matches_service_class_policy(
-        worker,
-        service.spec.class_name.as_deref(),
-        &service.spec.fallback_class_names,
-    ) {
-        return false;
-    }
-    true
-}
-
-fn load_workers_for_service(
-    manifest: &ResourceEnvelope<ServiceSpec>,
-    namespace: &str,
-) -> anyhow::Result<Vec<ResourceEnvelope<WorkerSpec>>> {
-    let mut workers = Vec::new();
-    for resource in load_manifests_by_kind(ResourceKind::Worker, Some(namespace))? {
-        let ResourceManifest::Worker(worker) = resource else {
-            continue;
-        };
-        if worker_matches_service_runtime_policy(manifest, &worker) {
-            workers.push(worker);
-        }
-    }
-    Ok(workers)
 }
 
 fn ensure_message_flow_allowed(
@@ -11797,158 +4189,12 @@ fn effective_network_policy_types(spec: &NetworkPolicySpec) -> Vec<NetworkPolicy
     policy_types
 }
 
-fn load_all_manifests(namespace: Option<&str>) -> anyhow::Result<Vec<ResourceManifest>> {
-    let mut manifests = Vec::new();
-    for kind in [
-        ResourceKind::Namespace,
-        ResourceKind::Application,
-        ResourceKind::CronJob,
-        ResourceKind::Job,
-        ResourceKind::Deployment,
-        ResourceKind::ReplicaSet,
-        ResourceKind::Service,
-        ResourceKind::NetworkPolicy,
-        ResourceKind::ConfigMap,
-        ResourceKind::Secret,
-        ResourceKind::Volume,
-        ResourceKind::Worker,
-    ] {
-        manifests.extend(load_manifests_by_kind(kind, namespace)?);
-    }
-    Ok(manifests)
-}
-
-fn load_manifests_by_kind(
-    kind: ResourceKind,
-    namespace: Option<&str>,
-) -> anyhow::Result<Vec<ResourceManifest>> {
-    let root = control_plane_root()?;
-    let mut manifests = Vec::new();
-    match kind {
-        ResourceKind::Namespace => {
-            let dir = root.join("namespaces");
-            if !dir.exists() {
-                return Ok(Vec::new());
-            }
-            for entry in
-                fs::read_dir(&dir).with_context(|| format!("failed to read '{}'", dir.display()))?
-            {
-                let entry = entry?;
-                if entry.file_type()?.is_file() {
-                    manifests.push(load_manifest_from_path(&entry.path())?);
-                }
-            }
-        }
-        _ => {
-            let dir = root.join(kind.directory_name());
-            if !dir.exists() {
-                return Ok(Vec::new());
-            }
-            if let Some(namespace) = namespace {
-                let namespace_dir =
-                    dir.join(normalize_namespaced_resource_namespace(Some(namespace)));
-                if !namespace_dir.exists() {
-                    return Ok(Vec::new());
-                }
-                for entry in fs::read_dir(&namespace_dir)
-                    .with_context(|| format!("failed to read '{}'", namespace_dir.display()))?
-                {
-                    let entry = entry?;
-                    if entry.file_type()?.is_file() {
-                        manifests.push(load_manifest_from_path(&entry.path())?);
-                    }
-                }
-            } else {
-                for namespace_entry in fs::read_dir(&dir)
-                    .with_context(|| format!("failed to read '{}'", dir.display()))?
-                {
-                    let namespace_entry = namespace_entry?;
-                    if !namespace_entry.file_type()?.is_dir() {
-                        continue;
-                    }
-                    for entry in fs::read_dir(namespace_entry.path()).with_context(|| {
-                        format!("failed to read '{}'", namespace_entry.path().display())
-                    })? {
-                        let entry = entry?;
-                        if entry.file_type()?.is_file() {
-                            manifests.push(load_manifest_from_path(&entry.path())?);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(manifests)
-}
-
-fn load_manifest(
-    kind: ResourceKind,
-    name: &str,
-    namespace: Option<&str>,
-) -> anyhow::Result<ResourceManifest> {
-    let path = manifest_path(kind, name, namespace)?;
-    load_manifest_from_path(&path)
-}
-
-fn load_manifest_from_path(path: &Path) -> anyhow::Result<ResourceManifest> {
-    let raw =
-        fs::read_to_string(path).with_context(|| format!("failed to read '{}'", path.display()))?;
-    parse_manifest_documents(&raw)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("manifest '{}' is empty", path.display()))
-}
-
-fn manifest_path(
-    kind: ResourceKind,
-    name: &str,
-    namespace: Option<&str>,
-) -> anyhow::Result<PathBuf> {
-    let root = control_plane_root()?;
-    let filename = format!("{}.yaml", slugify(name));
-    let path = match kind {
-        ResourceKind::Namespace => root.join("namespaces").join(filename),
-        _ => root
-            .join(kind.directory_name())
-            .join(normalize_namespaced_resource_namespace(namespace))
-            .join(filename),
-    };
-    Ok(path)
-}
-
-fn control_plane_root() -> anyhow::Result<PathBuf> {
-    let home = env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".jarvis").join("control-plane"))
-}
-
 fn normalize_namespaced_resource_namespace(namespace: Option<&str>) -> String {
     namespace
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("default")
         .to_string()
-}
-
-fn render_summary_table(summaries: &[ResourceSummary]) -> String {
-    if summaries.is_empty() {
-        return "No control-plane resources found.".to_string();
-    }
-    let mut lines = vec!["KIND\tNAMESPACE\tNAME\tSTATUS\tDETAIL".to_string()];
-    for summary in summaries {
-        lines.push(format!(
-            "{}\t{}\t{}\t{}\t{}",
-            summary.kind,
-            summary.namespace.clone().unwrap_or("-".to_string()),
-            summary.name,
-            summary.status,
-            if summary.detail.is_empty() {
-                "-".to_string()
-            } else {
-                summary.detail.clone()
-            }
-        ));
-    }
-    lines.join("\n")
 }
 
 fn manifest_ref(manifest: &ResourceManifest) -> String {
@@ -11967,6 +4213,65 @@ fn collect_runtime_sessions() -> anyhow::Result<Vec<NativeSessionMetadata>> {
     let mut sessions = collect_native_sessions()?;
     sessions.extend(collect_codex_app_sessions()?);
     enrich_native_sessions(&mut sessions)?;
+    sessions.extend(collect_remote_runtime_sessions()?);
+    Ok(sessions)
+}
+
+fn collect_remote_runtime_sessions() -> anyhow::Result<Vec<NativeSessionMetadata>> {
+    let mut sessions = Vec::new();
+    let nodes = load_manifests_by_kind(ResourceKind::Node, None)?
+        .into_iter()
+        .filter_map(|manifest| match manifest {
+            ResourceManifest::Node(node) if !node_is_local(&node) => Some(node),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    for node in nodes {
+        let Some(target) = node_ssh_target(&node.spec) else {
+            continue;
+        };
+        let output = ProcessCommand::new("ssh")
+            .args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                &target,
+                "jarvisctl list --json",
+            ])
+            .output();
+        let Ok(output) = output else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+            continue;
+        };
+        let mut remote_sessions = if value.is_array() {
+            serde_json::from_value::<Vec<NativeSessionMetadata>>(value).unwrap_or_default()
+        } else {
+            serde_json::from_value::<NativeSessionMetadata>(value)
+                .map(|session| vec![session])
+                .unwrap_or_default()
+        };
+        for session in &mut remote_sessions {
+            let context = session
+                .context
+                .get_or_insert_with(RuntimeContextMetadata::default);
+            context
+                .labels
+                .entry("jarvisctl.io/node".to_string())
+                .or_insert_with(|| node.metadata.name.clone());
+            context
+                .labels
+                .entry("jarvisctl.io/node-address".to_string())
+                .or_insert_with(|| node.spec.address.clone().unwrap_or_default());
+        }
+        sessions.extend(remote_sessions);
+    }
     Ok(sessions)
 }
 
@@ -11978,119 +4283,179 @@ fn load_runtime_session_by_namespace(namespace: &str) -> anyhow::Result<NativeSe
 }
 
 fn delete_runtime_session(session: &NativeSessionMetadata) -> anyhow::Result<()> {
+    if let Some(node_name) = session
+        .context
+        .as_ref()
+        .and_then(|context| context.labels.get("jarvisctl.io/node"))
+    {
+        if let Ok(ResourceManifest::Node(node)) = load_manifest(ResourceKind::Node, node_name, None)
+        {
+            if !node_is_local(&node) {
+                return delete_remote_runtime_session(&node, &session.namespace);
+            }
+        }
+    }
     match session.backend.as_str() {
         "codex-app" => delete_codex_app_session(&session.namespace),
         _ => delete_native_session(&session.namespace),
     }
 }
 
+fn delete_remote_runtime_session(
+    node: &ResourceEnvelope<NodeSpec>,
+    runtime_namespace: &str,
+) -> anyhow::Result<()> {
+    run_remote_runtime_command(
+        node,
+        vec![
+            "jarvisctl".to_string(),
+            "delete".to_string(),
+            "--namespace".to_string(),
+            runtime_namespace.to_string(),
+        ],
+    )?;
+    cleanup_codex_auth_lease_on_remote_node(node, runtime_namespace).with_context(|| {
+        format!(
+            "remote runtime '{}' was deleted, but Codex auth lease cleanup failed on Node '{}'",
+            runtime_namespace, node.metadata.name
+        )
+    })?;
+    Ok(())
+}
+
+fn remote_node_for_runtime_session(
+    runtime_namespace: &str,
+) -> anyhow::Result<Option<ResourceEnvelope<NodeSpec>>> {
+    let Some(session) = collect_remote_runtime_sessions()?
+        .into_iter()
+        .find(|session| session.namespace == runtime_namespace)
+    else {
+        return Ok(None);
+    };
+    let Some(node_name) = session
+        .context
+        .as_ref()
+        .and_then(|context| context.labels.get("jarvisctl.io/node"))
+    else {
+        return Ok(None);
+    };
+    match load_manifest(ResourceKind::Node, node_name, None) {
+        Ok(ResourceManifest::Node(node)) if !node_is_local(&node) => Ok(Some(node)),
+        _ => Ok(None),
+    }
+}
+
+fn run_remote_runtime_command(
+    node: &ResourceEnvelope<NodeSpec>,
+    command: Vec<String>,
+) -> anyhow::Result<()> {
+    let target = node_ssh_target(&node.spec)
+        .ok_or_else(|| anyhow!("Node '{}' has no SSH target", node.metadata.name))?;
+    let remote_command = shell_words::join(command);
+    let output = ProcessCommand::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            &target,
+            &remote_command,
+        ])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to run remote command on Node '{}'",
+                node.metadata.name
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "remote command on Node '{}' failed with status {}: {}",
+            node.metadata.name,
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn run_remote_runtime_command_interactive(
+    node: &ResourceEnvelope<NodeSpec>,
+    command: Vec<String>,
+) -> anyhow::Result<()> {
+    let target = node_ssh_target(&node.spec)
+        .ok_or_else(|| anyhow!("Node '{}' has no SSH target", node.metadata.name))?;
+    let remote_command = shell_words::join(command);
+    let status = ProcessCommand::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            &target,
+            &remote_command,
+        ])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| {
+            format!(
+                "failed to run remote command on Node '{}'",
+                node.metadata.name
+            )
+        })?;
+    if !status.success() {
+        bail!(
+            "remote command on Node '{}' failed with status {}",
+            node.metadata.name,
+            status
+        );
+    }
+    Ok(())
+}
+
 fn parse_specific_kind(kind_arg: ControlPlaneResourceKindArg) -> anyhow::Result<ResourceKind> {
     match kind_arg {
+        ControlPlaneResourceKindArg::Node => Ok(ResourceKind::Node),
         ControlPlaneResourceKindArg::Namespace => Ok(ResourceKind::Namespace),
         ControlPlaneResourceKindArg::Deployment => Ok(ResourceKind::Deployment),
         ControlPlaneResourceKindArg::ReplicaSet => Ok(ResourceKind::ReplicaSet),
-        ControlPlaneResourceKindArg::Job => Ok(ResourceKind::Job),
-        ControlPlaneResourceKindArg::CronJob => Ok(ResourceKind::CronJob),
-        ControlPlaneResourceKindArg::Application => Ok(ResourceKind::Application),
         ControlPlaneResourceKindArg::Service => Ok(ResourceKind::Service),
         ControlPlaneResourceKindArg::NetworkPolicy => Ok(ResourceKind::NetworkPolicy),
         ControlPlaneResourceKindArg::ConfigMap => Ok(ResourceKind::ConfigMap),
         ControlPlaneResourceKindArg::Secret => Ok(ResourceKind::Secret),
         ControlPlaneResourceKindArg::Volume => Ok(ResourceKind::Volume),
-        ControlPlaneResourceKindArg::Worker => Ok(ResourceKind::Worker),
         ControlPlaneResourceKindArg::All => bail!("'all' is not valid for this command"),
     }
-}
-
-fn service_route_state_path(
-    control_namespace: &str,
-    service_name: &str,
-) -> anyhow::Result<PathBuf> {
-    Ok(control_plane_root()?
-        .join("state")
-        .join("services")
-        .join(control_namespace)
-        .join(format!("{}.json", slugify(service_name))))
-}
-
-fn load_service_route_state(
-    control_namespace: &str,
-    service_name: &str,
-) -> anyhow::Result<ServiceRouteState> {
-    let path = service_route_state_path(control_namespace, service_name)?;
-    if !path.exists() {
-        return Ok(ServiceRouteState::default());
-    }
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read '{}'", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| format!("failed to parse '{}'", path.display()))
-}
-
-fn save_service_route_state(
-    control_namespace: &str,
-    service_name: &str,
-    state: &ServiceRouteState,
-) -> anyhow::Result<()> {
-    let path = service_route_state_path(control_namespace, service_name)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create '{}'", parent.display()))?;
-    }
-    let raw =
-        serde_json::to_string_pretty(state).context("failed to encode service route state")?;
-    atomic_write_string(&path, &raw)
 }
 
 impl ResourceKind {
     fn directory_name(self) -> &'static str {
         match self {
+            ResourceKind::Node => "nodes",
             ResourceKind::Namespace => "namespaces",
             ResourceKind::Deployment => "deployments",
             ResourceKind::ReplicaSet => "replicasets",
-            ResourceKind::Job => "jobs",
-            ResourceKind::CronJob => "cronjobs",
-            ResourceKind::Application => "applications",
             ResourceKind::Service => "services",
             ResourceKind::NetworkPolicy => "networkpolicies",
             ResourceKind::ConfigMap => "configmaps",
             ResourceKind::Secret => "secrets",
             ResourceKind::Volume => "volumes",
-            ResourceKind::Worker => "workers",
         }
     }
 
     fn display_name(self) -> &'static str {
         match self {
+            ResourceKind::Node => "Node",
             ResourceKind::Namespace => "Namespace",
             ResourceKind::Deployment => "Deployment",
             ResourceKind::ReplicaSet => "ReplicaSet",
-            ResourceKind::Job => "Job",
-            ResourceKind::CronJob => "CronJob",
-            ResourceKind::Application => "Application",
             ResourceKind::Service => "Service",
             ResourceKind::NetworkPolicy => "NetworkPolicy",
             ResourceKind::ConfigMap => "ConfigMap",
             ResourceKind::Secret => "Secret",
             ResourceKind::Volume => "Volume",
-            ResourceKind::Worker => "Worker",
-        }
-    }
-
-    fn from_manifest_kind(kind: &str) -> anyhow::Result<Self> {
-        match kind {
-            "Namespace" => Ok(ResourceKind::Namespace),
-            "Deployment" => Ok(ResourceKind::Deployment),
-            "ReplicaSet" => Ok(ResourceKind::ReplicaSet),
-            "Job" => Ok(ResourceKind::Job),
-            "CronJob" => Ok(ResourceKind::CronJob),
-            "Application" => Ok(ResourceKind::Application),
-            "Service" => Ok(ResourceKind::Service),
-            "NetworkPolicy" => Ok(ResourceKind::NetworkPolicy),
-            "ConfigMap" => Ok(ResourceKind::ConfigMap),
-            "Secret" => Ok(ResourceKind::Secret),
-            "Volume" => Ok(ResourceKind::Volume),
-            "Worker" => Ok(ResourceKind::Worker),
-            other => bail!("unsupported manifest kind '{}'", other),
         }
     }
 }
@@ -12098,69 +4463,57 @@ impl ResourceKind {
 impl ResourceManifest {
     fn kind(&self) -> ResourceKind {
         match self {
+            ResourceManifest::Node(_) => ResourceKind::Node,
             ResourceManifest::Namespace(_) => ResourceKind::Namespace,
             ResourceManifest::Deployment(_) => ResourceKind::Deployment,
             ResourceManifest::ReplicaSet(_) => ResourceKind::ReplicaSet,
-            ResourceManifest::Job(_) => ResourceKind::Job,
-            ResourceManifest::CronJob(_) => ResourceKind::CronJob,
-            ResourceManifest::Application(_) => ResourceKind::Application,
             ResourceManifest::Service(_) => ResourceKind::Service,
             ResourceManifest::NetworkPolicy(_) => ResourceKind::NetworkPolicy,
             ResourceManifest::ConfigMap(_) => ResourceKind::ConfigMap,
             ResourceManifest::Secret(_) => ResourceKind::Secret,
             ResourceManifest::Volume(_) => ResourceKind::Volume,
-            ResourceManifest::Worker(_) => ResourceKind::Worker,
         }
     }
 
     fn name(&self) -> &str {
         match self {
+            ResourceManifest::Node(manifest) => &manifest.metadata.name,
             ResourceManifest::Namespace(manifest) => &manifest.metadata.name,
             ResourceManifest::Deployment(manifest) => &manifest.metadata.name,
             ResourceManifest::ReplicaSet(manifest) => &manifest.metadata.name,
-            ResourceManifest::Job(manifest) => &manifest.metadata.name,
-            ResourceManifest::CronJob(manifest) => &manifest.metadata.name,
-            ResourceManifest::Application(manifest) => &manifest.metadata.name,
             ResourceManifest::Service(manifest) => &manifest.metadata.name,
             ResourceManifest::NetworkPolicy(manifest) => &manifest.metadata.name,
             ResourceManifest::ConfigMap(manifest) => &manifest.metadata.name,
             ResourceManifest::Secret(manifest) => &manifest.metadata.name,
             ResourceManifest::Volume(manifest) => &manifest.metadata.name,
-            ResourceManifest::Worker(manifest) => &manifest.metadata.name,
         }
     }
 
     fn namespace(&self) -> Option<&str> {
         match self {
+            ResourceManifest::Node(_) => None,
             ResourceManifest::Namespace(_) => None,
             ResourceManifest::Deployment(manifest) => manifest.metadata.namespace.as_deref(),
             ResourceManifest::ReplicaSet(manifest) => manifest.metadata.namespace.as_deref(),
-            ResourceManifest::Job(manifest) => manifest.metadata.namespace.as_deref(),
-            ResourceManifest::CronJob(manifest) => manifest.metadata.namespace.as_deref(),
-            ResourceManifest::Application(manifest) => manifest.metadata.namespace.as_deref(),
             ResourceManifest::Service(manifest) => manifest.metadata.namespace.as_deref(),
             ResourceManifest::NetworkPolicy(manifest) => manifest.metadata.namespace.as_deref(),
             ResourceManifest::ConfigMap(manifest) => manifest.metadata.namespace.as_deref(),
             ResourceManifest::Secret(manifest) => manifest.metadata.namespace.as_deref(),
             ResourceManifest::Volume(manifest) => manifest.metadata.namespace.as_deref(),
-            ResourceManifest::Worker(manifest) => manifest.metadata.namespace.as_deref(),
         }
     }
 
     fn metadata_mut(&mut self) -> &mut ResourceMetadata {
         match self {
+            ResourceManifest::Node(manifest) => &mut manifest.metadata,
             ResourceManifest::Namespace(manifest) => &mut manifest.metadata,
             ResourceManifest::Deployment(manifest) => &mut manifest.metadata,
             ResourceManifest::ReplicaSet(manifest) => &mut manifest.metadata,
-            ResourceManifest::Job(manifest) => &mut manifest.metadata,
-            ResourceManifest::CronJob(manifest) => &mut manifest.metadata,
-            ResourceManifest::Application(manifest) => &mut manifest.metadata,
             ResourceManifest::Service(manifest) => &mut manifest.metadata,
             ResourceManifest::NetworkPolicy(manifest) => &mut manifest.metadata,
             ResourceManifest::ConfigMap(manifest) => &mut manifest.metadata,
             ResourceManifest::Secret(manifest) => &mut manifest.metadata,
             ResourceManifest::Volume(manifest) => &mut manifest.metadata,
-            ResourceManifest::Worker(manifest) => &mut manifest.metadata,
         }
     }
 }
@@ -12181,32 +4534,8 @@ fn default_progress_deadline_seconds() -> u64 {
     600
 }
 
-fn default_parallelism() -> usize {
-    1
-}
-
-fn default_completions() -> usize {
-    1
-}
-
-fn default_backoff_limit() -> usize {
-    1
-}
-
-fn default_successful_jobs_history_limit() -> usize {
-    3
-}
-
-fn default_failed_jobs_history_limit() -> usize {
-    1
-}
-
-fn default_application_history_limit() -> usize {
-    10
-}
-
-fn default_true() -> bool {
-    true
+fn short_revision(revision: &str) -> String {
+    revision.chars().take(12).collect()
 }
 
 fn now_epoch_ms() -> u128 {
@@ -12217,9 +4546,6 @@ fn now_epoch_ms() -> u128 {
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::sync::mpsc::Receiver;
     use std::sync::{Mutex, OnceLock};
 
     fn home_env_lock() -> &'static Mutex<()> {
@@ -12261,1255 +4587,11 @@ mod tests {
         }
     }
 
-    struct TempEnvVarGuard {
-        key: &'static str,
-        original_value: Option<OsString>,
-    }
-
-    impl TempEnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let original_value = env::var_os(key);
-            unsafe {
-                env::set_var(key, value);
-            }
-            Self {
-                key,
-                original_value,
-            }
-        }
-    }
-
-    impl Drop for TempEnvVarGuard {
-        fn drop(&mut self) {
-            match &self.original_value {
-                Some(value) => unsafe {
-                    env::set_var(self.key, value);
-                },
-                None => unsafe {
-                    env::remove_var(self.key);
-                },
-            }
-        }
-    }
-
     fn write_text_file(path: &Path, contents: &str) {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, contents).unwrap();
-    }
-
-    fn spawn_json_response_server(
-        response_body: serde_json::Value,
-    ) -> (String, Receiver<String>, std::thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = format!("http://{}", listener.local_addr().unwrap());
-        let (tx, rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut received = Vec::new();
-            let mut buffer = [0_u8; 4096];
-            let mut header_end = None;
-            let mut content_length = 0_usize;
-
-            loop {
-                let read = stream.read(&mut buffer).unwrap();
-                if read == 0 {
-                    break;
-                }
-                received.extend_from_slice(&buffer[..read]);
-                if header_end.is_none() {
-                    header_end = received
-                        .windows(4)
-                        .position(|window| window == b"\r\n\r\n")
-                        .map(|index| index + 4);
-                    if let Some(end) = header_end {
-                        let headers = String::from_utf8_lossy(&received[..end]);
-                        content_length = headers
-                            .lines()
-                            .find_map(|line| {
-                                let (name, value) = line.split_once(':')?;
-                                (name.eq_ignore_ascii_case("content-length"))
-                                    .then(|| value.trim().parse::<usize>().ok())
-                                    .flatten()
-                            })
-                            .unwrap_or(0);
-                    }
-                }
-                if let Some(end) = header_end {
-                    if received.len() >= end + content_length {
-                        break;
-                    }
-                }
-            }
-
-            tx.send(String::from_utf8_lossy(&received).into_owned())
-                .unwrap();
-
-            let body = serde_json::to_string(&response_body).unwrap();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-            stream.flush().unwrap();
-        });
-        (address, rx, handle)
-    }
-
-    #[test]
-    fn parse_worker_manifest_normalizes_namespace_and_defaults_provider() {
-        let manifests = parse_manifest_documents(
-            r#"apiVersion: jarvisctl.io/v1alpha1
-kind: Worker
-metadata:
-  name: qwen-junior
-spec:
-  model: qwen3:8b
-"#,
-        )
-        .unwrap();
-
-        let ResourceManifest::Worker(worker) = &manifests[0] else {
-            panic!("expected worker manifest");
-        };
-
-        assert_eq!(worker.metadata.namespace.as_deref(), Some("default"));
-        assert_eq!(worker.spec.model, "qwen3:8b");
-        assert!(matches!(worker.spec.provider, WorkerProvider::Ollama));
-        assert!(worker.spec.output_mode.is_none());
-    }
-
-    #[test]
-    fn parse_worker_backed_job_manifest_without_task_note() {
-        let manifests = parse_manifest_documents(
-            r#"apiVersion: jarvisctl.io/v1alpha1
-kind: Job
-metadata:
-  name: summarize-docs
-spec:
-  parallelism: 1
-  completions: 1
-  worker:
-    name: qwen-junior
-    prompt: Return strict JSON only.
-"#,
-        )
-        .unwrap();
-
-        let ResourceManifest::Job(job) = &manifests[0] else {
-            panic!("expected job manifest");
-        };
-
-        let worker = job.spec.worker.as_ref().expect("worker spec should exist");
-        assert_eq!(worker.name.as_deref(), Some("qwen-junior"));
-        assert_eq!(worker.prompt, "Return strict JSON only.");
-        assert!(job.spec.template.task_note.is_empty());
-    }
-
-    #[test]
-    fn worker_backed_job_rejects_missing_prompt() {
-        let error = parse_manifest_documents(
-            r#"apiVersion: jarvisctl.io/v1alpha1
-kind: Job
-metadata:
-  name: summarize-docs
-spec:
-  worker:
-    name: qwen-junior
-    prompt: ""
-"#,
-        )
-        .expect_err("expected validation failure");
-        assert!(error.to_string().contains("spec.worker.prompt"));
-    }
-
-    #[test]
-    fn kubernetes_cron_parser_accepts_five_field_syntax() {
-        assert!(parse_kubernetes_cron_schedule("* * * * *").is_ok());
-        assert!(parse_kubernetes_cron_schedule("@hourly").is_ok());
-    }
-
-    #[test]
-    fn merge_yaml_deep_merges_mappings() {
-        let mut target: Value = serde_yaml::from_str(
-            r#"
-spec:
-  template:
-    labels:
-      app: demo
-"#,
-        )
-        .unwrap();
-        let patch: Value = serde_yaml::from_str(
-            r#"
-spec:
-  template:
-    labels:
-      tier: backend
-"#,
-        )
-        .unwrap();
-
-        merge_yaml(&mut target, &patch);
-
-        let labels = target
-            .get("spec")
-            .and_then(|value| value.get("template"))
-            .and_then(|value| value.get("labels"))
-            .and_then(Value::as_mapping)
-            .unwrap();
-        assert_eq!(
-            labels.get(Value::from("app")).and_then(Value::as_str),
-            Some("demo")
-        );
-        assert_eq!(
-            labels.get(Value::from("tier")).and_then(Value::as_str),
-            Some("backend")
-        );
-    }
-
-    #[test]
-    fn job_run_phase_keeps_recently_active_runs_pending_without_completion_record() {
-        let phase = job_run_phase(None, None, JobRunPhase::Active, 1_000, 1_000 + 1_000);
-        assert_eq!(phase, JobRunPhase::Active);
-    }
-
-    #[test]
-    fn job_run_phase_fails_stale_active_runs_without_completion_record() {
-        let phase = job_run_phase(
-            None,
-            None,
-            JobRunPhase::Active,
-            1_000,
-            1_000 + JOB_COMPLETION_GRACE_MS,
-        );
-        assert_eq!(phase, JobRunPhase::Failed);
-    }
-
-    #[test]
-    fn job_run_phase_succeeds_from_zero_exit_completion_record() {
-        let completion = NativeSessionCompletion {
-            namespace: "job-demo--run0".to_string(),
-            created_at_epoch_ms: 2_000,
-            agents: vec![crate::native::NativeAgentCompletion {
-                name: "agent0".to_string(),
-                exit_code: Some(0),
-            }],
-        };
-
-        let phase = job_run_phase(None, Some(&completion), JobRunPhase::Active, 1_000, 2_000);
-        assert_eq!(phase, JobRunPhase::Succeeded);
-    }
-
-    #[test]
-    fn worker_run_launch_needs_recovery_for_stale_active_manifest() {
-        let run = JobRunState {
-            name: "run-0".to_string(),
-            runtime_namespace: "workers-lab--recover-demo--j0".to_string(),
-            created_at_epoch_ms: 1_000,
-            backend: JobRunBackend::Worker,
-            worker_name: Some("qwen-junior".to_string()),
-            worker_namespace: Some("workers-lab".to_string()),
-            service_name: None,
-            intent: None,
-            selected_class: None,
-            fallback_class: false,
-            worker_locality: Some(WorkerLocality::Remote),
-            admission_state: Some(JobRunAdmissionState::Granted),
-            admission_code: Some(WorkerAdmissionCode::Ready),
-            validation_state: None,
-            validation_message: None,
-            validation_enforced: false,
-            admission_reason: Some("admitted".to_string()),
-            last_active_epoch_ms: Some(1_000),
-            completed_at_epoch_ms: None,
-            artifact_path: None,
-            output_path: None,
-            last_error: None,
-            status: JobRunPhase::Active,
-        };
-
-        assert!(worker_run_launch_needs_recovery(
-            &run,
-            true,
-            1_000 + WORKER_RUN_STARTUP_GRACE_MS
-        ));
-        assert!(!worker_run_launch_needs_recovery(&run, false, 9_999));
-        assert!(!worker_run_launch_needs_recovery(&run, true, 1_000 + 1_000));
-    }
-
-    #[test]
-    fn job_status_includes_structured_worker_run_details() {
-        save_manifest(&ResourceManifest::Worker(ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Worker".to_string(),
-            metadata: ResourceMetadata {
-                name: "qwen-junior".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: WorkerSpec {
-                provider: WorkerProvider::Ollama,
-                model: "qwen3:8b".to_string(),
-                locality: Some(WorkerLocality::Local),
-                ..WorkerSpec::default()
-            },
-        }))
-        .unwrap();
-
-        let manifest = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Job".to_string(),
-            metadata: ResourceMetadata {
-                name: "summarize-docs".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: JobSpec {
-                worker: Some(WorkerJobSpec {
-                    name: Some("qwen-junior".to_string()),
-                    prompt: "Return strict JSON only.".to_string(),
-                    timeout_seconds: Some(30),
-                    output_path: Some("/tmp/worker-job.out".to_string()),
-                    ..WorkerJobSpec::default()
-                }),
-                ..JobSpec::default()
-            },
-        };
-        let state = JobControllerState {
-            runs: vec![JobRunState {
-                name: "run-0".to_string(),
-                runtime_namespace: "workers-lab--summarize-docs--j0".to_string(),
-                created_at_epoch_ms: 1_000,
-                backend: JobRunBackend::Worker,
-                worker_name: Some("qwen-junior".to_string()),
-                worker_namespace: Some("workers-lab".to_string()),
-                service_name: Some("junior-svc".to_string()),
-                intent: Some("task_offload".to_string()),
-                selected_class: Some("junior-code".to_string()),
-                fallback_class: true,
-                worker_locality: Some(WorkerLocality::Local),
-                admission_state: Some(JobRunAdmissionState::Granted),
-                admission_code: Some(WorkerAdmissionCode::Ready),
-                validation_state: Some(WorkerRunValidationState::Passed),
-                validation_message: Some("validation passed".to_string()),
-                validation_enforced: true,
-                admission_reason: Some("admitted on local worker 'qwen-junior'".to_string()),
-                last_active_epoch_ms: Some(1_000),
-                completed_at_epoch_ms: Some(2_000),
-                artifact_path: Some("/tmp/worker-job-artifact.out".to_string()),
-                output_path: Some("/tmp/worker-job.out".to_string()),
-                last_error: None,
-                status: JobRunPhase::Succeeded,
-            }],
-        };
-
-        let status = job_status_from_state(&manifest, &state);
-        assert_eq!(status.succeeded, 1);
-        assert_eq!(status.run_details.len(), 1);
-        assert_eq!(status.run_details[0].backend, "worker");
-        assert_eq!(status.run_details[0].worker.as_deref(), Some("qwen-junior"));
-        assert_eq!(
-            status.run_details[0].worker_provider.as_deref(),
-            Some("ollama")
-        );
-        assert_eq!(
-            status.run_details[0].worker_model.as_deref(),
-            Some("qwen3:8b")
-        );
-        assert_eq!(
-            status.run_details[0].service_name.as_deref(),
-            Some("junior-svc")
-        );
-        assert_eq!(
-            status.run_details[0].intent.as_deref(),
-            Some("task_offload")
-        );
-        assert_eq!(
-            status.run_details[0].selected_class.as_deref(),
-            Some("junior-code")
-        );
-        assert!(status.run_details[0].fallback_class);
-        assert_eq!(
-            status.run_details[0].validation_state.as_deref(),
-            Some("passed")
-        );
-        assert_eq!(
-            status.run_details[0].validation_message.as_deref(),
-            Some("validation passed")
-        );
-        assert!(status.run_details[0].validation_enforced);
-        assert_eq!(
-            status.run_details[0].worker_locality.as_deref(),
-            Some("local")
-        );
-        assert_eq!(
-            status.run_details[0].admission_code.as_deref(),
-            Some("ready")
-        );
-        assert!(!status.run_details[0].events.is_empty());
-        assert_eq!(status.conditions.len(), 3);
-        assert!(!status.events.is_empty());
-        assert_eq!(
-            status.run_details[0].artifact_path.as_deref(),
-            Some("/tmp/worker-job-artifact.out")
-        );
-    }
-
-    #[test]
-    fn cron_job_status_includes_history_conditions_and_events() {
-        let _lock = home_env_lock().lock().unwrap();
-        let _home = TempHomeGuard::new("jarvisctl-cronjob-status-history");
-
-        let manifest = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "CronJob".to_string(),
-            metadata: ResourceMetadata {
-                name: "hourly-worker".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: CronJobSpec {
-                schedule: "* * * * *".to_string(),
-                job_template: JobTemplateSpec {
-                    spec: JobSpec {
-                        worker: Some(WorkerJobSpec {
-                            name: Some("qwen-junior".to_string()),
-                            prompt: "Return strict JSON only.".to_string(),
-                            ..WorkerJobSpec::default()
-                        }),
-                        ..JobSpec::default()
-                    },
-                },
-                ..CronJobSpec::default()
-            },
-        };
-        let child_job_name = "hourly-worker-1700000000".to_string();
-        let child_job = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Job".to_string(),
-            metadata: ResourceMetadata {
-                name: child_job_name.clone(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::from([(
-                    "jarvisctl.io/cronjob".to_string(),
-                    "hourly-worker".to_string(),
-                )]),
-                annotations: BTreeMap::new(),
-            },
-            spec: JobSpec {
-                worker: Some(WorkerJobSpec {
-                    name: Some("qwen-junior".to_string()),
-                    prompt: "Return strict JSON only.".to_string(),
-                    ..WorkerJobSpec::default()
-                }),
-                ..JobSpec::default()
-            },
-        };
-        save_manifest(&ResourceManifest::Job(child_job)).unwrap();
-        save_job_controller_state(
-            "workers-lab",
-            &child_job_name,
-            &JobControllerState {
-                runs: vec![JobRunState {
-                    name: "run-0".to_string(),
-                    runtime_namespace: "workers-lab--hourly-worker--j0".to_string(),
-                    created_at_epoch_ms: 1_700_000_000_000,
-                    backend: JobRunBackend::Worker,
-                    worker_name: Some("qwen-junior".to_string()),
-                    worker_namespace: Some("workers-lab".to_string()),
-                    service_name: None,
-                    intent: None,
-                    selected_class: None,
-                    fallback_class: false,
-                    worker_locality: None,
-                    admission_state: Some(JobRunAdmissionState::Granted),
-                    admission_code: Some(WorkerAdmissionCode::Ready),
-                    validation_state: Some(WorkerRunValidationState::Passed),
-                    validation_message: Some("validation passed".to_string()),
-                    validation_enforced: false,
-                    admission_reason: Some("admitted on local worker 'qwen-junior'".to_string()),
-                    last_active_epoch_ms: Some(1_700_000_000_100),
-                    completed_at_epoch_ms: Some(1_700_000_000_200),
-                    artifact_path: Some("/tmp/hourly-worker.out".to_string()),
-                    output_path: None,
-                    last_error: None,
-                    status: JobRunPhase::Succeeded,
-                }],
-            },
-        )
-        .unwrap();
-        save_cron_job_controller_state(
-            "workers-lab",
-            "hourly-worker",
-            &CronJobControllerState {
-                last_schedule_epoch_ms: Some(1_700_000_000_000),
-                jobs: vec![child_job_name],
-            },
-        )
-        .unwrap();
-
-        let status = cron_job_status(&manifest).unwrap();
-        assert_eq!(status.successful_jobs, 1);
-        assert_eq!(status.failed_jobs, 0);
-        assert_eq!(status.history.len(), 1);
-        assert_eq!(status.history[0].phase, "succeeded");
-        assert!(status.history[0].worker_backed);
-        assert_eq!(status.history[0].workers, vec!["qwen-junior".to_string()]);
-        assert_eq!(status.conditions.len(), 3);
-        assert!(!status.events.is_empty());
-    }
-
-    #[test]
-    fn worker_status_reports_memory_pressure_for_local_worker() {
-        let _lock = home_env_lock().lock().unwrap();
-        let _home = TempHomeGuard::new("jarvisctl-worker-status-memory");
-        let _memory = TempEnvVarGuard::set("JARVISCTL_TEST_AVAILABLE_MEMORY_MIB", "512");
-
-        let manifest = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Worker".to_string(),
-            metadata: ResourceMetadata {
-                name: "qwen-junior".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: WorkerSpec {
-                model: "qwen3:8b".to_string(),
-                locality: Some(WorkerLocality::Local),
-                memory_mib: Some(1024),
-                ..WorkerSpec::default()
-            },
-        };
-
-        let evaluation =
-            evaluate_worker_admission(&manifest, "workers-lab", None, &machine_capacity_snapshot())
-                .unwrap();
-
-        assert_eq!(
-            evaluation.admission_code,
-            WorkerAdmissionCode::MemoryPressure
-        );
-        assert_eq!(evaluation.machine_memory_available_mib, Some(512));
-        assert_eq!(evaluation.estimated_memory_mib, Some(1024));
-    }
-
-    #[test]
-    fn worker_status_reports_missing_credentials_for_nvidia_worker() {
-        let _lock = home_env_lock().lock().unwrap();
-        let _home = TempHomeGuard::new("jarvisctl-worker-status-nvidia-creds");
-        let _api_key = TempEnvVarGuard::set("NVIDIA_API_KEY", "");
-
-        let manifest = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Worker".to_string(),
-            metadata: ResourceMetadata {
-                name: "nemotron-mini".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: WorkerSpec {
-                provider: WorkerProvider::Nvidia,
-                model: "nvidia/nemotron-mini-4b-instruct".to_string(),
-                ..WorkerSpec::default()
-            },
-        };
-
-        let status = worker_status(&manifest).unwrap();
-        assert_eq!(status.provider, "nvidia");
-        assert_eq!(status.admission, "credentials-missing");
-        assert_eq!(status.admission_code, "credentials_missing");
-        assert!(status.admission_reason.contains("NVIDIA_API_KEY"));
-    }
-
-    #[test]
-    fn worker_status_reports_missing_credentials_for_moonshot_worker() {
-        let _lock = home_env_lock().lock().unwrap();
-        let _home = TempHomeGuard::new("jarvisctl-worker-status-moonshot-creds");
-        let _api_key = TempEnvVarGuard::set("MOONSHOT_API_KEY", "");
-
-        let manifest = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Worker".to_string(),
-            metadata: ResourceMetadata {
-                name: "kimi-junior".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: WorkerSpec {
-                provider: WorkerProvider::Moonshot,
-                model: "moonshotai/kimi-k2-instruct".to_string(),
-                ..WorkerSpec::default()
-            },
-        };
-
-        let status = worker_status(&manifest).unwrap();
-        assert_eq!(status.provider, "moonshot");
-        assert_eq!(
-            status.endpoint,
-            "https://api.moonshot.cn/v1/chat/completions"
-        );
-        assert_eq!(status.admission, "credentials-missing");
-        assert_eq!(status.admission_code, "credentials_missing");
-        assert!(status.admission_reason.contains("MOONSHOT_API_KEY"));
-    }
-
-    #[test]
-    fn worker_status_accepts_secret_backed_nvidia_credentials() {
-        let _lock = home_env_lock().lock().unwrap();
-        let _home = TempHomeGuard::new("jarvisctl-worker-status-nvidia-secret-creds");
-        let _api_key = TempEnvVarGuard::set("NVIDIA_API_KEY", "");
-
-        save_manifest(&ResourceManifest::Secret(ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Secret".to_string(),
-            metadata: ResourceMetadata {
-                name: "nvidia-creds".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: SecretSpec {
-                string_data: BTreeMap::from([(
-                    "apiKey".to_string(),
-                    "test-secret-token".to_string(),
-                )]),
-                access_policy: ResourceAccessPolicy::default(),
-            },
-        }))
-        .unwrap();
-
-        let manifest = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Worker".to_string(),
-            metadata: ResourceMetadata {
-                name: "nemotron-secret".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: WorkerSpec {
-                provider: WorkerProvider::Nvidia,
-                model: "nvidia/nemotron-mini-4b-instruct".to_string(),
-                api_key_secret_ref: Some(SecretKeyRef {
-                    name: "nvidia-creds".to_string(),
-                    key: "apiKey".to_string(),
-                    namespace: None,
-                }),
-                ..WorkerSpec::default()
-            },
-        };
-
-        let status = worker_status(&manifest).unwrap();
-        assert_eq!(status.admission_code, "ready");
-        assert!(!status.admission_reason.contains("credentials"));
-    }
-
-    #[test]
-    fn invoke_worker_supports_nvidia_openai_compatible_endpoint() {
-        let _lock = home_env_lock().lock().unwrap();
-        let _home = TempHomeGuard::new("jarvisctl-worker-nvidia-invoke");
-        let _api_key = TempEnvVarGuard::set("NVIDIA_API_KEY", "test-nvidia-token");
-        let (endpoint, rx, handle) = spawn_json_response_server(json!({
-            "choices": [
-                {
-                    "message": {
-                        "content": "{\"result\":\"ok\",\"lane\":\"routing\"}"
-                    }
-                }
-            ]
-        }));
-
-        let worker = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Worker".to_string(),
-            metadata: ResourceMetadata {
-                name: "nemotron-mini".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: WorkerSpec {
-                provider: WorkerProvider::Nvidia,
-                model: "nvidia/nemotron-mini-4b-instruct".to_string(),
-                endpoint: Some(format!("{}/v1", endpoint)),
-                output_mode: Some(WorkerOutputMode::Json),
-                temperature: Some(0.2),
-                top_p: Some(0.7),
-                num_predict: Some(64),
-                ..WorkerSpec::default()
-            },
-        };
-        save_manifest(&ResourceManifest::Worker(worker)).unwrap();
-
-        let output = invoke_worker(
-            "nemotron-mini",
-            Some("workers-lab"),
-            "Return strict JSON with keys result and lane.",
-        )
-        .unwrap();
-        let request = rx.recv().unwrap();
-        handle.join().unwrap();
-        let request_lower = request.to_lowercase();
-        let request_body = request
-            .split("\r\n\r\n")
-            .nth(1)
-            .expect("request body is present");
-        let request_json: serde_json::Value = serde_json::from_str(request_body).unwrap();
-
-        assert_eq!(
-            output,
-            "{\n  \"lane\": \"routing\",\n  \"result\": \"ok\"\n}"
-        );
-        assert!(
-            request.contains("POST /v1/chat/completions HTTP/1.1"),
-            "{request}"
-        );
-        assert!(
-            request_lower.contains("authorization: bearer test-nvidia-token"),
-            "{request}"
-        );
-        assert_eq!(
-            request_json
-                .get("model")
-                .and_then(serde_json::Value::as_str),
-            Some("nvidia/nemotron-mini-4b-instruct")
-        );
-        assert_eq!(
-            request_json
-                .get("stream")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-        assert_eq!(
-            request_json
-                .get("max_tokens")
-                .and_then(serde_json::Value::as_u64),
-            Some(64)
-        );
-        assert!(request_json.get("top_p").is_some());
-        assert_eq!(
-            request_json
-                .get("messages")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|messages| messages.first())
-                .and_then(|message| message.get("role"))
-                .and_then(serde_json::Value::as_str),
-            Some("system")
-        );
-    }
-
-    #[test]
-    fn invoke_worker_supports_secret_backed_nvidia_credentials() {
-        let _lock = home_env_lock().lock().unwrap();
-        let _home = TempHomeGuard::new("jarvisctl-worker-nvidia-secret-invoke");
-        let _api_key = TempEnvVarGuard::set("NVIDIA_API_KEY", "");
-
-        save_manifest(&ResourceManifest::Secret(ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Secret".to_string(),
-            metadata: ResourceMetadata {
-                name: "nvidia-creds".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: SecretSpec {
-                string_data: BTreeMap::from([(
-                    "apiKey".to_string(),
-                    "test-secret-token".to_string(),
-                )]),
-                access_policy: ResourceAccessPolicy::default(),
-            },
-        }))
-        .unwrap();
-
-        let (endpoint, rx, handle) = spawn_json_response_server(json!({
-            "choices": [
-                {
-                    "message": {
-                        "content": "{\"result\":\"ok\",\"lane\":\"routing\"}"
-                    }
-                }
-            ]
-        }));
-
-        save_manifest(&ResourceManifest::Worker(ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Worker".to_string(),
-            metadata: ResourceMetadata {
-                name: "nemotron-secret".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: WorkerSpec {
-                provider: WorkerProvider::Nvidia,
-                model: "nvidia/nemotron-mini-4b-instruct".to_string(),
-                endpoint: Some(format!("{}/v1", endpoint)),
-                api_key_secret_ref: Some(SecretKeyRef {
-                    name: "nvidia-creds".to_string(),
-                    key: "apiKey".to_string(),
-                    namespace: None,
-                }),
-                output_mode: Some(WorkerOutputMode::Json),
-                ..WorkerSpec::default()
-            },
-        }))
-        .unwrap();
-
-        let output = invoke_worker(
-            "nemotron-secret",
-            Some("workers-lab"),
-            "Return strict JSON with keys result and lane.",
-        )
-        .unwrap();
-        let request = rx.recv().unwrap();
-        handle.join().unwrap();
-
-        assert_eq!(
-            output,
-            "{\n  \"lane\": \"routing\",\n  \"result\": \"ok\"\n}"
-        );
-        assert!(
-            request
-                .to_lowercase()
-                .contains("authorization: bearer test-secret-token"),
-            "{request}"
-        );
-    }
-
-    #[test]
-    fn worker_selection_prefers_remote_when_local_is_blocked_by_memory_pressure() {
-        let _lock = home_env_lock().lock().unwrap();
-        let _home = TempHomeGuard::new("jarvisctl-worker-remote-fallback");
-        let _memory = TempEnvVarGuard::set("JARVISCTL_TEST_AVAILABLE_MEMORY_MIB", "512");
-
-        let local_worker = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Worker".to_string(),
-            metadata: ResourceMetadata {
-                name: "local-junior".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::from([("lane".to_string(), "junior".to_string())]),
-                annotations: BTreeMap::new(),
-            },
-            spec: WorkerSpec {
-                model: "qwen3:8b".to_string(),
-                locality: Some(WorkerLocality::Local),
-                capabilities: vec!["vault".to_string()],
-                max_concurrent: Some(1),
-                memory_mib: Some(1024),
-                ..WorkerSpec::default()
-            },
-        };
-        let remote_worker = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Worker".to_string(),
-            metadata: ResourceMetadata {
-                name: "remote-junior".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::from([("lane".to_string(), "junior".to_string())]),
-                annotations: BTreeMap::new(),
-            },
-            spec: WorkerSpec {
-                model: "qwen3:8b".to_string(),
-                endpoint: Some("http://127.0.0.1:18081".to_string()),
-                locality: Some(WorkerLocality::Remote),
-                capabilities: vec!["vault".to_string()],
-                max_concurrent: Some(1),
-                ..WorkerSpec::default()
-            },
-        };
-        save_manifest(&ResourceManifest::Worker(local_worker)).unwrap();
-        save_manifest(&ResourceManifest::Worker(remote_worker)).unwrap();
-
-        let job = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Job".to_string(),
-            metadata: ResourceMetadata {
-                name: "summarize-docs".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: JobSpec {
-                worker: Some(WorkerJobSpec {
-                    selector: Some(LabelSelector {
-                        match_labels: BTreeMap::from([("lane".to_string(), "junior".to_string())]),
-                    }),
-                    required_capabilities: vec!["vault".to_string()],
-                    prefer_local: true,
-                    prompt: "Return strict JSON only.".to_string(),
-                    ..WorkerJobSpec::default()
-                }),
-                ..JobSpec::default()
-            },
-        };
-
-        let selection = select_worker_for_job_run(&job, &JobControllerState::default()).unwrap();
-        assert_eq!(selection.name.as_deref(), Some("remote-junior"));
-        assert_eq!(selection.namespace.as_deref(), Some("workers-lab"));
-        assert_eq!(
-            selection.admission_code,
-            WorkerAdmissionCode::RemoteFallback
-        );
-        assert!(
-            selection
-                .reason
-                .contains("preferred local workers are not admissible"),
-            "{}",
-            selection.reason
-        );
-        assert!(
-            selection.reason.contains("requires 1024 MiB RAM"),
-            "{}",
-            selection.reason
-        );
-    }
-
-    #[test]
-    fn worker_selection_uses_service_class_fallback_and_pool_balance() {
-        let _lock = home_env_lock().lock().unwrap();
-        let _home = TempHomeGuard::new("jarvisctl-worker-service-class-fallback");
-
-        let service = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Service".to_string(),
-            metadata: ResourceMetadata {
-                name: "junior-svc".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: ServiceSpec {
-                selector: BTreeMap::from([("lane".to_string(), "junior".to_string())]),
-                target_kind: Some(ServiceTargetKind::Worker),
-                class_name: Some("junior-routing".to_string()),
-                fallback_class_names: vec!["junior-code".to_string()],
-                allowed_intents: vec!["task_offload".to_string()],
-                ..ServiceSpec::default()
-            },
-        };
-        save_manifest(&ResourceManifest::Service(service)).unwrap();
-
-        let helper_a = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Worker".to_string(),
-            metadata: ResourceMetadata {
-                name: "helper-a".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::from([("lane".to_string(), "junior".to_string())]),
-                annotations: BTreeMap::new(),
-            },
-            spec: WorkerSpec {
-                model: "qwen3:8b".to_string(),
-                locality: Some(WorkerLocality::Remote),
-                pool: Some("pool-a".to_string()),
-                classes: vec!["ops".to_string()],
-                max_concurrent: Some(2),
-                ..WorkerSpec::default()
-            },
-        };
-        let code_a = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Worker".to_string(),
-            metadata: ResourceMetadata {
-                name: "code-a".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::from([("lane".to_string(), "junior".to_string())]),
-                annotations: BTreeMap::new(),
-            },
-            spec: WorkerSpec {
-                model: "qwen3:8b".to_string(),
-                locality: Some(WorkerLocality::Remote),
-                pool: Some("pool-a".to_string()),
-                classes: vec!["junior-code".to_string()],
-                max_concurrent: Some(2),
-                ..WorkerSpec::default()
-            },
-        };
-        let code_b = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Worker".to_string(),
-            metadata: ResourceMetadata {
-                name: "code-b".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::from([("lane".to_string(), "junior".to_string())]),
-                annotations: BTreeMap::new(),
-            },
-            spec: WorkerSpec {
-                model: "qwen3:8b".to_string(),
-                locality: Some(WorkerLocality::Remote),
-                pool: Some("pool-b".to_string()),
-                classes: vec!["junior-code".to_string()],
-                max_concurrent: Some(2),
-                ..WorkerSpec::default()
-            },
-        };
-        save_manifest(&ResourceManifest::Worker(helper_a)).unwrap();
-        save_manifest(&ResourceManifest::Worker(code_a)).unwrap();
-        save_manifest(&ResourceManifest::Worker(code_b)).unwrap();
-
-        let existing_job = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Job".to_string(),
-            metadata: ResourceMetadata {
-                name: "existing-load".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: JobSpec {
-                worker: Some(WorkerJobSpec {
-                    name: Some("helper-a".to_string()),
-                    prompt: "noop".to_string(),
-                    ..WorkerJobSpec::default()
-                }),
-                ..JobSpec::default()
-            },
-        };
-        save_manifest(&ResourceManifest::Job(existing_job)).unwrap();
-        save_job_controller_state(
-            "workers-lab",
-            "existing-load",
-            &JobControllerState {
-                runs: vec![JobRunState {
-                    name: "run-0".to_string(),
-                    runtime_namespace: "workers-lab--existing-load--j0".to_string(),
-                    created_at_epoch_ms: 1_000,
-                    backend: JobRunBackend::Worker,
-                    worker_name: Some("helper-a".to_string()),
-                    worker_namespace: Some("workers-lab".to_string()),
-                    service_name: None,
-                    intent: None,
-                    selected_class: None,
-                    fallback_class: false,
-                    worker_locality: None,
-                    admission_state: Some(JobRunAdmissionState::Granted),
-                    admission_code: Some(WorkerAdmissionCode::Ready),
-                    validation_state: None,
-                    validation_message: None,
-                    validation_enforced: false,
-                    admission_reason: Some("busy".to_string()),
-                    last_active_epoch_ms: Some(1_100),
-                    completed_at_epoch_ms: None,
-                    artifact_path: None,
-                    output_path: None,
-                    last_error: None,
-                    status: JobRunPhase::Active,
-                }],
-            },
-        )
-        .unwrap();
-
-        let job = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Job".to_string(),
-            metadata: ResourceMetadata {
-                name: "route-docs".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: JobSpec {
-                worker: Some(WorkerJobSpec {
-                    service_name: Some("junior-svc".to_string()),
-                    prompt: "strict json".to_string(),
-                    ..WorkerJobSpec::default()
-                }),
-                ..JobSpec::default()
-            },
-        };
-
-        let selection = select_worker_for_job_run(&job, &JobControllerState::default()).unwrap();
-        assert_eq!(selection.name.as_deref(), Some("code-b"));
-        assert_eq!(selection.namespace.as_deref(), Some("workers-lab"));
-        assert!(
-            selection.reason.contains("via service 'junior-svc'"),
-            "{}",
-            selection.reason
-        );
-        assert!(
-            selection.reason.contains("fallback class 'junior-code'"),
-            "{}",
-            selection.reason
-        );
-    }
-
-    #[test]
-    fn worker_selection_prefers_service_provider_order() {
-        let _lock = home_env_lock().lock().unwrap();
-        let _home = TempHomeGuard::new("jarvisctl-worker-service-provider-order");
-        let _api_key = TempEnvVarGuard::set("NVIDIA_API_KEY", "provider-order-token");
-
-        let service = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Service".to_string(),
-            metadata: ResourceMetadata {
-                name: "code-svc".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: ServiceSpec {
-                selector: BTreeMap::from([("lane".to_string(), "code".to_string())]),
-                target_kind: Some(ServiceTargetKind::Worker),
-                class_name: Some("junior-code".to_string()),
-                required_capabilities: vec!["json".to_string()],
-                preferred_providers: vec![WorkerProvider::Nvidia, WorkerProvider::Ollama],
-                allowed_intents: vec!["code_task".to_string()],
-                ..ServiceSpec::default()
-            },
-        };
-        save_manifest(&ResourceManifest::Service(service)).unwrap();
-
-        let local_worker = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Worker".to_string(),
-            metadata: ResourceMetadata {
-                name: "local-code".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::from([("lane".to_string(), "code".to_string())]),
-                annotations: BTreeMap::new(),
-            },
-            spec: WorkerSpec {
-                provider: WorkerProvider::Ollama,
-                model: "qwen2.5-coder:3b".to_string(),
-                locality: Some(WorkerLocality::Local),
-                classes: vec!["junior-code".to_string()],
-                capabilities: vec!["json".to_string(), "code".to_string()],
-                max_concurrent: Some(1),
-                ..WorkerSpec::default()
-            },
-        };
-        let remote_worker = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Worker".to_string(),
-            metadata: ResourceMetadata {
-                name: "remote-kimi".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::from([("lane".to_string(), "code".to_string())]),
-                annotations: BTreeMap::new(),
-            },
-            spec: WorkerSpec {
-                provider: WorkerProvider::Nvidia,
-                model: "moonshotai/kimi-k2-instruct".to_string(),
-                locality: Some(WorkerLocality::Remote),
-                classes: vec!["junior-code".to_string()],
-                capabilities: vec!["json".to_string(), "code".to_string()],
-                max_concurrent: Some(1),
-                ..WorkerSpec::default()
-            },
-        };
-        save_manifest(&ResourceManifest::Worker(local_worker)).unwrap();
-        save_manifest(&ResourceManifest::Worker(remote_worker)).unwrap();
-
-        let job = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Job".to_string(),
-            metadata: ResourceMetadata {
-                name: "code-task".to_string(),
-                namespace: Some("workers-lab".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: JobSpec {
-                worker: Some(WorkerJobSpec {
-                    service_name: Some("code-svc".to_string()),
-                    intent: Some("code_task".to_string()),
-                    prompt: "strict json".to_string(),
-                    ..WorkerJobSpec::default()
-                }),
-                ..JobSpec::default()
-            },
-        };
-
-        let selection = select_worker_for_job_run(&job, &JobControllerState::default()).unwrap();
-        assert_eq!(selection.name.as_deref(), Some("remote-kimi"));
-        assert_eq!(selection.namespace.as_deref(), Some("workers-lab"));
-        assert_eq!(selection.selected_class.as_deref(), Some("junior-code"));
-    }
-
-    #[test]
-    fn worker_service_access_policy_denies_untrusted_job_namespace() {
-        let _lock = home_env_lock().lock().unwrap();
-        let _home = TempHomeGuard::new("jarvisctl-worker-service-access-policy");
-
-        let service = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Service".to_string(),
-            metadata: ResourceMetadata {
-                name: "restricted-svc".to_string(),
-                namespace: Some("trusted-ns".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: ServiceSpec {
-                selector: BTreeMap::from([("lane".to_string(), "junior".to_string())]),
-                target_kind: Some(ServiceTargetKind::Worker),
-                allowed_intents: vec!["task_offload".to_string()],
-                access_policy: ResourceAccessPolicy {
-                    allowed_namespaces: vec!["trusted-ns".to_string()],
-                    workload_selector: None,
-                },
-                ..ServiceSpec::default()
-            },
-        };
-        let worker = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Worker".to_string(),
-            metadata: ResourceMetadata {
-                name: "trusted-worker".to_string(),
-                namespace: Some("trusted-ns".to_string()),
-                labels: BTreeMap::from([("lane".to_string(), "junior".to_string())]),
-                annotations: BTreeMap::new(),
-            },
-            spec: WorkerSpec {
-                model: "qwen3:8b".to_string(),
-                locality: Some(WorkerLocality::Remote),
-                ..WorkerSpec::default()
-            },
-        };
-        save_manifest(&ResourceManifest::Service(service)).unwrap();
-        save_manifest(&ResourceManifest::Worker(worker)).unwrap();
-
-        let job = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Job".to_string(),
-            metadata: ResourceMetadata {
-                name: "cross-namespace".to_string(),
-                namespace: Some("other-ns".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: JobSpec {
-                worker: Some(WorkerJobSpec {
-                    service_name: Some("restricted-svc".to_string()),
-                    service_namespace: Some("trusted-ns".to_string()),
-                    prompt: "strict json".to_string(),
-                    ..WorkerJobSpec::default()
-                }),
-                ..JobSpec::default()
-            },
-        };
-
-        let error = select_worker_for_job_run(&job, &JobControllerState::default()).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("denies source workload in namespace 'other-ns'"),
-            "{}",
-            error
-        );
     }
 
     #[test]
@@ -13625,38 +4707,6 @@ spec:
     }
 
     #[test]
-    fn resolve_manifest_relative_paths_updates_application_sources() {
-        let mut manifests = vec![ResourceManifest::Application(ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Application".to_string(),
-            metadata: ResourceMetadata {
-                name: "demo".to_string(),
-                namespace: Some("gitops".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: ApplicationSpec {
-                source: ApplicationSourceSpec {
-                    path: "overlays/dev".to_string(),
-                    repo_url: None,
-                    target_revision: None,
-                },
-                destination: ApplicationDestinationSpec {
-                    namespace: Some("gitops".to_string()),
-                },
-                sync_policy: ApplicationSyncPolicy::default(),
-            },
-        })];
-
-        resolve_manifest_relative_paths(&mut manifests, Path::new("/tmp/root"));
-
-        let ResourceManifest::Application(application) = &manifests[0] else {
-            panic!("expected application manifest");
-        };
-        assert_eq!(application.spec.source.path, "/tmp/root/overlays/dev");
-    }
-
-    #[test]
     fn deployment_template_hash_changes_on_restart_token() {
         let mut manifest = ResourceEnvelope {
             api_version: API_VERSION.to_string(),
@@ -13760,585 +4810,6 @@ spec:
                 "ReplicaSet 'deadline-demo-rs-0001' has not reached 1 updated/ready replica(s) within 1s"
             )
         );
-    }
-
-    #[test]
-    fn application_status_uses_git_source_metadata() {
-        let _home_guard = home_env_lock().lock().unwrap();
-        let temp_home = TempHomeGuard::new("jarvisctl-application-git-source");
-        let repo_dir = temp_home.root.join("repo");
-        fs::create_dir_all(repo_dir.join("manifests")).unwrap();
-        write_text_file(
-            &repo_dir.join("manifests/deployment.yaml"),
-            r#"apiVersion: jarvisctl.io/v1alpha1
-kind: Deployment
-metadata:
-  name: git-app
-spec:
-  replicas: 1
-  agents: 1
-  template:
-    task_note: /tmp/git-app.md
-"#,
-        );
-        ProcessCommand::new("git")
-            .arg("init")
-            .arg(&repo_dir)
-            .output()
-            .unwrap();
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(&repo_dir)
-            .args(["config", "user.email", "codex@example.com"])
-            .output()
-            .unwrap();
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(&repo_dir)
-            .args(["config", "user.name", "Codex"])
-            .output()
-            .unwrap();
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(&repo_dir)
-            .args(["add", "."])
-            .output()
-            .unwrap();
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(&repo_dir)
-            .args(["commit", "-m", "initial"])
-            .output()
-            .unwrap();
-
-        let head = String::from_utf8(
-            ProcessCommand::new("git")
-                .arg("-C")
-                .arg(&repo_dir)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_string();
-
-        let application = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Application".to_string(),
-            metadata: ResourceMetadata {
-                name: "git-source-demo".to_string(),
-                namespace: Some("gitops".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: ApplicationSpec {
-                source: ApplicationSourceSpec {
-                    path: repo_dir.join("manifests").display().to_string(),
-                    repo_url: None,
-                    target_revision: Some("HEAD".to_string()),
-                },
-                destination: ApplicationDestinationSpec {
-                    namespace: Some("gitops".to_string()),
-                },
-                sync_policy: ApplicationSyncPolicy::default(),
-            },
-        };
-
-        let clean_status = application_status(&application).unwrap();
-        assert_eq!(clean_status.source_type, "git");
-        assert_eq!(
-            clean_status.source_root.as_deref(),
-            Some(repo_dir.to_string_lossy().as_ref())
-        );
-        assert_eq!(clean_status.source_revision, head);
-        assert!(!clean_status.source_dirty);
-        assert_eq!(clean_status.conditions.len(), 3);
-        assert!(!clean_status.events.is_empty());
-
-        write_text_file(
-            &repo_dir.join("manifests/deployment.yaml"),
-            r#"apiVersion: jarvisctl.io/v1alpha1
-kind: Deployment
-metadata:
-  name: git-app
-spec:
-  replicas: 2
-  agents: 1
-  template:
-    task_note: /tmp/git-app.md
-"#,
-        );
-
-        let dirty_status = application_status(&application).unwrap();
-        assert_eq!(dirty_status.source_type, "git");
-        assert!(dirty_status.source_dirty);
-        assert!(
-            dirty_status
-                .conditions
-                .iter()
-                .any(|condition| condition.condition_type == "Synced")
-        );
-        assert!(
-            dirty_status
-                .events
-                .iter()
-                .any(|event| event.event_type == "application_drift")
-        );
-    }
-
-    #[test]
-    fn application_status_uses_remote_git_source_metadata() {
-        let _home_guard = home_env_lock().lock().unwrap();
-        let temp_home = TempHomeGuard::new("jarvisctl-application-remote-git-source");
-        let repo_dir = temp_home.root.join("repo");
-        let remote_dir = temp_home.root.join("remote.git");
-        fs::create_dir_all(repo_dir.join("manifests")).unwrap();
-        write_text_file(
-            &repo_dir.join("manifests/configmap.yaml"),
-            r#"apiVersion: jarvisctl.io/v1alpha1
-kind: ConfigMap
-metadata:
-  name: remote-git-config
-spec:
-  data:
-    MODE: demo
-"#,
-        );
-        ProcessCommand::new("git")
-            .arg("init")
-            .arg(&repo_dir)
-            .output()
-            .unwrap();
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(&repo_dir)
-            .args(["config", "user.email", "codex@example.com"])
-            .output()
-            .unwrap();
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(&repo_dir)
-            .args(["config", "user.name", "Codex"])
-            .output()
-            .unwrap();
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(&repo_dir)
-            .args(["add", "."])
-            .output()
-            .unwrap();
-        ProcessCommand::new("git")
-            .arg("-C")
-            .arg(&repo_dir)
-            .args(["commit", "-m", "initial"])
-            .output()
-            .unwrap();
-        ProcessCommand::new("git")
-            .arg("clone")
-            .args([
-                "--bare",
-                repo_dir.to_string_lossy().as_ref(),
-                remote_dir.to_string_lossy().as_ref(),
-            ])
-            .output()
-            .unwrap();
-
-        let head = String::from_utf8(
-            ProcessCommand::new("git")
-                .arg("-C")
-                .arg(&repo_dir)
-                .args(["rev-parse", "HEAD"])
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_string();
-
-        let application = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Application".to_string(),
-            metadata: ResourceMetadata {
-                name: "remote-git-source-demo".to_string(),
-                namespace: Some("gitops".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: ApplicationSpec {
-                source: ApplicationSourceSpec {
-                    path: "manifests".to_string(),
-                    repo_url: Some(remote_dir.display().to_string()),
-                    target_revision: Some("HEAD".to_string()),
-                },
-                destination: ApplicationDestinationSpec {
-                    namespace: Some("gitops".to_string()),
-                },
-                sync_policy: ApplicationSyncPolicy::default(),
-            },
-        };
-
-        let status = application_status(&application).unwrap();
-        assert_eq!(status.source_type, "git_remote");
-        assert_eq!(
-            status.repo_url.as_deref(),
-            Some(remote_dir.to_string_lossy().as_ref())
-        );
-        assert_eq!(status.source_revision, head);
-        assert!(!status.source_dirty);
-    }
-
-    #[test]
-    fn application_diff_reports_create_update_and_delete() {
-        let _home_guard = home_env_lock().lock().unwrap();
-        let temp_home = TempHomeGuard::new("jarvisctl-application-diff");
-        let source_dir = temp_home.root.join("app-src");
-        fs::create_dir_all(&source_dir).unwrap();
-        write_text_file(
-            &source_dir.join("configmap.yaml"),
-            r#"apiVersion: jarvisctl.io/v1alpha1
-kind: ConfigMap
-metadata:
-  name: diff-config
-spec:
-  data:
-    MODE: desired
-"#,
-        );
-
-        let application = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Application".to_string(),
-            metadata: ResourceMetadata {
-                name: "diff-demo".to_string(),
-                namespace: Some("gitops".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: ApplicationSpec {
-                source: ApplicationSourceSpec {
-                    path: source_dir.display().to_string(),
-                    repo_url: None,
-                    target_revision: None,
-                },
-                destination: ApplicationDestinationSpec {
-                    namespace: Some("gitops".to_string()),
-                },
-                sync_policy: ApplicationSyncPolicy::default(),
-            },
-        };
-
-        save_manifest(&ResourceManifest::Application(application.clone())).unwrap();
-
-        let create_diff = application_diff("diff-demo", Some("gitops")).unwrap();
-        assert_eq!(create_diff.creates, 1);
-        assert_eq!(create_diff.updates, 0);
-        assert_eq!(create_diff.deletes, 0);
-
-        sync_application(&application, true).unwrap();
-        let synced_diff = application_diff("diff-demo", Some("gitops")).unwrap();
-        assert!(synced_diff.changes.is_empty());
-
-        let ResourceManifest::ConfigMap(mut configmap) =
-            load_manifest(ResourceKind::ConfigMap, "diff-config", Some("gitops")).unwrap()
-        else {
-            panic!("expected configmap");
-        };
-        configmap
-            .spec
-            .data
-            .insert("MODE".to_string(), "drifted".to_string());
-        save_manifest(&ResourceManifest::ConfigMap(configmap)).unwrap();
-
-        let update_diff = application_diff("diff-demo", Some("gitops")).unwrap();
-        assert_eq!(update_diff.creates, 0);
-        assert_eq!(update_diff.updates, 1);
-        assert_eq!(update_diff.deletes, 0);
-
-        fs::remove_file(source_dir.join("configmap.yaml")).unwrap();
-        let delete_diff = application_diff("diff-demo", Some("gitops")).unwrap();
-        assert_eq!(delete_diff.creates, 0);
-        assert_eq!(delete_diff.updates, 0);
-        assert_eq!(delete_diff.deletes, 1);
-    }
-
-    #[test]
-    fn application_rollout_revision_two_preserves_replica_set_history() {
-        let _home_guard = home_env_lock().lock().unwrap();
-        let temp_home = TempHomeGuard::new("jarvisctl-app-rollout-test");
-        let source_dir = temp_home.root.join("app-src");
-        write_text_file(
-            &source_dir.join("kustomization.yaml"),
-            "resources:\n  - deployment.yaml\n",
-        );
-        write_text_file(
-            &source_dir.join("deployment.yaml"),
-            r#"apiVersion: jarvisctl.io/v1alpha1
-kind: Deployment
-metadata:
-  name: app-rollout
-spec:
-  replicas: 1
-  agents: 1
-  driver: cli_pty
-  startupDelayMs: 0
-  template:
-    task_note: /tmp/jarvisctl-rollout-demo-ticket.md
-    working_directory: /home/rootster/documents/jarvisctl
-    operator_message: app revision one
-    command:
-      - /bin/sh
-      - -lc
-      - sleep 30
-"#,
-        );
-
-        save_manifest(&ResourceManifest::Namespace(ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Namespace".to_string(),
-            metadata: ResourceMetadata {
-                name: "app-revision-lab".to_string(),
-                namespace: None,
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: NamespaceSpec::default(),
-        }))
-        .unwrap();
-
-        let application_v1 = ResourceEnvelope {
-            api_version: API_VERSION.to_string(),
-            kind: "Application".to_string(),
-            metadata: ResourceMetadata {
-                name: "app-revision-two".to_string(),
-                namespace: Some("app-revision-lab".to_string()),
-                labels: BTreeMap::new(),
-                annotations: BTreeMap::new(),
-            },
-            spec: ApplicationSpec {
-                source: ApplicationSourceSpec {
-                    path: source_dir.display().to_string(),
-                    repo_url: None,
-                    target_revision: Some("rev1".to_string()),
-                },
-                destination: ApplicationDestinationSpec {
-                    namespace: Some("app-revision-lab".to_string()),
-                },
-                sync_policy: ApplicationSyncPolicy::default(),
-            },
-        };
-
-        save_manifest(&ResourceManifest::Application(application_v1.clone())).unwrap();
-        reconcile_application(&application_v1).unwrap();
-        let ResourceManifest::Deployment(deployment_v1) = load_manifest(
-            ResourceKind::Deployment,
-            "app-rollout",
-            Some("app-revision-lab"),
-        )
-        .unwrap() else {
-            panic!("expected deployment manifest");
-        };
-        let namespace_defaults = NamespaceSpec::default();
-        let revision_one_hash =
-            deployment_template_hash(&deployment_v1, &namespace_defaults).unwrap();
-        let mut replica_set_v1 = create_replica_set_manifest(
-            &deployment_v1,
-            &namespace_defaults,
-            1,
-            1,
-            &revision_one_hash,
-        );
-        save_manifest(&ResourceManifest::ReplicaSet(replica_set_v1.clone())).unwrap();
-
-        write_text_file(
-            &source_dir.join("deployment.yaml"),
-            r#"apiVersion: jarvisctl.io/v1alpha1
-kind: Deployment
-metadata:
-  name: app-rollout
-spec:
-  replicas: 1
-  agents: 1
-  driver: cli_pty
-  startupDelayMs: 0
-  template:
-    task_note: /tmp/jarvisctl-rollout-demo-ticket.md
-    working_directory: /home/rootster/documents/jarvisctl
-    operator_message: app revision two
-    command:
-      - /bin/sh
-      - -lc
-      - sleep 30
-"#,
-        );
-
-        let application_v2 = ResourceEnvelope {
-            spec: ApplicationSpec {
-                source: ApplicationSourceSpec {
-                    path: source_dir.display().to_string(),
-                    repo_url: None,
-                    target_revision: Some("rev2".to_string()),
-                },
-                destination: ApplicationDestinationSpec {
-                    namespace: Some("app-revision-lab".to_string()),
-                },
-                sync_policy: ApplicationSyncPolicy::default(),
-            },
-            ..application_v1.clone()
-        };
-
-        save_manifest(&ResourceManifest::Application(application_v2.clone())).unwrap();
-        reconcile_application(&application_v2).unwrap();
-        let ResourceManifest::Deployment(deployment_v2) = load_manifest(
-            ResourceKind::Deployment,
-            "app-rollout",
-            Some("app-revision-lab"),
-        )
-        .unwrap() else {
-            panic!("expected deployment manifest");
-        };
-        let revision_two_hash =
-            deployment_template_hash(&deployment_v2, &namespace_defaults).unwrap();
-        replica_set_v1.spec.replicas = 0;
-        save_manifest(&ResourceManifest::ReplicaSet(replica_set_v1.clone())).unwrap();
-        let replica_set_v2 = create_replica_set_manifest(
-            &deployment_v2,
-            &namespace_defaults,
-            2,
-            1,
-            &revision_two_hash,
-        );
-        save_manifest(&ResourceManifest::ReplicaSet(replica_set_v2)).unwrap();
-
-        let status = deployment_status(&deployment_v2).unwrap();
-        assert_eq!(status.current_revision, Some(2));
-        assert_eq!(
-            status.current_replica_set.as_deref(),
-            Some("app-rollout-rs-0002")
-        );
-
-        let history = deployment_rollout_history(&deployment_v2).unwrap();
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0].revision, 2);
-        assert_eq!(history[0].replica_set, "app-rollout-rs-0002");
-        assert_eq!(history[1].revision, 1);
-        assert_eq!(history[1].replica_set, "app-rollout-rs-0001");
-        assert_ne!(history[0].template_hash, history[1].template_hash);
-
-        let application_status = application_status(&application_v2).unwrap();
-        assert_eq!(application_status.sync_status, "Synced");
-        assert_eq!(application_status.history.len(), 2);
-
-        assert_eq!(
-            replica_set_runtime_namespaces("app-revision-lab", "app-rollout", 2, 1),
-            vec!["app-revision-lab--app-rollout--rev2--r0".to_string()]
-        );
-    }
-
-    #[test]
-    fn kubernetes_compiler_resolves_worker_service_into_job() {
-        let manifests = parse_manifest_documents(
-            r#"apiVersion: jarvisctl.io/v1alpha1
-kind: Namespace
-metadata:
-  name: openclaw-kube
-spec: {}
----
-apiVersion: jarvisctl.io/v1alpha1
-kind: Secret
-metadata:
-  name: nvidia-build
-  namespace: openclaw-kube
-spec:
-  stringData:
-    apiKey: test-token
----
-apiVersion: jarvisctl.io/v1alpha1
-kind: Worker
-metadata:
-  name: kimi-routing
-  namespace: openclaw-kube
-  labels:
-    role: routing
-    stability: stable
-spec:
-  provider: nvidia
-  model: moonshotai/kimi-k2-instruct
-  apiKeySecretRef:
-    name: nvidia-build
-    key: apiKey
-  classes:
-    - junior-routing
-  capabilities:
-    - routing
-    - json
-  outputMode: json
----
-apiVersion: jarvisctl.io/v1alpha1
-kind: Service
-metadata:
-  name: routing-svc
-  namespace: openclaw-kube
-spec:
-  targetKind: worker
-  selector:
-    role: routing
-    stability: stable
-  className: junior-routing
-  requiredCapabilities:
-    - json
----
-apiVersion: jarvisctl.io/v1alpha1
-kind: Job
-metadata:
-  name: route-titlecase
-  namespace: openclaw-kube
-spec:
-  worker:
-    serviceName: routing-svc
-    serviceNamespace: openclaw-kube
-    prompt: Return strict JSON only.
-"#,
-        )
-        .unwrap();
-
-        let compiled = compile_kubernetes_manifests(&manifests).unwrap();
-        let job = compiled
-            .manifests
-            .iter()
-            .find(|manifest| {
-                manifest.get("kind").and_then(serde_json::Value::as_str) == Some("Job")
-                    && manifest
-                        .get("metadata")
-                        .and_then(|metadata| metadata.get("name"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("route-titlecase")
-            })
-            .expect("compiled job manifest");
-        let env = job["spec"]["template"]["spec"]["containers"][0]["env"]
-            .as_array()
-            .expect("job env array");
-        let worker_name = env
-            .iter()
-            .find(|entry| {
-                entry.get("name").and_then(serde_json::Value::as_str) == Some("JARVIS_WORKER_NAME")
-            })
-            .and_then(|entry| entry.get("value"))
-            .and_then(serde_json::Value::as_str);
-        assert_eq!(worker_name, Some("kimi-routing"));
-        let secret_name = env
-            .iter()
-            .find(|entry| {
-                entry.get("name").and_then(serde_json::Value::as_str)
-                    == Some("JARVIS_WORKER_API_KEY")
-            })
-            .and_then(|entry| entry.get("valueFrom"))
-            .and_then(|value| value.get("secretKeyRef"))
-            .and_then(|value| value.get("name"))
-            .and_then(serde_json::Value::as_str);
-        assert_eq!(secret_name, Some("nvidia-build"));
     }
 
     #[test]

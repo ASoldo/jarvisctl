@@ -1,13 +1,4 @@
-//! jarvisctl: Enterprise-grade orchestrator for CLI/TUI worker apps using a native PTY runtime
-//!
-//! Features:
-//! - Namespaces for isolating agent groups
-//! - Agents running your CLI worker inside a native PTY runtime
-//! - Inspect: detailed process info (with optional nsenter shell)
-//! - Run: spawn new native session with N agents
-//! - Attach/Exec: connect to live sessions
-//! - Tell: send text into a running agent
-//! - Delete/List: manage native sessions
+//! jarvisctl: Operator-first control plane for local and hybrid coding agents
 
 use clap::{Parser, Subcommand, ValueEnum, ValueHint};
 use std::{
@@ -33,33 +24,35 @@ mod codex_app;
 mod control_plane;
 mod dispatch;
 mod native;
+mod runtime;
 mod ticket;
 mod tui;
 
 use agent::spawn_agent;
-use codex::{CodexLaunchOptions, CodexRuntimeDriver, enrich_native_sessions, launch_codex_ticket};
+use codex::{CodexLaunchOptions, CodexRuntimeDriver, launch_codex_ticket};
 use codex_app::{
-    CodexAppInputMode, attach_codex_app, attach_codex_app_tcp, codex_app_session_metadata,
-    codex_app_session_metadata_tcp, collect_codex_app_sessions, delete_codex_app_session,
-    interrupt_codex_app, interrupt_codex_app_tcp, request_worker_offload_for_current_runtime,
-    request_worker_offload_via_runtime_namespace, serve_codex_app_session,
-    tell_codex_app_with_mode, tell_codex_app_with_mode_tcp,
+    CodexAppInputMode, attach_codex_app_tcp, codex_app_session_metadata_tcp,
+    interrupt_codex_app_tcp, read_codex_app_thread, serve_codex_app_session,
+    tell_codex_app_with_mode_tcp,
 };
 use control_plane::{
-    ControlPlaneOutput, ControlPlaneResourceKindArg, KubernetesRenderOutput, WorkerOffloadRequest,
-    apply_kubernetes_resources, apply_kustomization, apply_manifests, authorize_runtime_message,
-    invoke_worker, offload_worker_task, pause_deployment_rollout, render_application_diff_output,
+    ControlPlaneOutput, ControlPlaneResourceKindArg, KubernetesRenderOutput, NodeRegisterOptions,
+    NodeVisitOptions, apply_kubernetes_resources, apply_kustomization, apply_manifests,
+    attach_cluster_runtime_session, authorize_runtime_message, delete_cluster_runtime_session,
+    interrupt_cluster_runtime_session, pause_deployment_rollout, register_node,
     render_describe_output, render_get_output, render_kubernetes_resources,
-    render_rollout_history_output, render_rollout_status_output, resolve_service_target,
-    resolve_service_target_for_message, restart_deployment_rollout, resume_deployment_rollout,
-    serve_worker_run, sync_application_resource, undo_deployment_rollout,
-    wait_for_rollout_status_output,
+    render_node_probe_output, render_rollout_history_output, render_rollout_status_output,
+    resolve_service_target, resolve_service_target_for_message, restart_deployment_rollout,
+    resume_deployment_rollout, run_node_visit, set_node_cordoned, sync_codex_auth_to_node,
+    tell_cluster_runtime_session, undo_deployment_rollout, wait_for_rollout_status_output,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use native::{
-    NativeSessionMetadata, RuntimeContextMetadata, attach_native, collect_native_sessions,
-    delete_native_session, interrupt_native, serve_native_session, spawn_native_session,
-    tell_native,
+    NativeSessionMetadata, RuntimeContextMetadata, serve_native_session, spawn_native_session,
+};
+use runtime::{
+    attach_runtime_session, collect_runtime_sessions, delete_runtime_session,
+    interrupt_runtime_session, tell_runtime_session,
 };
 use ticket::slugify;
 use tui::{run_dashboard, view_agent};
@@ -67,13 +60,6 @@ use tui::{run_dashboard, view_agent};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum SessionBackend {
     Native,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum WorkerOffloadOutput {
-    Text,
-    Json,
-    Yaml,
 }
 
 #[derive(Error, Debug)]
@@ -91,12 +77,12 @@ pub enum JarvisError {
     Other(#[from] anyhow::Error),
 }
 
-/// CLI tool to inspect and control worker sessions
+/// CLI tool to launch, steer, and inspect coding-agent work
 #[derive(Parser, Debug)]
 #[command(
     name = "jarvisctl",
     version,
-    about = "Orchestrate CLI/TUI workers with a native PTY runtime"
+    about = "Operator-first control plane for local and hybrid coding agents"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -130,7 +116,7 @@ enum Command {
         exec_shell: bool,
     },
 
-    /// Run a worker in a new namespace
+    /// Run a command in a new namespace
     Run {
         /// Deprecated compatibility flag; native is the only backend
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
@@ -174,6 +160,14 @@ enum Command {
         /// Bind the launched Codex runtime to a control-plane namespace
         #[arg(long = "control-namespace")]
         control_namespace: Option<String>,
+
+        /// Internal control-plane deployment metadata for scheduled launches
+        #[arg(long, hide = true)]
+        deployment: Option<String>,
+
+        /// Internal control-plane runtime label metadata for scheduled launches
+        #[arg(long = "runtime-label", hide = true)]
+        runtime_labels: Vec<String>,
 
         /// Number of Codex agents to create
         #[arg(long, default_value_t = 1)]
@@ -227,7 +221,7 @@ enum Command {
         driver: CodexRuntimeDriver,
 
         /// Vault root used to resolve board links and default boards
-        #[arg(long, value_hint = ValueHint::DirPath, default_value = "/home/rootster/documents/codex")]
+        #[arg(long, value_hint = ValueHint::DirPath, default_value = "/home/rootster/codex")]
         vault_path: PathBuf,
 
         /// Board file to scan; may be repeated. Defaults to the dispatch board and project boards in the vault.
@@ -267,6 +261,53 @@ enum Command {
         command: Vec<String>,
     },
 
+    /// Send a bounded Codex prompt capsule to a remote node and return its result
+    Visit {
+        /// Registered remote node to visit
+        #[arg(long)]
+        node: String,
+
+        /// Prompt text to send to the remote Codex
+        #[arg(long, conflicts_with = "prompt_file")]
+        text: Option<String>,
+
+        /// Prompt file to send to the remote Codex
+        #[arg(long = "file", value_hint = ValueHint::FilePath, conflicts_with = "text")]
+        prompt_file: Option<PathBuf>,
+
+        /// Remote working directory; defaults to the remote user's home directory
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        working_directory: Option<String>,
+
+        /// Override the generated visit namespace/lease name
+        #[arg(long)]
+        namespace: Option<String>,
+
+        /// Kill the remote visit if it runs longer than this
+        #[arg(long = "timeout-seconds", default_value_t = 900)]
+        timeout_seconds: u64,
+
+        /// Remote Codex sandbox mode for the visit
+        #[arg(long, default_value = "read-only")]
+        sandbox: String,
+
+        /// Remote Codex model override
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Remote Codex reasoning effort override
+        #[arg(long = "reasoning-effort")]
+        reasoning_effort: Option<String>,
+
+        /// Do not persist a Codex session file on the remote node
+        #[arg(long, default_value_t = false)]
+        ephemeral: bool,
+
+        /// Print the full remote stdout/stderr envelope instead of just the final answer
+        #[arg(long, default_value_t = false)]
+        full: bool,
+    },
+
     /// Apply declarative control-plane resources from YAML manifests
     Apply {
         #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
@@ -299,26 +340,19 @@ enum Command {
         output: ControlPlaneOutput,
     },
 
+    /// Register and manage Jarvis cluster nodes
+    Node {
+        #[command(subcommand)]
+        command: NodeCommand,
+    },
+
     /// Inspect or trigger Deployment rollouts
     Rollout {
         #[command(subcommand)]
         command: RolloutCommand,
     },
 
-    /// Inspect or trigger Application sync operations
-    #[command(alias = "app")]
-    Application {
-        #[command(subcommand)]
-        command: ApplicationCommand,
-    },
-
-    /// Invoke a namespaced worker resource
-    Worker {
-        #[command(subcommand)]
-        command: WorkerCommand,
-    },
-
-    /// Render or apply supported resources onto a Kubernetes cluster
+    /// Experimental: render or apply the narrow Kubernetes adapter surface
     Kube {
         #[command(subcommand)]
         command: KubeCommand,
@@ -368,6 +402,31 @@ enum Command {
 
         #[arg(long)]
         namespace: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Read Codex app-server thread history for a namespace
+    History {
+        #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
+        backend: SessionBackend,
+
+        #[arg(long, required_unless_present = "service", conflicts_with = "service")]
+        namespace: Option<String>,
+
+        #[arg(
+            long,
+            required_unless_present = "namespace",
+            conflicts_with = "namespace"
+        )]
+        service: Option<String>,
+
+        #[arg(short = 'n', long = "resource-namespace", requires = "service")]
+        resource_namespace: Option<String>,
+
+        #[arg(long, default_value_t = true)]
+        include_turns: bool,
 
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -455,12 +514,55 @@ enum Command {
         #[arg(long, value_hint = ValueHint::FilePath)]
         manifest: PathBuf,
     },
+}
 
-    #[command(hide = true)]
-    WorkerRunServe {
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        manifest: PathBuf,
+#[derive(Subcommand, Debug)]
+enum NodeCommand {
+    /// Register a local, SSH, or Tailscale-reachable worker node
+    Register {
+        name: String,
+
+        #[arg(long)]
+        address: Option<String>,
+
+        #[arg(long = "ssh-host")]
+        ssh_host: Option<String>,
+
+        #[arg(long = "ssh-user")]
+        ssh_user: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        local: bool,
+
+        #[arg(long = "role")]
+        roles: Vec<String>,
+
+        #[arg(long = "label")]
+        labels: Vec<String>,
+
+        #[arg(long = "workspace-root", value_hint = ValueHint::DirPath)]
+        workspace_root: Option<String>,
+
+        #[arg(long = "max-sessions")]
+        max_sessions: Option<usize>,
     },
+
+    /// Probe a registered node over its configured transport
+    Ping {
+        name: String,
+
+        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Mark a node unschedulable for future work
+    Cordon { name: String },
+
+    /// Mark a node schedulable again
+    Uncordon { name: String },
+
+    /// Copy this machine's Codex auth/config to a node over SSH
+    SyncCodexAuth { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -530,80 +632,8 @@ enum RolloutCommand {
 }
 
 #[derive(Subcommand, Debug)]
-enum ApplicationCommand {
-    /// Force an Application sync, even if automated sync is disabled
-    Sync {
-        application: String,
-
-        #[arg(short = 'n', long = "resource-namespace")]
-        resource_namespace: Option<String>,
-    },
-
-    /// Show the diff between desired Application source and live managed resources
-    Diff {
-        application: String,
-
-        #[arg(short = 'n', long = "resource-namespace")]
-        resource_namespace: Option<String>,
-
-        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
-        output: ControlPlaneOutput,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum WorkerCommand {
-    /// Invoke a worker with a prompt or prompt file
-    Invoke {
-        worker: String,
-
-        #[arg(short = 'n', long = "resource-namespace")]
-        resource_namespace: Option<String>,
-
-        #[arg(long, conflicts_with = "file")]
-        prompt: Option<String>,
-
-        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "prompt")]
-        file: Option<PathBuf>,
-    },
-
-    /// Submit a worker-backed offload job through a worker Service and wait for the result
-    Offload {
-        #[arg(long)]
-        service: String,
-
-        #[arg(short = 'n', long = "resource-namespace")]
-        resource_namespace: Option<String>,
-
-        #[arg(long = "via-runtime-namespace")]
-        via_runtime_namespace: Option<String>,
-
-        #[arg(long, conflicts_with = "file")]
-        prompt: Option<String>,
-
-        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "prompt")]
-        file: Option<PathBuf>,
-
-        #[arg(long)]
-        intent: Option<String>,
-
-        #[arg(long = "job-name")]
-        job_name: Option<String>,
-
-        #[arg(long = "timeout-seconds", default_value_t = 180)]
-        timeout_seconds: u64,
-
-        #[arg(long = "output-path", value_hint = ValueHint::FilePath)]
-        output_path: Option<PathBuf>,
-
-        #[arg(long, value_enum, default_value_t = WorkerOffloadOutput::Text)]
-        output: WorkerOffloadOutput,
-    },
-}
-
-#[derive(Subcommand, Debug)]
 enum KubeCommand {
-    /// Render supported jarvisctl resources as native Kubernetes manifests
+    /// Experimental: render the supported adapter subset as native Kubernetes manifests
     Render {
         #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
         file: Vec<PathBuf>,
@@ -615,7 +645,7 @@ enum KubeCommand {
         output: KubernetesRenderOutput,
     },
 
-    /// Apply supported jarvisctl resources onto the active Kubernetes cluster
+    /// Experimental: apply the supported adapter subset onto the active Kubernetes cluster
     Apply {
         #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
         file: Vec<PathBuf>,
@@ -630,7 +660,7 @@ enum KubeCommand {
         dry_run_server: bool,
     },
 
-    /// Control a pod-hosted Codex runtime exposed through Kubernetes
+    /// Experimental: control a pod-hosted Codex runtime exposed through Kubernetes
     Runtime {
         #[command(subcommand)]
         command: KubeRuntimeCommand,
@@ -639,7 +669,7 @@ enum KubeCommand {
 
 #[derive(Subcommand, Debug)]
 enum KubeRuntimeCommand {
-    /// Fetch live metadata from a pod-hosted Codex runtime
+    /// Experimental: fetch live metadata from a pod-hosted Codex runtime
     Metadata {
         #[arg(long, required_unless_present = "service", conflicts_with = "service")]
         deployment: Option<String>,
@@ -661,7 +691,7 @@ enum KubeRuntimeCommand {
         json: bool,
     },
 
-    /// Attach to the live output stream of a pod-hosted Codex runtime
+    /// Experimental: attach to the live output stream of a pod-hosted Codex runtime
     Attach {
         #[arg(long, required_unless_present = "service", conflicts_with = "service")]
         deployment: Option<String>,
@@ -680,7 +710,7 @@ enum KubeRuntimeCommand {
         context: Option<String>,
     },
 
-    /// Send text into a pod-hosted Codex runtime
+    /// Experimental: send text into a pod-hosted Codex runtime
     Tell {
         #[arg(long, required_unless_present = "service", conflicts_with = "service")]
         deployment: Option<String>,
@@ -708,7 +738,7 @@ enum KubeRuntimeCommand {
         mode: CodexAppInputMode,
     },
 
-    /// Interrupt the active turn inside a pod-hosted Codex runtime
+    /// Experimental: interrupt the active turn inside a pod-hosted Codex runtime
     Interrupt {
         #[arg(long, required_unless_present = "service", conflicts_with = "service")]
         deployment: Option<String>,
@@ -727,7 +757,7 @@ enum KubeRuntimeCommand {
         context: Option<String>,
     },
 
-    /// Delete a pod-hosted Codex runtime Deployment and its launch ConfigMap
+    /// Experimental: delete a pod-hosted Codex runtime Deployment and its launch ConfigMap
     Delete {
         #[arg(long)]
         deployment: String,
@@ -801,6 +831,8 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             task_note,
             namespace,
             control_namespace,
+            deployment,
+            runtime_labels,
             agents,
             agent,
             fresh,
@@ -827,6 +859,8 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             environment: Default::default(),
             context_overlay: RuntimeContextMetadata {
                 control_namespace,
+                deployment,
+                labels: parse_key_value_pairs(&runtime_labels)?,
                 ..RuntimeContextMetadata::default()
             },
             extra_runtime_args: Vec::new(),
@@ -861,6 +895,31 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             command,
         })
         .map_err(JarvisError::from),
+        Command::Visit {
+            node,
+            text,
+            prompt_file,
+            working_directory,
+            namespace,
+            timeout_seconds,
+            sandbox,
+            model,
+            reasoning_effort,
+            ephemeral,
+            full,
+        } => visit_node(
+            node,
+            text,
+            prompt_file,
+            working_directory,
+            namespace,
+            timeout_seconds,
+            sandbox,
+            model,
+            reasoning_effort,
+            ephemeral,
+            full,
+        ),
         Command::Apply { file, kustomize } => apply_resources(&file, kustomize.as_deref()),
         Command::Get {
             kind,
@@ -873,9 +932,8 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             resource_namespace,
             output,
         } => describe_resource(kind, &name, resource_namespace.as_deref(), output),
+        Command::Node { command } => node_command(command),
         Command::Rollout { command } => rollout_command(command),
-        Command::Application { command } => application_command(command),
-        Command::Worker { command } => worker_command(command),
         Command::Kube { command } => kube_command(command),
         Command::Dashboard {
             backend,
@@ -902,6 +960,21 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             namespace,
             json,
         } => list_sessions(backend, namespace, json),
+        Command::History {
+            backend,
+            namespace,
+            service,
+            resource_namespace,
+            include_turns,
+            json,
+        } => {
+            let namespace = resolve_runtime_namespace(
+                namespace.as_deref(),
+                service.as_deref(),
+                resource_namespace.as_deref(),
+            )?;
+            history(backend, &namespace, include_turns, json)
+        }
         Command::Exec {
             backend,
             namespace,
@@ -961,9 +1034,6 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         }
         Command::CodexAppSessionServe { manifest } => {
             serve_codex_app_session(manifest).map_err(JarvisError::from)
-        }
-        Command::WorkerRunServe { manifest } => {
-            serve_worker_run(manifest).map_err(JarvisError::from)
         }
     }
 }
@@ -1073,6 +1143,69 @@ fn apply_resources(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn visit_node(
+    node: String,
+    text: Option<String>,
+    prompt_file: Option<PathBuf>,
+    working_directory: Option<String>,
+    namespace: Option<String>,
+    timeout_seconds: u64,
+    sandbox: String,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    ephemeral: bool,
+    full: bool,
+) -> Result<(), JarvisError> {
+    let prompt = match (text, prompt_file) {
+        (Some(text), None) => text,
+        (None, Some(path)) => fs::read_to_string(&path).map_err(|error| {
+            JarvisError::Other(anyhow::anyhow!(
+                "failed to read visit prompt file '{}': {}",
+                path.display(),
+                error
+            ))
+        })?,
+        (None, None) => {
+            return Err(JarvisError::Other(anyhow::anyhow!(
+                "provide --text or --file for the visit prompt"
+            )));
+        }
+        (Some(_), Some(_)) => {
+            return Err(JarvisError::Other(anyhow::anyhow!(
+                "use either --text or --file, not both"
+            )));
+        }
+    };
+
+    let result = run_node_visit(NodeVisitOptions {
+        node,
+        prompt,
+        working_directory,
+        namespace,
+        timeout_seconds,
+        sandbox_mode: Some(sandbox),
+        model,
+        reasoning_effort,
+        ephemeral,
+    })
+    .map_err(JarvisError::from)?;
+
+    if full {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).map_err(anyhow::Error::from)?
+        );
+    } else {
+        println!("{}", result.final_message);
+        eprintln!(
+            "visit={} node={} cleanup={}",
+            result.namespace, result.node, result.cleanup_status
+        );
+    }
+    Ok(())
+}
+
 fn get_resources(
     kind: ControlPlaneResourceKindArg,
     resource_namespace: Option<&str>,
@@ -1097,6 +1230,89 @@ fn describe_resource(
             .map_err(JarvisError::from)?
     );
     Ok(())
+}
+
+fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
+    match command {
+        NodeCommand::Register {
+            name,
+            address,
+            ssh_host,
+            ssh_user,
+            local,
+            roles,
+            labels,
+            workspace_root,
+            max_sessions,
+        } => {
+            let messages = register_node(NodeRegisterOptions {
+                name,
+                address,
+                ssh_host,
+                ssh_user,
+                roles,
+                labels: parse_key_value_pairs(&labels)?,
+                workspace_root,
+                max_sessions,
+                local,
+            })
+            .map_err(JarvisError::from)?;
+            for message in messages {
+                println!("{message}");
+            }
+            Ok(())
+        }
+        NodeCommand::Ping { name, output } => {
+            println!(
+                "{}",
+                render_node_probe_output(&name, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        NodeCommand::Cordon { name } => {
+            println!(
+                "{}",
+                set_node_cordoned(&name, true).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        NodeCommand::Uncordon { name } => {
+            println!(
+                "{}",
+                set_node_cordoned(&name, false).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        NodeCommand::SyncCodexAuth { name } => {
+            println!(
+                "{}",
+                sync_codex_auth_to_node(&name).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+    }
+}
+
+fn parse_key_value_pairs(
+    values: &[String],
+) -> Result<std::collections::BTreeMap<String, String>, JarvisError> {
+    let mut parsed = std::collections::BTreeMap::new();
+    for value in values {
+        let Some((key, val)) = value.split_once('=') else {
+            return Err(JarvisError::Other(anyhow::anyhow!(
+                "expected KEY=VALUE, got '{}'",
+                value
+            )));
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(JarvisError::Other(anyhow::anyhow!(
+                "label key must not be empty"
+            )));
+        }
+        parsed.insert(key.to_string(), val.trim().to_string());
+    }
+    Ok(parsed)
 }
 
 fn rollout_command(command: RolloutCommand) -> Result<(), JarvisError> {
@@ -1182,121 +1398,14 @@ fn rollout_command(command: RolloutCommand) -> Result<(), JarvisError> {
     }
 }
 
-fn application_command(command: ApplicationCommand) -> Result<(), JarvisError> {
-    match command {
-        ApplicationCommand::Sync {
-            application,
-            resource_namespace,
-        } => {
-            println!(
-                "{}",
-                sync_application_resource(&application, resource_namespace.as_deref())
-                    .map_err(JarvisError::from)?
-            );
-            Ok(())
-        }
-        ApplicationCommand::Diff {
-            application,
-            resource_namespace,
-            output,
-        } => {
-            println!(
-                "{}",
-                render_application_diff_output(&application, resource_namespace.as_deref(), output)
-                    .map_err(JarvisError::from)?
-            );
-            Ok(())
-        }
-    }
-}
-
-fn worker_command(command: WorkerCommand) -> Result<(), JarvisError> {
-    match command {
-        WorkerCommand::Invoke {
-            worker,
-            resource_namespace,
-            prompt,
-            file,
-        } => {
-            let prompt = read_worker_prompt(prompt.as_deref(), file.as_deref())?;
-            println!(
-                "{}",
-                invoke_worker(&worker, resource_namespace.as_deref(), &prompt)
-                    .map_err(JarvisError::from)?
-            );
-            Ok(())
-        }
-        WorkerCommand::Offload {
-            service,
-            resource_namespace,
-            via_runtime_namespace,
-            prompt,
-            file,
-            intent,
-            job_name,
-            timeout_seconds,
-            output_path,
-            output,
-        } => {
-            let prompt = read_worker_prompt(prompt.as_deref(), file.as_deref())?;
-            let request_payload = WorkerOffloadRequest {
-                service_name: service,
-                resource_namespace,
-                prompt,
-                intent,
-                timeout_seconds: Some(timeout_seconds),
-                output_path: output_path.map(|path| path.display().to_string()),
-                job_name,
-            };
-            let result = if let Some(runtime_namespace) = via_runtime_namespace {
-                request_worker_offload_via_runtime_namespace(&runtime_namespace, request_payload)
-                    .map_err(JarvisError::from)?
-            } else {
-                request_worker_offload_for_current_runtime(request_payload.clone())
-                    .map_err(JarvisError::from)?
-                    .map_or_else(
-                        || offload_worker_task(request_payload).map_err(JarvisError::from),
-                        Ok,
-                    )?
-            };
-
-            match output {
-                WorkerOffloadOutput::Text => {
-                    if let Some(response) = result.response.as_deref() {
-                        print!("{}", response);
-                        if !response.ends_with('\n') {
-                            println!();
-                        }
-                    } else {
-                        println!(
-                            "worker offload completed: {}/{} via {}",
-                            result.namespace, result.job_name, result.service_name
-                        );
-                    }
-                }
-                WorkerOffloadOutput::Json => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&result)
-                            .map_err(anyhow::Error::from)
-                            .map_err(JarvisError::from)?
-                    );
-                }
-                WorkerOffloadOutput::Yaml => {
-                    println!(
-                        "{}",
-                        serde_yaml::to_string(&result)
-                            .map_err(anyhow::Error::from)
-                            .map_err(JarvisError::from)?
-                    );
-                }
-            }
-            Ok(())
-        }
-    }
+fn print_experimental_surface_notice(surface: &str) {
+    eprintln!(
+        "warning: the {surface} surface is experimental and currently receives smoke-test maintenance while jarvisctl core operator paths are prioritized"
+    );
 }
 
 fn kube_command(command: KubeCommand) -> Result<(), JarvisError> {
+    print_experimental_surface_notice("kubernetes");
     match command {
         KubeCommand::Render {
             file,
@@ -1896,19 +2005,6 @@ fn kubectl_list_json(
         .map_err(JarvisError::from)
 }
 
-fn read_worker_prompt(
-    prompt: Option<&str>,
-    file: Option<&std::path::Path>,
-) -> Result<String, JarvisError> {
-    match (prompt, file) {
-        (Some(prompt), None) => Ok(prompt.to_string()),
-        (None, Some(path)) => Ok(fs::read_to_string(path)?),
-        _ => Err(JarvisError::Other(anyhow::anyhow!(
-            "provide either --prompt or --file for worker invoke"
-        ))),
-    }
-}
-
 fn resolve_runtime_namespace(
     namespace: Option<&str>,
     service: Option<&str>,
@@ -1971,27 +2067,6 @@ fn current_runtime_namespace_from_env() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn collect_runtime_sessions() -> Result<Vec<NativeSessionMetadata>, JarvisError> {
-    let mut sessions = collect_native_sessions().map_err(JarvisError::from)?;
-    sessions.extend(collect_codex_app_sessions().map_err(JarvisError::from)?);
-    enrich_native_sessions(&mut sessions).map_err(JarvisError::from)?;
-    sessions.sort_by(|left, right| left.namespace.cmp(&right.namespace));
-    Ok(sessions)
-}
-
-fn session_metadata_for_namespace(namespace: &str) -> Result<NativeSessionMetadata, JarvisError> {
-    if let Some(session) = codex_app_session_metadata(namespace).map_err(JarvisError::from)? {
-        return Ok(session);
-    }
-    if let Some(session) = native::native_session_metadata(namespace).map_err(JarvisError::from)? {
-        return Ok(session);
-    }
-    Err(JarvisError::Other(anyhow::anyhow!(
-        "runtime session '{}' does not exist",
-        namespace
-    )))
-}
-
 #[instrument(err)]
 fn list_sessions(
     backend: SessionBackend,
@@ -1999,7 +2074,7 @@ fn list_sessions(
     json: bool,
 ) -> Result<(), JarvisError> {
     let _ = backend;
-    let mut sessions = collect_runtime_sessions()?;
+    let mut sessions = collect_runtime_sessions().map_err(JarvisError::from)?;
 
     if let Some(namespace) = namespace.as_deref() {
         sessions.retain(|session| session.namespace == namespace);
@@ -2074,13 +2149,128 @@ fn print_runtime_sessions(sessions: &[NativeSessionMetadata]) {
 }
 
 #[instrument(err)]
+fn history(
+    backend: SessionBackend,
+    namespace: &str,
+    include_turns: bool,
+    json: bool,
+) -> Result<(), JarvisError> {
+    let _ = backend;
+    let metadata = runtime::session_metadata_for_namespace(namespace).map_err(JarvisError::from)?;
+    if metadata.backend != "codex-app" {
+        return Err(JarvisError::Other(anyhow::anyhow!(
+            "history is only available for codex-app sessions; '{}' uses '{}'",
+            namespace,
+            metadata.backend
+        )));
+    }
+
+    let response = read_codex_app_thread(namespace, include_turns).map_err(JarvisError::from)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&response).map_err(anyhow::Error::from)?
+        );
+        return Ok(());
+    }
+
+    print_thread_history(namespace, &response);
+    Ok(())
+}
+
+fn print_thread_history(namespace: &str, value: &serde_json::Value) {
+    let thread = value.get("thread").unwrap_or(value);
+    let thread_id = thread
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-");
+    let status = thread
+        .get("status")
+        .and_then(status_label)
+        .unwrap_or_else(|| "-".to_string());
+    println!("{namespace} {thread_id} {status}");
+
+    let turns = thread
+        .get("turns")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if turns.is_empty() {
+        println!("(no turns loaded)");
+        return;
+    }
+
+    for turn in turns.iter().rev().take(12).rev() {
+        let id = turn
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(short_id)
+            .unwrap_or_else(|| "-".to_string());
+        let status = turn
+            .get("status")
+            .and_then(status_label)
+            .unwrap_or_else(|| "-".to_string());
+        let items_view = turn
+            .get("itemsView")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
+        let items = turn
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default();
+        let preview = turn_preview(turn).unwrap_or_default();
+        println!("{id:10} {status:12} {items_view:10} {items:3} {preview}");
+    }
+}
+
+fn status_label(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(raw) => Some(raw.clone()),
+        serde_json::Value::Object(object) => object
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        _ => None,
+    }
+}
+
+fn turn_preview(turn: &serde_json::Value) -> Option<String> {
+    let items = turn.get("items")?.as_array()?;
+    items.iter().rev().find_map(|item| {
+        item.get("text")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| item.get("message").and_then(serde_json::Value::as_str))
+            .or_else(|| item.get("command").and_then(serde_json::Value::as_str))
+            .map(|text| truncate_plain(text, 96))
+    })
+}
+
+fn short_id(raw: &str) -> String {
+    raw.split('-')
+        .next()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(raw)
+        .to_string()
+}
+
+fn truncate_plain(raw: &str, limit: usize) -> String {
+    let normalized = raw.replace('\n', " ").trim().to_string();
+    if normalized.chars().count() <= limit {
+        return normalized;
+    }
+    let mut rendered = normalized
+        .chars()
+        .take(limit.saturating_sub(3))
+        .collect::<String>();
+    rendered.push_str("...");
+    rendered
+}
+
+#[instrument(err)]
 fn exec_agent(backend: SessionBackend, namespace: &str, agent: &str) -> Result<(), JarvisError> {
     let _ = backend;
-    let session = session_metadata_for_namespace(namespace)?;
-    match session.backend.as_str() {
-        "codex-app" => attach_codex_app(namespace).map_err(JarvisError::from),
-        _ => attach_native(namespace, agent).map_err(JarvisError::from),
-    }
+    attach_runtime_session(namespace, agent).map_err(JarvisError::from)
 }
 
 #[instrument(err)]
@@ -2108,23 +2298,15 @@ fn tell(
         }
     };
     let _ = backend;
-    let session = session_metadata_for_namespace(namespace)?;
-    match session.backend.as_str() {
-        "codex-app" => {
-            if !press_enter {
-                return Err(JarvisError::Other(anyhow::anyhow!(
-                    "--no-enter is not supported for codex app sessions"
-                )));
-            }
-            if agent != "agent0" {
-                return Err(JarvisError::Other(anyhow::anyhow!(
-                    "codex app sessions expose a single logical agent named agent0"
-                )));
-            }
-            tell_codex_app_with_mode(namespace, &contents, mode).map_err(JarvisError::from)?;
+    if let Err(local_error) = tell_runtime_session(namespace, agent, &contents, press_enter, mode) {
+        if !press_enter {
+            return Err(JarvisError::from(local_error));
         }
-        _ => {
-            tell_native(namespace, agent, &contents, press_enter).map_err(JarvisError::from)?;
+        let mode_arg = codex_input_mode_arg(mode);
+        if !tell_cluster_runtime_session(namespace, agent, &contents, mode_arg)
+            .map_err(JarvisError::from)?
+        {
+            return Err(JarvisError::from(local_error));
         }
     }
 
@@ -2170,21 +2352,23 @@ fn launch_and_print_codex(options: CodexLaunchOptions) -> Result<(), JarvisError
 #[instrument(err)]
 fn attach_session(backend: SessionBackend, namespace: &str) -> Result<(), JarvisError> {
     let _ = backend;
-    let session = session_metadata_for_namespace(namespace)?;
-    match session.backend.as_str() {
-        "codex-app" => attach_codex_app(namespace).map_err(JarvisError::from),
-        _ => attach_native(namespace, "agent0").map_err(JarvisError::from),
+    if let Err(local_error) = attach_runtime_session(namespace, "agent0") {
+        if !attach_cluster_runtime_session(namespace, "agent0").map_err(JarvisError::from)? {
+            return Err(JarvisError::from(local_error));
+        }
     }
+    Ok(())
 }
 
 #[instrument(err)]
 fn delete_session(backend: SessionBackend, namespace: &str) -> Result<(), JarvisError> {
     let _ = backend;
-    let session = session_metadata_for_namespace(namespace)?;
-    match session.backend.as_str() {
-        "codex-app" => delete_codex_app_session(namespace).map_err(JarvisError::from),
-        _ => delete_native_session(namespace).map_err(JarvisError::from),
+    if let Err(local_error) = delete_runtime_session(namespace) {
+        if !delete_cluster_runtime_session(namespace).map_err(JarvisError::from)? {
+            return Err(JarvisError::from(local_error));
+        }
     }
+    Ok(())
 }
 
 #[instrument(err)]
@@ -2194,17 +2378,19 @@ fn interrupt_agent(
     agent: &str,
 ) -> Result<(), JarvisError> {
     let _ = backend;
-    let session = session_metadata_for_namespace(namespace)?;
-    match session.backend.as_str() {
-        "codex-app" => {
-            if agent != "agent0" {
-                return Err(JarvisError::Other(anyhow::anyhow!(
-                    "codex app sessions expose a single logical agent named agent0"
-                )));
-            }
-            interrupt_codex_app(namespace).map_err(JarvisError::from)
+    if let Err(local_error) = interrupt_runtime_session(namespace, agent) {
+        if !interrupt_cluster_runtime_session(namespace, agent).map_err(JarvisError::from)? {
+            return Err(JarvisError::from(local_error));
         }
-        _ => interrupt_native(namespace, agent).map_err(JarvisError::from),
+    }
+    Ok(())
+}
+
+fn codex_input_mode_arg(mode: CodexAppInputMode) -> &'static str {
+    match mode {
+        CodexAppInputMode::Auto => "auto",
+        CodexAppInputMode::Steer => "steer",
+        CodexAppInputMode::Queue => "queue",
     }
 }
 

@@ -1,5 +1,5 @@
 use crate::SessionBackend;
-use crate::codex_app::{CodexAppLaunchManifest, spawn_codex_app_session};
+use crate::codex_app::{CodexAppLaunchManifest, CodexAppProtocolConfig, spawn_codex_app_session};
 use crate::native::{NativeSessionMetadata, RuntimeContextMetadata};
 use crate::ticket::{TicketNote, slugify};
 use anyhow::{Context, ensure};
@@ -46,6 +46,7 @@ pub struct CodexLaunchOptions {
 #[derive(Debug, Clone)]
 pub struct PreparedCodexLaunch {
     pub ticket: TicketNote,
+    pub runtime_driver: CodexRuntimeDriver,
     pub repo_path: PathBuf,
     pub namespace: String,
     pub resume_session_id: Option<String>,
@@ -110,7 +111,7 @@ pub fn default_namespace_for_ticket(ticket: &TicketNote) -> String {
 
 pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexLaunchRecord> {
     let prepared = prepare_codex_ticket_launch(&options)?;
-    let (runtime_backend, codex_session_id) = match options.driver {
+    let (runtime_backend, codex_session_id) = match prepared.runtime_driver {
         CodexRuntimeDriver::CliPty => {
             let mut launch_command = if launches_codex(&prepared.command) {
                 let mut wrapped = vec!["env".to_string(), "NO_UPDATE_NOTIFIER=1".to_string()];
@@ -168,6 +169,7 @@ pub fn launch_codex_ticket(options: CodexLaunchOptions) -> anyhow::Result<CodexL
                     .iter()
                     .map(|image| image.display().to_string())
                     .collect(),
+                protocol: codex_app_protocol_config(&prepared.ticket),
                 environment: prepared.runtime_environment.clone(),
                 resume_session_id: prepared.resume_session_id.clone(),
                 created_at_epoch_ms: prepared.timestamp_ms,
@@ -228,6 +230,7 @@ pub fn codex_app_manifest_from_prepared(prepared: &PreparedCodexLaunch) -> Codex
             .iter()
             .map(|image| image.display().to_string())
             .collect(),
+        protocol: codex_app_protocol_config(&prepared.ticket),
         environment: prepared.runtime_environment.clone(),
         resume_session_id: prepared.resume_session_id.clone(),
         created_at_epoch_ms: prepared.timestamp_ms,
@@ -258,7 +261,15 @@ pub fn prepare_codex_ticket_launch(
     let resume_session_id = resolve_resume_session_id(&ticket, &namespace, options)?;
     let runtime_args = ticket.codex_cli_args()?;
     let finish_mode = ticket.finish_session_policy()?.to_string();
-    let command = match options.driver {
+    let runtime_driver = ticket
+        .frontmatter
+        .codex_driver
+        .as_deref()
+        .map(parse_codex_driver)
+        .transpose()?
+        .unwrap_or(options.driver);
+
+    let command = match runtime_driver {
         CodexRuntimeDriver::CliPty => {
             let mut runtime_args_with_images = runtime_args.clone();
             runtime_args_with_images.extend(options.extra_runtime_args.clone());
@@ -327,6 +338,15 @@ pub fn prepare_codex_ticket_launch(
             thread_status: None,
             turn_id: None,
             turn_status: None,
+            goal_objective: ticket.frontmatter.codex_goal.clone(),
+            goal_status: None,
+            memory_mode: ticket.frontmatter.codex_memory_mode.clone(),
+            remote_control_status: None,
+            remote_environment_id: None,
+            codex_settings: codex_settings_summary(&ticket),
+            codex_features: ticket.frontmatter.codex_enable_features.clone(),
+            codex_disabled_features: ticket.frontmatter.codex_disable_features.clone(),
+            codex_environments: ticket.frontmatter.codex_environments.clone(),
             live_message: None,
             last_activity: None,
             last_error: None,
@@ -348,6 +368,7 @@ pub fn prepare_codex_ticket_launch(
 
     Ok(PreparedCodexLaunch {
         ticket,
+        runtime_driver,
         repo_path,
         namespace,
         resume_session_id,
@@ -362,6 +383,110 @@ pub fn prepare_codex_ticket_launch(
         readiness_warnings,
         images: options.images.clone(),
     })
+}
+
+fn codex_app_protocol_config(ticket: &TicketNote) -> CodexAppProtocolConfig {
+    let frontmatter = &ticket.frontmatter;
+    CodexAppProtocolConfig {
+        model: trim_opt(frontmatter.codex_model.as_deref()),
+        model_provider: trim_opt(frontmatter.codex_model_provider.as_deref()),
+        reasoning_effort: trim_opt(frontmatter.codex_reasoning_effort.as_deref()),
+        reasoning_summary: trim_opt(frontmatter.codex_reasoning_summary.as_deref()),
+        sandbox_mode: trim_opt(frontmatter.codex_sandbox_mode.as_deref()),
+        approval_policy: trim_opt(frontmatter.codex_approval_policy.as_deref()),
+        approvals_reviewer: trim_opt(frontmatter.codex_approvals_reviewer.as_deref()),
+        personality: trim_opt(frontmatter.codex_personality.as_deref()),
+        service_name: trim_opt(frontmatter.codex_service_name.as_deref())
+            .or_else(|| Some("jarvisctl".to_string())),
+        service_tier: trim_opt(frontmatter.codex_service_tier.as_deref()),
+        thread_source: trim_opt(frontmatter.codex_thread_source.as_deref())
+            .or_else(|| Some("user".to_string())),
+        session_start_source: trim_opt(frontmatter.codex_session_start_source.as_deref()),
+        ephemeral: frontmatter.codex_ephemeral,
+        developer_instructions: trim_opt(frontmatter.codex_developer_instructions.as_deref()),
+        base_instructions: trim_opt(frontmatter.codex_base_instructions.as_deref()),
+        permission_profile: trim_opt(frontmatter.codex_permission_profile.as_deref()),
+        permission_additional_writable_roots: frontmatter
+            .codex_permission_additional_writable_roots
+            .iter()
+            .filter_map(|value| trim_opt(Some(value.as_str())))
+            .collect(),
+        environments: frontmatter
+            .codex_environments
+            .iter()
+            .filter_map(|value| trim_opt(Some(value.as_str())))
+            .collect(),
+        goal: trim_opt(frontmatter.codex_goal.as_deref()),
+        goal_token_budget: frontmatter.codex_goal_token_budget,
+        memory_mode: trim_opt(frontmatter.codex_memory_mode.as_deref()),
+        enabled_features: frontmatter
+            .codex_enable_features
+            .iter()
+            .filter_map(|value| trim_opt(Some(value.as_str())))
+            .collect(),
+        disabled_features: frontmatter
+            .codex_disable_features
+            .iter()
+            .filter_map(|value| trim_opt(Some(value.as_str())))
+            .collect(),
+        thread_config: frontmatter.codex_app_thread_config.clone(),
+        turn_config: frontmatter.codex_app_turn_config.clone(),
+    }
+}
+
+fn codex_settings_summary(ticket: &TicketNote) -> BTreeMap<String, String> {
+    let protocol = codex_app_protocol_config(ticket);
+    let mut settings = BTreeMap::new();
+    for (key, value) in [
+        ("model", protocol.model.as_deref()),
+        ("model_provider", protocol.model_provider.as_deref()),
+        ("reasoning_effort", protocol.reasoning_effort.as_deref()),
+        ("reasoning_summary", protocol.reasoning_summary.as_deref()),
+        ("sandbox_mode", protocol.sandbox_mode.as_deref()),
+        ("approval_policy", protocol.approval_policy.as_deref()),
+        ("approvals_reviewer", protocol.approvals_reviewer.as_deref()),
+        ("personality", protocol.personality.as_deref()),
+        ("service_name", protocol.service_name.as_deref()),
+        ("service_tier", protocol.service_tier.as_deref()),
+        ("thread_source", protocol.thread_source.as_deref()),
+        (
+            "session_start_source",
+            protocol.session_start_source.as_deref(),
+        ),
+        ("permission_profile", protocol.permission_profile.as_deref()),
+    ] {
+        if let Some(value) = value {
+            settings.insert(key.to_string(), value.to_string());
+        }
+    }
+    if let Some(ephemeral) = protocol.ephemeral {
+        settings.insert("ephemeral".to_string(), ephemeral.to_string());
+    }
+    if !protocol.permission_additional_writable_roots.is_empty() {
+        settings.insert(
+            "permission_additional_writable_roots".to_string(),
+            protocol.permission_additional_writable_roots.join(","),
+        );
+    }
+    settings
+}
+
+fn trim_opt(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn parse_codex_driver(value: &str) -> anyhow::Result<CodexRuntimeDriver> {
+    match value.trim() {
+        "app-server" | "app_server" => Ok(CodexRuntimeDriver::AppServer),
+        "cli-pty" | "cli_pty" => Ok(CodexRuntimeDriver::CliPty),
+        other => anyhow::bail!(
+            "unsupported codex_driver '{}'; expected app-server or cli-pty",
+            other
+        ),
+    }
 }
 
 fn jarvis_home() -> anyhow::Result<PathBuf> {
@@ -628,6 +753,33 @@ fn merge_runtime_context(
     }
     if overlay.turn_status.is_some() {
         base.turn_status = overlay.turn_status;
+    }
+    if overlay.goal_objective.is_some() {
+        base.goal_objective = overlay.goal_objective;
+    }
+    if overlay.goal_status.is_some() {
+        base.goal_status = overlay.goal_status;
+    }
+    if overlay.memory_mode.is_some() {
+        base.memory_mode = overlay.memory_mode;
+    }
+    if overlay.remote_control_status.is_some() {
+        base.remote_control_status = overlay.remote_control_status;
+    }
+    if overlay.remote_environment_id.is_some() {
+        base.remote_environment_id = overlay.remote_environment_id;
+    }
+    if !overlay.codex_settings.is_empty() {
+        base.codex_settings.extend(overlay.codex_settings);
+    }
+    if !overlay.codex_features.is_empty() {
+        base.codex_features = overlay.codex_features;
+    }
+    if !overlay.codex_disabled_features.is_empty() {
+        base.codex_disabled_features = overlay.codex_disabled_features;
+    }
+    if !overlay.codex_environments.is_empty() {
+        base.codex_environments = overlay.codex_environments;
     }
     if overlay.live_message.is_some() {
         base.live_message = overlay.live_message;

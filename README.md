@@ -3,34 +3,34 @@
 
 # jarvisctl
 
-> Enterprise-grade orchestrator for CLI/TUI worker apps using a native PTY runtime
+> Operator-first control plane for local and hybrid coding agents
 
-`jarvisctl` runs, inspects, and controls CLI or TUI applications in isolated namespaces. The runtime is native-only now: each namespace is a background PTY session process with a Unix-socket control plane. Older scripts may still pass `--backend native`, but there is no tmux backend anymore.
+`jarvisctl` turns durable task notes into controllable agent runtimes. It launches or resumes work from tickets, keeps live runtime state observable, and makes repeatable runtime and workspace setup portable across machines.
+
+It is not a sandbox, a model marketplace, or a generic infrastructure control plane. It exists to solve the operator gap around coding agents: start the right work, steer it while it is live, inspect what it is doing, and complete the task lifecycle cleanly.
+
+The local runtime is native-only now: each namespace is a background PTY session process with a Unix-socket control plane. Older scripts may still pass `--backend native`, but there is no tmux backend anymore.
 
 It is designed to sit underneath an Obsidian-driven Codex workflow: ticket notes stay in the vault, `jarvisctl dispatch` watches board transitions, and the operator uses the dashboard, attach flow, or Waybar counts to see what is live.
 
+For the current product direction and pruning criteria, see [docs/NORTH_STAR.md](docs/NORTH_STAR.md).
+
 ---
 
-## Features
+## Core Responsibilities
 
-* **Namespaces**: Isolated native PTY session processes for agent groups
-* **Agents**: Each agent runs in a dedicated PTY inside the namespace
-* **Process Inspection**: Query live data (CPU, memory, status, etc.) by name or PID
-* **Namespace Shell Access**: Use `nsenter` to exec into target process namespace
-* **Structured Logging**: Enable `RUST_LOG=info` or `debug` for detailed logs
-* **Agent Command Injection**: Send text/scripts into running agents through the native control plane
-* **Codex Ticket Launches**: Start an interactive Codex session directly from a Markdown ticket note
-* **Declarative Control Plane**: Manage `Namespace`, `Deployment`, `ReplicaSet`, `Job`, `CronJob`, `Application`, `Service`, `NetworkPolicy`, `ConfigMap`, `Secret`, `Volume`, and `Worker` resources from YAML
-* **Kustomize / GitOps Flow**: Render local `kustomization.yaml` trees with `apply -k` or keep them synced through an `Application`
-* **Rollout History / Status**: Track generated `ReplicaSet` revisions, pause or undo rollouts, and wait on managed Deployment progress
-* **Git-Aware Applications**: Surface local or remote Git source revision state for `Application` resources
-* **Worker Backends**: Register bounded Ollama, NVIDIA NIM, or Moonshot/Kimi-backed `Worker` resources for deterministic helper tasks that do not need a full Codex session
-* **Obsidian Board Dispatch**: Watch `Ready for Codex` transitions and move cards through `Codex Working` to `Review`
-* **Operator Dashboard**: Bare `jarvisctl` opens a ratatui control surface for live namespaces and agents
-* **Waybar Status**: Emit namespace and agent counts for a compact desktop status widget
-* **Attach/Exec**: Attach to full namespace or specific agent window/PTY
-* **Clean Deletion**: Gracefully shut down sessions via `jarvisctl delete`
-* **Native Runtime**: Run on `portable-pty` plus a Unix-socket control plane without tmux
+* Launch or resume coding-agent work from durable ticket notes
+* Keep live runtimes steerable with attach, tell, interrupt, delete, and status surfaces
+* Give the operator one place to inspect active work across sessions, threads, agents, and subagents
+* Define repeatable runtime and workspace resources for multi-agent work
+* Keep Obsidian board state, ticket state, and runtime state in sync
+* Provide only the control-plane resources needed to support that workflow
+
+## Deliberate Non-Goals
+
+* It is not a sandbox or VM platform
+* It is not a model catalog or benchmarking playground
+* It is not trying to replace Kubernetes, GitOps, or a general infrastructure control plane
 
 ---
 
@@ -82,7 +82,7 @@ status: ready_for_codex
 owner: codex
 autostart: true
 project: Projects/jarvisctl/Project.md
-repo_path: /home/rootster/documents/jarvisctl
+repo_path: /home/rootster/work/jarvisctl
 ```
 
 The board column is the launch trigger. `status: ready_for_codex` is still a sensible convention for humans and other tooling, but the dispatcher itself keys off the card transition into `Ready for Codex` plus the ticket ownership and `autostart` gate.
@@ -91,7 +91,7 @@ The board column is the launch trigger. `status: ready_for_codex` is still a sen
 
 ```bash
 jarvisctl codex \
-  --task-note /home/rootster/documents/codex/Tickets/jarvisctl-codex-ticket-launch-bootstrap.md
+  --task-note /home/rootster/codex/Tickets/jarvisctl-codex-ticket-launch-bootstrap.md
 ```
 
 This will:
@@ -106,24 +106,37 @@ This will:
 Supported ticket frontmatter for Codex runtime overrides:
 
 ```yaml
-repo_path: /home/rootster/documents/jarvisctl
+repo_path: /home/rootster/work/jarvisctl
 codex_sandbox_mode: danger-full-access
 codex_approval_policy: never
-codex_profile: ollama-local
 codex_model: gpt-5.4
 codex_reasoning_effort: xhigh
+codex_reasoning_summary: concise
+codex_personality: pragmatic
+codex_approvals_reviewer: user
+codex_service_name: jarvisctl
+codex_goal: Finish this ticket and validate the result.
+codex_goal_token_budget: 200000
+codex_memory_mode: enabled
 codex_completion_status: review
 codex_completion_column: Review
 codex_finish_mode: close
 codex_search: true
+codex_enable_features:
+  - remote-control
 codex_add_dirs:
-  - /home/rootster/documents/codex
+  - /home/rootster/codex
 ```
 
 `codex_reasoning_effort` currently accepts `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`.
+`codex_reasoning_summary` accepts `none`, `auto`, `concise`, or `detailed`.
+`codex_personality` accepts `none`, `friendly`, or `pragmatic`.
+`codex_approvals_reviewer` accepts `user`, `auto_review`, or `guardian_subagent`.
 `codex_sandbox_mode` accepts `read-only`, `workspace-write`, or `danger-full-access`.
 `codex_approval_policy` accepts `untrusted`, `on-failure`, `on-request`, or `never`.
 `codex_finish_mode` accepts `close` or `keep`. The default is `close`, which keeps Waybar and `jarvisctl list` aligned with active work rather than idle shells. `close` means the dispatcher finalizes the run on the tracked Codex stop event and closes the namespace unless you explicitly choose `keep`. `codex_finish_tmux` is still accepted as a compatibility alias in older ticket notes.
+
+For the current app-server protocol mapping used by the Obsidian plugin, including goals, memory, permission profiles, environments, remote-control status, feature flags, and escape-hatch config, see [docs/CODEX_APP_SERVER_MAPPING.md](docs/CODEX_APP_SERVER_MAPPING.md).
 
 ### Apply declarative control-plane resources
 
@@ -133,28 +146,25 @@ jarvisctl get deployment -n team-alpha
 jarvisctl describe service planner-svc -n team-alpha
 ```
 
-Supported resources:
+This surface exists to support agent operations. If a resource does not help launch work, observe runtime state, replicate a workspace, or complete the task lifecycle, it should be treated as drift.
 
+Core operator resources:
+
+* `Node`
 * `Namespace`
 * `Deployment`
-* `ReplicaSet`
-* `Job`
-* `CronJob`
-* `Application`
 * `Service`
-* `NetworkPolicy`
 * `ConfigMap`
 * `Secret`
+
+Supporting resources:
+
+* `ReplicaSet`
+* `NetworkPolicy`
 * `Volume`
-* `Worker`
 
 `Deployment` now reconciles into generated `ReplicaSet` revisions and runtime namespaces such as `team-alpha--planner--rev2--r0`.
-`ReplicaSet` is generated by the controller and preserved as rollout history, similar to Kubernetes.
-`Job` launches one-shot managed runs and tracks completions, active runs, failures, retries, typed `conditions`, summary `events`, and per-run event timelines.
-Short-lived native runs now tolerate the “completed before attach” race, so fast batch jobs can finish successfully without being misclassified as failed during runtime teardown.
-`Job` can also target a `Worker` directly through `spec.worker`, which runs an asynchronous local-model task and persists structured `run_details` including backend, worker name, artifact path, optional output path, timestamps, and any terminal error.
-`CronJob` accepts Kubernetes-style 5-field schedules such as `* * * * *`, creates timestamped child `Job` resources, and now reports typed `conditions`, `events`, plus child-job `history`.
-`Application` is a thin local GitOps layer: it renders a source tree, applies owned resources, prunes resources that disappear from the rendered set, records resolved revision plus sync history, reports local Git dirty-worktree state, exposes typed `conditions` and `events`, and can also render from `spec.source.repoURL` plus `spec.source.targetRevision` through a cached remote checkout.
+`ReplicaSet` is generated by the controller and preserved as rollout history, similar to Kubernetes. It is a supporting resource, not a product-center entrypoint.
 
 `Deployment` also supports:
 
@@ -164,36 +174,63 @@ Short-lived native runs now tolerate the “completed before attach” race, so 
 * `spec.strategy.type: Recreate|RollingUpdate`
 * `spec.strategy.rollingUpdate.maxUnavailable`
 * `spec.strategy.rollingUpdate.maxSurge`
+* `spec.template.nodeSelector`
+* `spec.template.tolerations`
 
-`Worker` currently supports:
+### Register machine nodes
 
-* `spec.provider: ollama|nvidia|moonshot`
-* `spec.model`
-* `spec.endpoint`
-* `spec.apiKeyEnv`
-* `spec.role`
-* `spec.systemPrompt`
-* `spec.outputMode: text|json`
-* `spec.temperature`
-* `spec.topP`
-* `spec.frequencyPenalty`
-* `spec.presencePenalty`
-* `spec.numPredict`
-* `spec.numCtx`
+Nodes are Jarvis inventory for local, SSH, and Tailscale-reachable machines. They record where work can run, what a machine is good for, and whether new work should be scheduled there.
 
-Worker-targeting `Service` resources now also support schedulable routing defaults:
+```bash
+jarvisctl node register archiechokie --local --role control-plane --role worker --label arch=arm64 --label network=tailscale --max-sessions 3
+jarvisctl node register archiebald --address 100.115.119.27 --ssh-host archiebald --ssh-user rootster --role worker --label arch=x86_64 --label network=tailscale --max-sessions 6
+jarvisctl get nodes
+jarvisctl node ping archiebald
+jarvisctl node sync-codex-auth archiebald
+jarvisctl node cordon archiebald
+jarvisctl node uncordon archiebald
+```
 
-* `spec.className`
-* `spec.fallbackClassNames`
-* `spec.requiredCapabilities`
-* `spec.preferredProviders`
-* `spec.preferLocal`
+Deployments can select a schedulable node:
 
-`Application` source also supports:
+```yaml
+spec:
+  template:
+    nodeSelector:
+      arch: arm64
+      network: tailscale
+```
 
-* `spec.source.path`
-* `spec.source.repoURL`
-* `spec.source.targetRevision`
+Remote node selection uses SSH to call the selected node's own `jarvisctl codex` command, then folds `jarvisctl list --json` from that node back into local rollout status. Direct `tell`, `interrupt`, `attach`, and `delete` fall back to the remote node when the namespace is not local. Runtime metadata records `JARVIS_NODE_NAME`, `JARVIS_NODE_ADDRESS`, and the `jarvisctl.io/node` label.
+
+Before launching Codex on a remote node, `jarvisctl` syncs the local `~/.codex/auth.json`, `config.toml`, and `version.json` over SSH into the remote node's `~/.codex` directory. The token is streamed over the SSH channel via `tar` stdin, not exposed as a command-line argument. Remote deployment launches are lease-based: the node's previous Codex auth/config files are backed up under `~/.jarvis/codex/auth-leases/<namespace>/` and restored when `jarvisctl delete --namespace <namespace>` closes the remote runtime. If the files did not exist before the leased launch, cleanup removes the synced copies.
+
+You can also refresh a node manually:
+
+```sh
+jarvisctl node sync-codex-auth archiebald
+```
+
+`jarvisctl node ping <name>` reports `CODEX_AUTH` as `present` or `missing` so you can tell whether that node can start Codex without an interactive login.
+
+### Visit a remote node with Codex
+
+`visit` is the lightweight "go there, look around, come back" path for cluster nodes that keep their own vaults, memories, and workspaces. It sends a bounded prompt capsule to a registered SSH node, runs `codex exec` on that node, returns the final answer locally, and restores the leased Codex auth/config when the visit exits.
+
+```bash
+jarvisctl visit \
+  --node archiebald \
+  --text "Inspect this node's local Codex vault and report what is relevant."
+```
+
+Useful options:
+
+* `--working-directory <path>` runs the remote visit from a specific path on that node.
+* `--sandbox read-only|workspace-write|danger-full-access` controls the remote Codex sandbox.
+* `--timeout-seconds <n>` bounds the whole SSH/Codex visit.
+* `--full` prints the captured stdout/stderr envelope and cleanup status.
+
+The visit does not require the remote node to share this machine's `/home/rootster/codex` vault. The remote Codex sees that node's own home directory, vault, memory, and local files.
 
 ### Inspect rollout status and history
 
@@ -215,98 +252,56 @@ jarvisctl rollout undo planner -n team-alpha --to-revision 3
 `rollout resume` unpauses and continues reconciliation.
 `rollout undo` points the Deployment back at a prior `ReplicaSet` revision instead of minting a new one.
 
-### Inspect or force Application sync
-
-```bash
-jarvisctl application diff demo-stack -n gitops
-jarvisctl application sync demo-stack -n gitops
-jarvisctl describe application demo-stack -n gitops --output json
-```
-
-`application diff` is read-only and compares the desired rendered source against the live resources currently owned by the `Application`.
-`application sync` forces a reconcile even when automated sync is disabled in the manifest.
-`describe application` now includes `repo_url`, `source_type`, `source_root`, `source_revision`, and `source_dirty` so Git-backed sources expose where the desired state came from.
-
-### Define and invoke a local worker
+### Define a repeatable runtime workspace
 
 ```yaml
 apiVersion: jarvisctl.io/v1alpha1
 kind: Namespace
 metadata:
-  name: workers-lab
-spec: {}
+  name: runtime-lab
+spec:
+  default_driver: app_server
 ---
 apiVersion: jarvisctl.io/v1alpha1
-kind: Worker
+kind: Deployment
 metadata:
-  name: qwen-junior
-  namespace: workers-lab
+  name: review-bot
+  namespace: runtime-lab
 spec:
-  provider: ollama
-  model: qwen3:8b
-  locality: local
-  memoryMiB: 8192
-  gpuMemoryMiB: 6144
-  role: junior
-  capabilities:
-    - vault
-    - routing
-  maxConcurrent: 1
-  outputMode: json
-  temperature: 0
-  numPredict: 256
-  numCtx: 4096
-  systemPrompt: |
-    You are a bounded local worker. Return strict JSON only.
+  replicas: 1
+  agents: 2
+  driver: app_server
+  template:
+    task_note: /home/rootster/codex/Tickets/review-bot.md
+    working_directory: /home/rootster/work/jarvisctl
 ```
 
 ```bash
-jarvisctl apply -f workers.yaml
-jarvisctl get workers -n workers-lab
-jarvisctl describe worker qwen-junior -n workers-lab --output json
-jarvisctl worker invoke qwen-junior -n workers-lab \
-  --prompt 'Return JSON with schema {"task":"string","results":[{"path":"string","kind":"code|docs|vault"}]} ...'
+jarvisctl apply -f runtime-lab.yaml
+jarvisctl get deployment -n runtime-lab
+jarvisctl rollout status review-bot -n runtime-lab
+jarvisctl list --json
 ```
 
-Use `outputMode: json` for bounded classification, extraction, or routing tasks where a larger Codex session would be wasteful. Use `outputMode: text` only when the task contract is already narrow enough that a plain-text answer is acceptable.
-`memoryMiB` and `gpuMemoryMiB` let the scheduler block a local worker before launch when the machine does not currently have enough free RAM or VRAM for that model class.
-`describe worker --output json` now also reports `locality`, `capabilities`, `max_concurrent`, `active_runs`, `pending_runs`, `available_slots`, `admission`, `admission_code`, `admission_reason`, and the estimated vs machine-available memory fields, so operator clients can see slot pressure and placement readiness directly.
-Hosted `nvidia` and `moonshot` workers use OpenAI-compatible chat-completions endpoints. By default, `nvidia` reads `NVIDIA_API_KEY` and targets `https://integrate.api.nvidia.com/v1/chat/completions`, while `moonshot` reads `MOONSHOT_API_KEY` and targets `https://api.moonshot.cn/v1/chat/completions`.
-For GUI-launched operators like the Obsidian plugin, prefer `spec.apiKeySecretRef` over shell env inheritance. A worker can now resolve hosted credentials from a `Secret` resource in the same control namespace, with the env var acting only as an override when present.
-Third-party models served through NVIDIA Build, such as `moonshotai/kimi-k2-instruct`, still use `provider: nvidia` because the endpoint and credential are NVIDIA-managed. Use `provider: moonshot` only when you are calling Moonshot's own API directly.
-For a concrete hosted-lane setup, see [contrib/openclaw-hosted-workers.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-hosted-workers.yaml). It defines a small `openclaw` namespace with NVIDIA-backed `routing-svc` and `code-svc` worker services over Kimi using secret-backed credentials. Pair it with [contrib/openclaw-hosted-secrets.example.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-hosted-secrets.example.yaml) to create the `Secret` resources those workers expect.
+This is the Kubernetes spirit `jarvisctl` should keep: repeatable runtime and workspace definitions for Codex sessions, not model-provider orchestration.
 
-The NVIDIA Build free-endpoint catalog currently shows 94 preview/free models under the `nim_type_preview` filter, but not all of them fit `jarvisctl`'s current bounded text/json worker contract. For that reason the OpenClaw preset separates **stable hot-path lanes** from **experimental catalog lanes**. See [contrib/openclaw-nvidia-free-endpoints.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-nvidia-free-endpoints.yaml) with its matching [contrib/openclaw-nvidia-build-secret.example.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-nvidia-build-secret.example.yaml).
+### Experimental Kubernetes adapter
 
-### Render or apply onto Kubernetes
+This is an intentionally narrow cluster adapter. It exists to host remote Codex app-server runtimes and repeatable workspaces when needed, not to make `jarvisctl` a generic Kubernetes control plane.
 
 ```bash
-jarvisctl kube render \
-  -f contrib/openclaw-nvidia-build-secret.example.yaml \
-  -f contrib/openclaw-nvidia-free-endpoints.yaml \
-  -f contrib/openclaw-kubernetes-smoke.yaml
-
-jarvisctl kube apply \
-  -f contrib/openclaw-nvidia-build-secret.example.yaml \
-  -f contrib/openclaw-nvidia-free-endpoints.yaml \
-  -f contrib/openclaw-kubernetes-smoke.yaml \
-  --context archiebald-k3s
+jarvisctl kube render -f contrib/codex-kubernetes-runtime-hostpath.yaml
+jarvisctl kube apply -f contrib/codex-kubernetes-runtime-hostpath.yaml --context archiebald-k3s
 ```
 
-`jarvisctl kube render` compiles a supported subset of `jarvisctl` resources into native Kubernetes YAML. Right now that includes:
+`jarvisctl kube render` compiles a supported adapter subset of `jarvisctl` resources into native Kubernetes YAML. Right now that subset is focused on runtime hosting:
 
 * `Namespace -> v1/Namespace`
 * `ConfigMap -> v1/ConfigMap`
 * `Secret -> v1/Secret`
 * `NetworkPolicy -> networking.k8s.io/v1/NetworkPolicy`
 * `Deployment(spec.template.kubernetes) -> v1/ConfigMap + apps/v1/Deployment`
-* `Job(spec.worker) -> batch/v1/Job`
-* `CronJob(spec.jobTemplate.spec.worker) -> batch/v1/CronJob`
-* `Worker -> v1/ConfigMap` metadata surface for cluster inspection
 * `Service(targetKind=runtime) -> v1/Service`
-* `Service(targetKind=worker) -> v1/ConfigMap` routing metadata surface for cluster inspection
-
-Worker-backed Kubernetes jobs execute inside the cluster and call the selected worker endpoint directly. For hosted NVIDIA lanes this means the K3s pod makes the `chat/completions` request itself using the referenced Kubernetes `Secret`, while `jarvisctl` still does the service-to-worker routing decision at compile time.
 
 Kubernetes-hosted Codex runtimes use the same ticket launch contract as local `jarvisctl codex`. A `Deployment` with `spec.template.kubernetes` renders:
 
@@ -316,8 +311,8 @@ Kubernetes-hosted Codex runtimes use the same ticket launch contract as local `j
 
 For a real cluster proof, use a baked runtime image instead of bind-mounting the host `jarvisctl` binary into the pod. The checked-in runtime image and manifest are:
 
-* [contrib/Dockerfile.kube-runtime](file:///home/rootster/documents/jarvisctl/contrib/Dockerfile.kube-runtime)
-* [contrib/codex-kubernetes-runtime-hostpath.yaml](file:///home/rootster/documents/jarvisctl/contrib/codex-kubernetes-runtime-hostpath.yaml)
+* [contrib/Dockerfile.kube-runtime](file:///home/rootster/work/jarvisctl/contrib/Dockerfile.kube-runtime)
+* [contrib/codex-kubernetes-runtime-hostpath.yaml](file:///home/rootster/work/jarvisctl/contrib/codex-kubernetes-runtime-hostpath.yaml)
 
 Typical single-node k3s flow:
 
@@ -335,9 +330,11 @@ The current Kubernetes proof is intentionally narrow:
 * `spec.driver` must be `app_server`
 * `kubernetes.workspaceHostPath` and `kubernetes.workspaceMountPath` must match `spec.template.working_directory`
 
+Generic cluster parity is explicitly out of scope. This surface gets smoke-test maintenance while the core operator path is prioritized.
+
 `jarvisctl kube apply --dry-run-server` automatically falls back to a client dry run when the rendered namespace does not exist yet, because Kubernetes cannot perform a server-side dry run for namespaced objects inside a namespace that has not actually been created.
 
-### Operate a Kubernetes-hosted Codex runtime
+### Operate an experimental Kubernetes-hosted Codex runtime
 
 Once the compiled Deployment and runtime Service are live in the cluster, `jarvisctl` can reach the in-pod Codex app-server through `kubectl port-forward`:
 
@@ -358,211 +355,6 @@ For the current hostPath-based proof, keep these paths aligned:
 * `spec.template.kubernetes.workspaceMountPath`
 
 The pod then gets a usable repo workspace plus whatever additional hostPath mounts you provide for `.codex`, the shared vault, and `.jarvis`.
-
-For the current OpenClaw cluster smoke on this machine, use [contrib/openclaw-kubernetes-smoke.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-kubernetes-smoke.yaml) together with [contrib/openclaw-nvidia-free-endpoints.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-nvidia-free-endpoints.yaml) and [contrib/openclaw-nvidia-build-secret.example.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-nvidia-build-secret.example.yaml). The stable cluster hot path remains `routing-svc -> kimi-routing` and `code-svc -> kimi-code`.
-
-Stable services in that preset:
-
-* `routing-svc`: `moonshotai/kimi-k2-instruct`
-* `code-svc`: `moonshotai/kimi-k2-instruct`
-
-Experimental services in that preset:
-
-* `routing-exp-svc`: `nvidia/nemotron-mini-4b-instruct` with `z-ai/glm4.7`
-* `planning-exp-svc`: `stepfun-ai/step-3-5-flash`
-* `reasoning-exp-svc`: `deepseek-ai/deepseek-v3.1-terminus` with `microsoft/phi-4-mini-flash-reasoning`
-* `heavy-code-exp-svc`: `qwen/qwen3-coder-480b-a35b-instruct` with `mistralai/devstral-2-123b-instruct-2512`
-* `safety-exp-svc`: `nvidia/llama-3.1-nemotron-safety-guard-8b-v3` with `nvidia/nemotron-content-safety-reasoning-4b`
-
-The preset also tags workers with `metadata.labels.stability: stable|experimental`, and the stable services select only `stability: stable` workers. That keeps the hot path narrow in the UI and at runtime:
-
-* `routing-svc` resolves only the proven Kimi routing lane
-* `code-svc` resolves only the proven Kimi coding lane
-* `*-exp-svc` resources are explicit opt-in lanes for scorecards, probes, and manual evaluation, including the weaker routing alternates
-
-Typical bootstrap:
-
-```bash
-jarvisctl apply \
-  -f contrib/openclaw-nvidia-build-secret.example.yaml \
-  -f contrib/openclaw-nvidia-free-endpoints.yaml
-
-jarvisctl get workers -n openclaw --output table
-jarvisctl get services -n openclaw --output table
-```
-
-Then run the probe pack:
-
-```bash
-jarvisctl apply -f contrib/openclaw-nvidia-free-endpoint-probes.yaml
-jarvisctl get jobs -n openclaw --output table
-jarvisctl describe job code-titlecase -n openclaw --output json
-```
-
-This is the intended OpenClaw split:
-
-* Codex / OpenAI: primary orchestrator, final reviewer, high-ambiguity work
-* NVIDIA Build free endpoints: bounded offload lanes for predictable routing and code, with broader catalog lanes kept behind explicit experimental services until scorecards prove them
-* Ollama local workers: cheapest deterministic lanes when the task is narrow enough and the machine has headroom
-
-### Define a hosted NVIDIA or Moonshot worker
-
-```yaml
-apiVersion: jarvisctl.io/v1alpha1
-kind: Worker
-metadata:
-  name: nemotron-routing
-  namespace: workers-lab
-spec:
-  provider: nvidia
-  model: nvidia/nemotron-mini-4b-instruct
-  locality: remote
-  apiKeySecretRef:
-    name: hosted-llm-creds
-    key: nvidiaApiKey
-  pool: nvidia-mini
-  classes:
-    - junior-routing
-  capabilities:
-    - routing
-    - json
-  maxConcurrent: 2
-  outputMode: json
-  temperature: 0.2
-  topP: 0.7
-  numPredict: 256
-  systemPrompt: |
-    You are a bounded hosted routing worker. Return strict JSON only.
----
-apiVersion: jarvisctl.io/v1alpha1
-kind: Worker
-metadata:
-  name: kimi-code
-  namespace: workers-lab
-spec:
-  provider: nvidia
-  model: moonshotai/kimi-k2-instruct
-  locality: remote
-  apiKeySecretRef:
-    name: nvidia-build
-    key: apiKey
-  pool: nvidia-code
-  classes:
-    - junior-code
-  capabilities:
-    - code
-    - reasoning
-    - json
-  maxConcurrent: 2
-  outputMode: json
-  temperature: 0.1
-  topP: 0.7
-  numPredict: 512
-  systemPrompt: |
-    You are a bounded hosted code worker. Return strict JSON only.
-```
-
-For hosted workers, either provide `apiKeySecretRef` or make sure the API key env var is present in the process environment that runs `jarvisctl`. If the credential source is missing, the scheduler will surface `admission_code: credentials_missing` instead of attempting a request.
-For a multi-lane free-endpoint scorecard setup, see [contrib/openclaw-nvidia-free-endpoint-probes.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-nvidia-free-endpoint-probes.yaml). It layers route and code probes on top of the stable services, plus an explicit planning probe for the experimental planner lane.
-
-### Run a worker-backed Job
-
-```yaml
-apiVersion: jarvisctl.io/v1alpha1
-kind: Job
-metadata:
-  name: summarize-docs
-  namespace: workers-lab
-spec:
-  parallelism: 1
-  completions: 1
-  backoffLimit: 0
-  worker:
-    selector:
-      matchLabels:
-        lane: junior
-    requiredCapabilities:
-      - vault
-    preferLocal: true
-    timeoutSeconds: 120
-    outputPath: /tmp/jarvisctl-worker-job-output.json
-    prompt: |
-      Return JSON with schema {"task":"string","results":[{"path":"string","kind":"code|docs|vault"}]}.
-      Use task="scan" and return one result for path "/home/rootster/documents/codex/Home.md" with kind "vault".
-```
-
-```bash
-jarvisctl apply -f worker-job.yaml
-jarvisctl describe job summarize-docs -n workers-lab --output json
-```
-
-Worker-backed jobs do not create a live Codex runtime namespace. Instead, the controller spawns an asynchronous worker-run helper, stores the full worker response under `~/.jarvis/control-plane/state/worker-runs/.../artifacts/`, optionally mirrors it to `spec.worker.outputPath`, and reports per-run metadata in `status.run_details`.
-When all matching workers are saturated, runs stay in `phase: pending` with `admission_state: pending` and a scheduler reason such as `waiting for capacity on preferred local worker ...` until a slot becomes available.
-When `preferLocal: true` is set and a matching local worker is blocked by RAM or VRAM pressure, the scheduler can fall back to a matching remote worker and records that with `admission_code: remote_fallback`.
-`describe job --output json` now also exposes top-level `conditions` and `events`, while each `run_details[]` entry carries its own `events` timeline for UI clients.
-Optional `spec.worker.validation.shellCommand` lets you score or verify the produced worker output after the model returns. The validator receives `JARVIS_WORKER_ARTIFACT_PATH`, `JARVIS_WORKER_OUTPUT_PATH`, `JARVIS_WORKER_NAME`, `JARVIS_WORKER_NAMESPACE`, `JARVIS_WORKER_EXECUTION_ID`, `JARVIS_WORKER_PROVIDER`, and `JARVIS_WORKER_MODEL`. Set `failJobOnFailure: true` to make a failed scorecard fail the Job, or leave it `false` to keep the run successful while still surfacing `validation_state`, `validation_message`, and validation events in `status.run_details`.
-For a concrete hosted-model scorecard example, see [contrib/openclaw-validated-probes.yaml](file:///home/rootster/documents/jarvisctl/contrib/openclaw-validated-probes.yaml). It layers route and code probes on top of the hosted OpenClaw worker services and demonstrates non-enforcing validation for Nemotron routing plus enforcing validation for Kimi code generation.
-
-### Offload from a live Codex runtime
-
-If a live Codex namespace should stay in the loop but hand a bounded task to a worker lane, launch that runtime with a control namespace and then offload through a worker `Service`.
-
-Launch the runtime:
-
-```bash
-jarvisctl codex \
-  --namespace openclaw-runtime-v3 \
-  --control-namespace openclaw \
-  --task-note /home/rootster/documents/codex/Tickets/openclaw-runtime-worker-flow-v3.md \
-  --message 'Stay open. Use worker services for bounded route/code tasks.'
-```
-
-Then offload via the runtime host session:
-
-```bash
-jarvisctl worker offload \
-  --service routing-svc \
-  -n openclaw \
-  --via-runtime-namespace openclaw-runtime-v3 \
-  --prompt 'Return strict JSON with lane, confidence, and selected_files for a bounded title-case helper task.' \
-  --output json
-```
-
-Or for a code lane:
-
-```bash
-jarvisctl worker offload \
-  --service code-svc \
-  -n openclaw \
-  --via-runtime-namespace openclaw-runtime-v3 \
-  --prompt 'Return strict JSON with a JavaScript function implementing normalizeTitleCase(input).' \
-  --output json
-```
-
-This path matters because a sandboxed live Codex shell may not be allowed to write manifests under `~/.jarvis/control-plane/...` directly. `--via-runtime-namespace` sends the request through the live app-server host session, which creates the worker-backed `Job`, waits for it, and returns a structured `WorkerOffloadResult`.
-
-The returned JSON includes:
-
-* `job_name`, `namespace`, and `service_name`
-* selected `worker`, `worker_provider`, `worker_model`, and `worker_locality`
-* `selected_class` and `fallback_class`
-* `validation_state` and `validation_message` when a scorecard ran
-* `artifact_path`, `output_path`, and inline `response` when available
-
-The OpenClaw runtime demo uses this split:
-
-* Codex runtime: orchestration, checkpointing, subagent review, receiver handoff
-* `routing-svc`: bounded route selection
-* `code-svc`: bounded junior-code generation on Kimi
-* receiver namespace: parked follow-up endpoint for cross-namespace queue validation
-
-### Inspect CronJob status
-
-```bash
-jarvisctl describe cronjob minute-worker -n workers-lab --output json
-```
-
-`describe cronjob --output json` now includes `conditions`, `events`, `successful_jobs`, `failed_jobs`, and `history[]` entries that summarize each retained child job with its phase, worker-backed flag, selected workers, and last transition timestamp.
 
 ### Apply a local kustomization tree
 
@@ -645,6 +437,15 @@ jarvisctl tell --namespace botfarm --agent agent0 --file prompt.md
 ```
 
 For Codex app-server sessions, `tell` also accepts `--mode auto|steer|queue`.
+
+### Read Codex thread history
+
+```bash
+jarvisctl history --namespace codex-example --json
+jarvisctl history --namespace codex-example
+```
+
+`history` calls app-server `thread/read` with `includeTurns` and returns the persisted thread payload. The plain view is intentionally compact for operator scans; plugin clients should use `--json`.
 `auto` keeps the existing behavior and steers the active turn when one is running.
 `queue` starts a follow-up turn without clobbering the current active turn pointer, which covers the queued follow-up workflow added in newer Codex builds.
 
@@ -734,7 +535,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now jarvisctl-dispatch.service
 ```
 
-The example service intentionally runs at lower priority with a `15` second interval so it does not compete aggressively with Codex sessions, Ollama, or local cluster workloads on the same machine.
+The example service intentionally runs at lower priority with a `15` second interval so it does not compete aggressively with active Codex sessions or other local development work on the same machine.
 
 With that service active, moving a linked ticket card into `Ready for Codex` becomes the normal local launch trigger. The dispatcher then owns the board write-back loop:
 
@@ -745,8 +546,8 @@ With that service active, moving a linked ticket card into `Ready for Codex` bec
 The service file assumes:
 
 * `jarvisctl` is installed at `%h/.local/bin/jarvisctl`
-* your vault lives at `%h/documents/codex`
-* the repo checkout lives at `%h/documents/jarvisctl`
+* your vault lives at `%h/codex`
+* the repo checkout lives at `%h/work/jarvisctl`
 
 Adjust the paths if your machine layout differs.
 

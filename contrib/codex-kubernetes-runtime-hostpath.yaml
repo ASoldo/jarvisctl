@@ -28,9 +28,9 @@ spec:
   driver: app_server
   template:
     # Replace this with your ticket note.
-    task_note: /home/rootster/documents/codex/Tickets/openclaw-runtime-offload-smoke.md
+    task_note: /home/rootster/codex/Tickets/openclaw-runtime-offload-smoke.md
     # This working directory must match the workspaceHostPath / workspaceMountPath pair below.
-    working_directory: /home/rootster/documents/jarvisctl
+    working_directory: /home/rootster/work/jarvisctl
     operator_message: |
       Start, acknowledge briefly that this Kubernetes-hosted runtime is ready, and then remain parked for operator follow-up.
     labels:
@@ -40,16 +40,16 @@ spec:
       image: docker.io/library/jarvisctl-kube-runtime:dev
       imagePullPolicy: Never
       controlPort: 47999
-      workspaceHostPath: /home/rootster/documents/jarvisctl
-      workspaceMountPath: /home/rootster/documents/jarvisctl
+      workspaceHostPath: /home/rootster/work/jarvisctl
+      workspaceMountPath: /home/rootster/work/jarvisctl
       env:
         HOME: /home/rootster
         PATH: /usr/local/bin:/usr/bin:/bin
       hostPathMounts:
         - hostPath: /home/rootster/.codex
           mountPath: /home/rootster/.codex
-        - hostPath: /home/rootster/documents/codex
-          mountPath: /home/rootster/documents/codex
+        - hostPath: /home/rootster/codex
+          mountPath: /home/rootster/codex
         - hostPath: /home/rootster/.jarvis
           mountPath: /home/rootster/.jarvis
 ---

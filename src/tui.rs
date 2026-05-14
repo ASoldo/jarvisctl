@@ -685,6 +685,37 @@ fn render_runtime_overview_card(
                 Span::styled(last_activity, Style::default().fg(TEXT)),
             ]));
         }
+        if let Some(goal) = context.goal_objective.as_deref() {
+            let status = context.goal_status.as_deref().unwrap_or("active");
+            lines.push(Line::from(vec![
+                Span::styled("Goal: ", Style::default().fg(SUBTLE_TEXT)),
+                Span::styled(status, status_style(status)),
+                Span::styled("  ", Style::default().fg(SUBTLE_TEXT)),
+                Span::styled(truncate_for_cell(goal, 160), Style::default().fg(TEXT)),
+            ]));
+        }
+        if let Some(memory_mode) = context.memory_mode.as_deref() {
+            let remote = context
+                .remote_control_status
+                .as_deref()
+                .map(|status| match context.remote_environment_id.as_deref() {
+                    Some(environment) => format!("  remote {status}/{environment}"),
+                    None => format!("  remote {status}"),
+                })
+                .unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled("Codex: ", Style::default().fg(SUBTLE_TEXT)),
+                Span::styled(
+                    format!("memory {memory_mode}{remote}"),
+                    Style::default().fg(TEXT),
+                ),
+            ]));
+        } else if let Some(remote_status) = context.remote_control_status.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled("Codex: ", Style::default().fg(SUBTLE_TEXT)),
+                Span::styled(format!("remote {remote_status}"), Style::default().fg(TEXT)),
+            ]));
+        }
         if let Some(live_message) = context.live_message.as_deref() {
             lines.push(Line::from(vec![
                 Span::styled("Live: ", Style::default().fg(SUBTLE_TEXT)),

@@ -1,4 +1,3 @@
-use crate::control_plane::{WorkerOffloadRequest, WorkerOffloadResult, offload_worker_task};
 use crate::native::{
     NativeAgentMetadata, NativeSessionMetadata, RuntimeContextMetadata, RuntimeFeedEntry,
     RuntimeSubagentAction, RuntimeSubagentMetadata,
@@ -46,11 +45,67 @@ pub struct CodexAppLaunchManifest {
     pub shell_command: String,
     pub startup_prompt: String,
     pub images: Vec<String>,
+    #[serde(default)]
+    pub protocol: CodexAppProtocolConfig,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub environment: BTreeMap<String, String>,
     pub resume_session_id: Option<String>,
     pub created_at_epoch_ms: u128,
     pub context: RuntimeContextMetadata,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CodexAppProtocolConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvals_reviewer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personality: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_start_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub developer_instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permission_additional_writable_roots: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub environments: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_token_budget: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enabled_features: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_features: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub thread_config: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub turn_config: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum, Default)]
@@ -66,8 +121,8 @@ pub enum CodexAppInputMode {
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 enum ClientMessage {
     Metadata,
-    WorkerOffload {
-        request: WorkerOffloadRequest,
+    ReadThread {
+        include_turns: bool,
     },
     Attach {
         agent: String,
@@ -86,7 +141,7 @@ enum ServerMessage {
     Ok,
     Error { message: String },
     Metadata(NativeSessionMetadata),
-    WorkerOffloadResult(WorkerOffloadResult),
+    ThreadHistory(Value),
     Attached { namespace: String, agent: String },
     Output { data_base64: String },
     Exited { agent: String },
@@ -114,6 +169,7 @@ struct AppSessionState {
 struct CodexAppSession {
     namespace: String,
     session_dir: PathBuf,
+    protocol: CodexAppProtocolConfig,
     state: Mutex<AppSessionState>,
     writer: Mutex<ChildStdin>,
     child: Mutex<Child>,
@@ -310,6 +366,27 @@ impl CodexAppSession {
                     None,
                 )?;
             }
+            "thread/goal/updated" => {
+                if let Some(goal) = params.get("goal") {
+                    self.apply_goal(goal)?;
+                }
+            }
+            "thread/goal/cleared" => {
+                self.mutate_state(|state| {
+                    let context = state.metadata.context.get_or_insert_with(Default::default);
+                    context.goal_objective = None;
+                    context.goal_status = None;
+                    context.last_activity = Some("goal cleared".to_string());
+                })?;
+                self.upsert_runtime_event(
+                    format!("goal-cleared:{}", now_epoch_ms()),
+                    "goal",
+                    "Goal cleared",
+                    None,
+                    Some("cleared".to_string()),
+                    Some("codex".to_string()),
+                )?;
+            }
             "turn/started" => {
                 if let Some(turn) = params.get("turn") {
                     self.apply_turn(turn)?;
@@ -335,6 +412,13 @@ impl CodexAppSession {
                         .get("status")
                         .and_then(Value::as_str)
                         .unwrap_or("completed");
+                    if status == "failed" {
+                        let detail = self.infer_failed_turn_detail()?.unwrap_or_else(|| {
+                            "Codex turn failed before app-server returned a detailed error"
+                                .to_string()
+                        });
+                        self.record_error(&detail)?;
+                    }
                     self.upsert_runtime_event(
                         format!(
                             "turn:{}",
@@ -435,6 +519,34 @@ impl CodexAppSession {
                 if let Some(item) = params.get("item") {
                     self.apply_completed_item(item)?;
                 }
+            }
+            "remoteControl/status/changed" => {
+                let status = params
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                let environment_id = params
+                    .get("environmentId")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                self.mutate_state(|state| {
+                    let context = state.metadata.context.get_or_insert_with(Default::default);
+                    context.remote_control_status = Some(status.clone());
+                    context.remote_environment_id = environment_id.clone();
+                    context.last_activity = Some(match environment_id.as_deref() {
+                        Some(id) => format!("remote-control {status} ({id})"),
+                        None => format!("remote-control {status}"),
+                    });
+                })?;
+                self.upsert_runtime_event(
+                    "remote-control".to_string(),
+                    "remote-control",
+                    "Remote control status",
+                    environment_id,
+                    Some(status),
+                    Some("codex".to_string()),
+                )?;
             }
             _ => {}
         }
@@ -571,6 +683,36 @@ impl CodexAppSession {
         })
     }
 
+    fn apply_goal(&self, goal: &Value) -> anyhow::Result<()> {
+        let objective = goal
+            .get("objective")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let status = goal
+            .get("status")
+            .and_then(thread_status_from_value)
+            .or_else(|| {
+                goal.get("status")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or_else(|| "active".to_string());
+        self.mutate_state(|state| {
+            let context = state.metadata.context.get_or_insert_with(Default::default);
+            context.goal_objective = objective.clone();
+            context.goal_status = Some(status.clone());
+            context.last_activity = Some(format!("goal {}", status));
+        })?;
+        self.upsert_runtime_event(
+            "goal".to_string(),
+            "goal",
+            "Goal updated",
+            objective.map(|value| truncate_block(&value, 2400)),
+            Some(status),
+            Some("codex".to_string()),
+        )
+    }
+
     fn apply_completed_item(&self, item: &Value) -> anyhow::Result<()> {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
         match item_type {
@@ -704,6 +846,51 @@ impl CodexAppSession {
         self.append_text_line(format!("[error] {}", message))
     }
 
+    fn infer_failed_turn_detail(&self) -> anyhow::Result<Option<String>> {
+        let transcript_path = {
+            let state = self.state.lock().unwrap();
+            state
+                .metadata
+                .context
+                .as_ref()
+                .and_then(|context| context.transcript_path.clone())
+        };
+        let Some(transcript_path) = transcript_path else {
+            return Ok(None);
+        };
+        let Ok(file) = File::open(&transcript_path) else {
+            return Ok(None);
+        };
+
+        for line in BufReader::new(file).lines().map_while(Result::ok) {
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let payload = value.get("payload").unwrap_or(&Value::Null);
+            let is_token_count = payload.get("type").and_then(Value::as_str) == Some("token_count");
+            if !is_token_count {
+                continue;
+            }
+            let credits = payload
+                .get("rate_limits")
+                .and_then(|limits| limits.get("credits"));
+            let balance = credits
+                .and_then(|credits| credits.get("balance"))
+                .and_then(Value::as_str);
+            let has_credits = credits
+                .and_then(|credits| credits.get("has_credits"))
+                .and_then(Value::as_bool);
+            if balance == Some("0") || has_credits == Some(false) {
+                return Ok(Some(
+                    "Codex turn failed before model output because quota or credits are unavailable; run /status for details"
+                        .to_string(),
+                ));
+            }
+        }
+
+        Ok(None)
+    }
+
     fn clear_last_error(&self) -> anyhow::Result<()> {
         self.mutate_state(|state| {
             if let Some(context) = state.metadata.context.as_mut() {
@@ -721,7 +908,7 @@ impl CodexAppSession {
                     "version": env!("CARGO_PKG_VERSION"),
                 },
                 "capabilities": {
-                    "experimentalApi": false,
+                    "experimentalApi": true,
                 }
             }),
         )?;
@@ -730,18 +917,10 @@ impl CodexAppSession {
         let thread_response = if let Some(session_id) = manifest.resume_session_id.as_deref() {
             self.call(
                 "thread/resume",
-                json!({
-                    "threadId": session_id,
-                    "cwd": manifest.working_directory,
-                }),
+                build_thread_resume_params(session_id, manifest),
             )?
         } else {
-            self.call(
-                "thread/start",
-                json!({
-                    "cwd": manifest.working_directory,
-                }),
-            )?
+            self.call("thread/start", build_thread_start_params(manifest))?
         };
 
         if let Some(thread) = thread_response.get("thread") {
@@ -763,13 +942,16 @@ impl CodexAppSession {
                 .ok_or_else(|| anyhow!("thread/start did not return a thread id"))?
         };
 
+        self.apply_thread_side_effects(&thread_id, manifest)?;
+
         let turn_response = self.call(
             "turn/start",
-            json!({
-                "threadId": thread_id,
-                "input": build_user_inputs(&manifest.startup_prompt, &manifest.images),
-                "cwd": manifest.working_directory,
-            }),
+            build_turn_start_params(
+                &thread_id,
+                build_user_inputs(&manifest.startup_prompt, &manifest.images),
+                manifest.working_directory.as_deref(),
+                &manifest.protocol,
+            ),
         )?;
         if let Some(turn) = turn_response.get("turn") {
             self.apply_turn(turn)?;
@@ -788,6 +970,79 @@ impl CodexAppSession {
             let _ = self.record_error(&format!("failed to inspect apps MCP status: {}", error));
         }
         Ok(())
+    }
+
+    fn apply_thread_side_effects(
+        &self,
+        thread_id: &str,
+        manifest: &CodexAppLaunchManifest,
+    ) -> anyhow::Result<()> {
+        if let Some(goal) = manifest.protocol.goal.as_deref() {
+            let mut params = json!({
+                "threadId": thread_id,
+                "objective": goal,
+            });
+            if let Some(token_budget) = manifest.protocol.goal_token_budget {
+                params["tokenBudget"] = json!(token_budget);
+            }
+            match self.call("thread/goal/set", params) {
+                Ok(response) => {
+                    if let Some(goal) = response.get("goal") {
+                        self.apply_goal(goal)?;
+                    } else {
+                        self.mark_requested_goal(goal)?;
+                    }
+                }
+                Err(error) => {
+                    self.mark_requested_goal(goal)?;
+                    self.upsert_runtime_event(
+                        "goal-protocol".to_string(),
+                        "goal",
+                        "Goal requested",
+                        Some(format!(
+                            "app-server did not accept thread/goal/set: {}",
+                            truncate_line(&error.to_string(), 180)
+                        )),
+                        Some("requested".to_string()),
+                        Some("jarvisctl".to_string()),
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn mark_requested_goal(&self, goal: &str) -> anyhow::Result<()> {
+        self.mutate_state(|state| {
+            let context = state.metadata.context.get_or_insert_with(Default::default);
+            context.goal_objective = Some(goal.to_string());
+            context.goal_status = Some("requested".to_string());
+        })
+    }
+
+    fn read_thread(&self, include_turns: bool) -> anyhow::Result<Value> {
+        let thread_id = {
+            let metadata = self.metadata();
+            metadata
+                .context
+                .as_ref()
+                .and_then(|context| {
+                    context
+                        .thread_id
+                        .clone()
+                        .or_else(|| context.codex_session_id.clone())
+                })
+                .ok_or_else(|| anyhow!("codex app session has no thread id"))?
+        };
+
+        self.call(
+            "thread/read",
+            json!({
+                "threadId": thread_id,
+                "includeTurns": include_turns,
+            }),
+        )
     }
 
     fn send_operator_message(&self, text: &str, mode: CodexAppInputMode) -> anyhow::Result<()> {
@@ -858,10 +1113,7 @@ impl CodexAppSession {
         } else {
             let response = self.call(
                 "turn/start",
-                json!({
-                    "threadId": thread_id,
-                    "input": input,
-                }),
+                build_turn_start_params(&thread_id, input, None, &self.protocol),
             )?;
             let turn = response.get("turn");
             if !active {
@@ -1060,7 +1312,9 @@ pub fn spawn_codex_app_session(
         .spawn()
         .context("failed to spawn codex app session server")?;
 
-    wait_for_codex_app_session(&manifest.namespace)
+    wait_for_codex_app_session(&manifest.namespace).inspect_err(|_| {
+        let _ = cleanup_stale_session(&manifest.namespace);
+    })
 }
 
 pub fn serve_codex_app_session(manifest_path: PathBuf) -> anyhow::Result<()> {
@@ -1128,6 +1382,12 @@ pub fn serve_codex_app_session(manifest_path: PathBuf) -> anyhow::Result<()> {
         shell_command: manifest.shell_command.clone(),
         context: Some(RuntimeContextMetadata {
             event_log_path: Some(events_path.display().to_string()),
+            codex_settings: protocol_settings_summary(&manifest.protocol),
+            codex_features: manifest.protocol.enabled_features.clone(),
+            codex_disabled_features: manifest.protocol.disabled_features.clone(),
+            codex_environments: manifest.protocol.environments.clone(),
+            memory_mode: manifest.protocol.memory_mode.clone(),
+            goal_objective: manifest.protocol.goal.clone(),
             recent_events: vec![RuntimeFeedEntry {
                 id: format!("session:{}:launch", manifest.namespace),
                 kind: "session".to_string(),
@@ -1156,6 +1416,7 @@ pub fn serve_codex_app_session(manifest_path: PathBuf) -> anyhow::Result<()> {
             active_command_outputs: BTreeMap::new(),
         }),
         writer: Mutex::new(stdin),
+        protocol: manifest.protocol.clone(),
         child: Mutex::new(child),
         pending: Mutex::new(HashMap::new()),
         next_request_id: AtomicU64::new(1),
@@ -1363,6 +1624,10 @@ pub fn collect_codex_app_sessions() -> anyhow::Result<Vec<NativeSessionMetadata>
 pub fn codex_app_session_metadata(
     namespace: &str,
 ) -> anyhow::Result<Option<NativeSessionMetadata>> {
+    if !session_dir_for(namespace)?.exists() {
+        return Ok(None);
+    }
+
     let socket_path = socket_path_for(namespace)?;
     let direct_metadata = (|| -> anyhow::Result<NativeSessionMetadata> {
         ensure!(
@@ -1399,6 +1664,10 @@ pub fn codex_app_session_metadata(
     }
 }
 
+pub fn codex_app_session_dir_exists(namespace: &str) -> anyhow::Result<bool> {
+    Ok(session_dir_for(namespace)?.exists())
+}
+
 fn read_session_metadata_file(namespace: &str) -> anyhow::Result<Option<NativeSessionMetadata>> {
     let path = session_dir_for(namespace)?.join(METADATA_FILE_NAME);
     if !path.exists() {
@@ -1427,6 +1696,9 @@ pub fn delete_codex_app_session(namespace: &str) -> anyhow::Result<()> {
                     cleanup_stale_session(namespace)?;
                     return Ok(());
                 }
+            } else if session_dir_for(namespace)?.exists() {
+                cleanup_stale_session(namespace)?;
+                return Ok(());
             }
             wait_for_codex_app_shutdown(namespace)
                 .or(Err(error))
@@ -1467,6 +1739,18 @@ pub fn interrupt_codex_app(namespace: &str) -> anyhow::Result<()> {
         ServerMessage::Error { message } => Err(anyhow!(message)),
         other => Err(anyhow!(
             "unexpected response while interrupting codex app session '{}': {:?}",
+            namespace,
+            other
+        )),
+    }
+}
+
+pub fn read_codex_app_thread(namespace: &str, include_turns: bool) -> anyhow::Result<Value> {
+    match request(namespace, &ClientMessage::ReadThread { include_turns })? {
+        ServerMessage::ThreadHistory(value) => Ok(value),
+        ServerMessage::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected history response while reading codex app session '{}': {:?}",
             namespace,
             other
         )),
@@ -1534,7 +1818,7 @@ pub fn attach_codex_app(namespace: &str) -> anyhow::Result<()> {
                 }
                 ServerMessage::Ok
                 | ServerMessage::Metadata(..)
-                | ServerMessage::WorkerOffloadResult(..) => {}
+                | ServerMessage::ThreadHistory(..) => {}
             }
         }
     });
@@ -1611,10 +1895,9 @@ fn handle_client_message(
 ) -> anyhow::Result<ServerMessage> {
     match request {
         ClientMessage::Metadata => Ok(ServerMessage::Metadata(session.metadata())),
-        ClientMessage::WorkerOffload { request } => {
-            let result = offload_worker_task(request)?;
-            Ok(ServerMessage::WorkerOffloadResult(result))
-        }
+        ClientMessage::ReadThread { include_turns } => Ok(ServerMessage::ThreadHistory(
+            session.read_thread(include_turns)?,
+        )),
         ClientMessage::Attach { .. } => {
             bail!("attach is not supported over the filesystem control queue")
         }
@@ -1659,31 +1942,6 @@ fn request_metadata_direct(namespace: &str) -> anyhow::Result<NativeSessionMetad
         other => Err(anyhow!(
             "unexpected metadata response while waiting for codex app session '{}': {:?}",
             namespace,
-            other
-        )),
-    }
-}
-
-pub fn request_worker_offload_via_runtime_namespace(
-    runtime_namespace: &str,
-    request_payload: WorkerOffloadRequest,
-) -> anyhow::Result<WorkerOffloadResult> {
-    let runtime_namespace = runtime_namespace.trim();
-    ensure!(
-        !runtime_namespace.is_empty(),
-        "runtime namespace must not be empty for worker offload proxy"
-    );
-    match request(
-        runtime_namespace,
-        &ClientMessage::WorkerOffload {
-            request: request_payload,
-        },
-    )? {
-        ServerMessage::WorkerOffloadResult(result) => Ok(result),
-        ServerMessage::Error { message } => Err(anyhow!(message)),
-        other => Err(anyhow!(
-            "unexpected worker offload response while waiting for codex app session '{}': {:?}",
-            runtime_namespace,
             other
         )),
     }
@@ -1820,25 +2078,12 @@ pub fn attach_codex_app_tcp(host: &str, port: u16, namespace: &str) -> anyhow::R
                 }
                 ServerMessage::Ok
                 | ServerMessage::Metadata(..)
-                | ServerMessage::WorkerOffloadResult(..) => {}
+                | ServerMessage::ThreadHistory(..) => {}
             }
         }
     });
 
     view_agent(&format!("{}:agent0", namespace), output)
-}
-
-pub fn request_worker_offload_for_current_runtime(
-    request_payload: WorkerOffloadRequest,
-) -> anyhow::Result<Option<WorkerOffloadResult>> {
-    let runtime_namespace = env::var("JARVIS_RUNTIME_NAMESPACE")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    let Some(runtime_namespace) = runtime_namespace else {
-        return Ok(None);
-    };
-    request_worker_offload_via_runtime_namespace(&runtime_namespace, request_payload).map(Some)
 }
 
 fn send_message(stream: &mut impl Write, message: &ClientMessage) -> anyhow::Result<()> {
@@ -1923,7 +2168,7 @@ fn read_server_message(reader: &mut impl BufRead) -> anyhow::Result<ServerMessag
 }
 
 fn wait_for_codex_app_session(namespace: &str) -> anyhow::Result<NativeSessionMetadata> {
-    let deadline = SystemTime::now() + Duration::from_secs(10);
+    let deadline = SystemTime::now() + Duration::from_secs(30);
     let mut successful_probes = 0_u8;
     loop {
         if let Ok(metadata) = request_metadata_direct(namespace) {
@@ -2053,6 +2298,264 @@ fn thread_id_from_value(thread: &Value) -> Option<String> {
         .get("id")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn build_thread_start_params(manifest: &CodexAppLaunchManifest) -> Value {
+    let mut params = serde_json::Map::new();
+    insert_opt(&mut params, "cwd", manifest.working_directory.as_deref());
+    insert_thread_protocol_params(
+        &mut params,
+        manifest.working_directory.as_deref(),
+        &manifest.protocol,
+    );
+    merge_object_fields(&mut params, &manifest.protocol.thread_config);
+    Value::Object(params)
+}
+
+fn build_thread_resume_params(thread_id: &str, manifest: &CodexAppLaunchManifest) -> Value {
+    let mut params = serde_json::Map::new();
+    params.insert("threadId".to_string(), json!(thread_id));
+    insert_opt(&mut params, "cwd", manifest.working_directory.as_deref());
+    insert_thread_protocol_params(
+        &mut params,
+        manifest.working_directory.as_deref(),
+        &manifest.protocol,
+    );
+    merge_object_fields(&mut params, &manifest.protocol.thread_config);
+    Value::Object(params)
+}
+
+fn build_turn_start_params(
+    thread_id: &str,
+    input: Vec<Value>,
+    cwd: Option<&str>,
+    protocol: &CodexAppProtocolConfig,
+) -> Value {
+    let mut params = serde_json::Map::new();
+    params.insert("threadId".to_string(), json!(thread_id));
+    params.insert("input".to_string(), Value::Array(input));
+    insert_opt(&mut params, "cwd", cwd);
+    insert_opt(&mut params, "model", protocol.model.as_deref());
+    insert_opt(&mut params, "effort", protocol.reasoning_effort.as_deref());
+    insert_opt(
+        &mut params,
+        "summary",
+        protocol.reasoning_summary.as_deref(),
+    );
+    insert_opt(
+        &mut params,
+        "approvalPolicy",
+        protocol.approval_policy.as_deref(),
+    );
+    insert_opt(
+        &mut params,
+        "approvalsReviewer",
+        protocol.approvals_reviewer.as_deref(),
+    );
+    insert_opt(&mut params, "personality", protocol.personality.as_deref());
+    insert_opt(&mut params, "serviceTier", protocol.service_tier.as_deref());
+    if protocol.permission_profile.is_none()
+        && let Some(sandbox_mode) = protocol.sandbox_mode.as_deref()
+    {
+        params.insert(
+            "sandboxPolicy".to_string(),
+            sandbox_policy_value(sandbox_mode, &protocol.permission_additional_writable_roots),
+        );
+    }
+    if let Some(permission_profile) = permission_profile_value(protocol) {
+        params.insert("permissions".to_string(), permission_profile);
+    }
+    if let Some(environments) = environments_value(cwd, protocol) {
+        params.insert("environments".to_string(), environments);
+    }
+    merge_object_fields(&mut params, &protocol.turn_config);
+    Value::Object(params)
+}
+
+fn insert_thread_protocol_params(
+    params: &mut serde_json::Map<String, Value>,
+    cwd: Option<&str>,
+    protocol: &CodexAppProtocolConfig,
+) {
+    insert_opt(params, "model", protocol.model.as_deref());
+    insert_opt(params, "modelProvider", protocol.model_provider.as_deref());
+    insert_opt(
+        params,
+        "approvalPolicy",
+        protocol.approval_policy.as_deref(),
+    );
+    insert_opt(
+        params,
+        "approvalsReviewer",
+        protocol.approvals_reviewer.as_deref(),
+    );
+    if protocol.permission_profile.is_none() {
+        insert_opt(params, "sandbox", protocol.sandbox_mode.as_deref());
+    }
+    insert_opt(params, "personality", protocol.personality.as_deref());
+    insert_opt(params, "serviceName", protocol.service_name.as_deref());
+    insert_opt(params, "serviceTier", protocol.service_tier.as_deref());
+    insert_opt(params, "threadSource", protocol.thread_source.as_deref());
+    insert_opt(
+        params,
+        "sessionStartSource",
+        protocol.session_start_source.as_deref(),
+    );
+    insert_opt(
+        params,
+        "developerInstructions",
+        protocol.developer_instructions.as_deref(),
+    );
+    insert_opt(
+        params,
+        "baseInstructions",
+        protocol.base_instructions.as_deref(),
+    );
+    if let Some(ephemeral) = protocol.ephemeral {
+        params.insert("ephemeral".to_string(), json!(ephemeral));
+    }
+    if let Some(config) = config_value(protocol) {
+        params.insert("config".to_string(), config);
+    }
+    if let Some(permission_profile) = permission_profile_value(protocol) {
+        params.insert("permissions".to_string(), permission_profile);
+    }
+    if let Some(environments) = environments_value(cwd, protocol) {
+        params.insert("environments".to_string(), environments);
+    }
+}
+
+fn config_value(protocol: &CodexAppProtocolConfig) -> Option<Value> {
+    let mut config = serde_json::Map::new();
+    insert_opt(
+        &mut config,
+        "model_reasoning_effort",
+        protocol.reasoning_effort.as_deref(),
+    );
+    insert_opt(
+        &mut config,
+        "model_reasoning_summary",
+        protocol.reasoning_summary.as_deref(),
+    );
+    if config.is_empty() {
+        None
+    } else {
+        Some(Value::Object(config))
+    }
+}
+
+fn sandbox_policy_value(sandbox_mode: &str, writable_roots: &[String]) -> Value {
+    match sandbox_mode {
+        "danger-full-access" => json!({ "type": "dangerFullAccess" }),
+        "read-only" => json!({ "type": "readOnly" }),
+        "workspace-write" => {
+            let roots = writable_roots
+                .iter()
+                .map(|root| Value::String(root.clone()))
+                .collect::<Vec<_>>();
+            json!({
+                "type": "workspaceWrite",
+                "writableRoots": roots,
+            })
+        }
+        _ => json!({ "type": "externalSandbox" }),
+    }
+}
+
+fn permission_profile_value(protocol: &CodexAppProtocolConfig) -> Option<Value> {
+    let profile = protocol.permission_profile.as_deref()?;
+    let mut value = serde_json::Map::new();
+    value.insert("type".to_string(), json!("profile"));
+    value.insert("id".to_string(), json!(profile));
+    if !protocol.permission_additional_writable_roots.is_empty() {
+        value.insert(
+            "modifications".to_string(),
+            Value::Array(
+                protocol
+                    .permission_additional_writable_roots
+                    .iter()
+                    .map(|path| {
+                        json!({
+                            "type": "additionalWritableRoot",
+                            "path": path,
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    Some(Value::Object(value))
+}
+
+fn environments_value(cwd: Option<&str>, protocol: &CodexAppProtocolConfig) -> Option<Value> {
+    if protocol.environments.is_empty() {
+        return None;
+    }
+    let values = protocol
+        .environments
+        .iter()
+        .map(|environment_id| match cwd {
+            Some(cwd) => json!({
+                "environmentId": environment_id,
+                "cwd": cwd,
+            }),
+            None => json!({
+                "environmentId": environment_id,
+            }),
+        })
+        .collect::<Vec<_>>();
+    Some(Value::Array(values))
+}
+
+fn insert_opt(params: &mut serde_json::Map<String, Value>, key: &str, value: Option<&str>) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        params.insert(key.to_string(), json!(value));
+    }
+}
+
+fn merge_object_fields(
+    params: &mut serde_json::Map<String, Value>,
+    overrides: &BTreeMap<String, Value>,
+) {
+    for (key, value) in overrides {
+        params.insert(key.clone(), value.clone());
+    }
+}
+
+fn protocol_settings_summary(protocol: &CodexAppProtocolConfig) -> BTreeMap<String, String> {
+    let mut settings = BTreeMap::new();
+    for (key, value) in [
+        ("model", protocol.model.as_deref()),
+        ("model_provider", protocol.model_provider.as_deref()),
+        ("reasoning_effort", protocol.reasoning_effort.as_deref()),
+        ("reasoning_summary", protocol.reasoning_summary.as_deref()),
+        ("sandbox_mode", protocol.sandbox_mode.as_deref()),
+        ("approval_policy", protocol.approval_policy.as_deref()),
+        ("approvals_reviewer", protocol.approvals_reviewer.as_deref()),
+        ("personality", protocol.personality.as_deref()),
+        ("service_name", protocol.service_name.as_deref()),
+        ("service_tier", protocol.service_tier.as_deref()),
+        ("thread_source", protocol.thread_source.as_deref()),
+        (
+            "session_start_source",
+            protocol.session_start_source.as_deref(),
+        ),
+        ("permission_profile", protocol.permission_profile.as_deref()),
+    ] {
+        if let Some(value) = value {
+            settings.insert(key.to_string(), value.to_string());
+        }
+    }
+    if let Some(ephemeral) = protocol.ephemeral {
+        settings.insert("ephemeral".to_string(), ephemeral.to_string());
+    }
+    if !protocol.permission_additional_writable_roots.is_empty() {
+        settings.insert(
+            "permission_additional_writable_roots".to_string(),
+            protocol.permission_additional_writable_roots.join(","),
+        );
+    }
+    settings
 }
 
 fn build_user_inputs(prompt: &str, images: &[String]) -> Vec<Value> {
@@ -2457,11 +2960,15 @@ fn short_thread_id(raw: &str) -> String {
         .to_string()
 }
 
-fn cleanup_stale_session(namespace: &str) -> anyhow::Result<()> {
+pub fn cleanup_stale_session(namespace: &str) -> anyhow::Result<()> {
     let session_dir = session_dir_for(namespace)?;
     let socket_path = session_dir.join(SOCKET_FILE_NAME);
     let metadata_path = session_dir.join(METADATA_FILE_NAME);
     let events_path = session_dir.join(EVENTS_FILE_NAME);
+    let working_directory = read_session_metadata_file(namespace)?
+        .as_ref()
+        .and_then(|metadata| metadata.working_directory.as_deref())
+        .map(ToOwned::to_owned);
 
     if socket_path.exists() {
         let _ = fs::remove_file(&socket_path);
@@ -2472,17 +2979,13 @@ fn cleanup_stale_session(namespace: &str) -> anyhow::Result<()> {
     if events_path.exists() {
         let _ = fs::remove_file(&events_path);
     }
-    let working_directory = read_session_metadata_file(namespace)?
-        .as_ref()
-        .and_then(|metadata| metadata.working_directory.as_deref())
-        .map(ToOwned::to_owned);
     let control_queue_root =
         control_queue_root_for_namespace(namespace, working_directory.as_deref());
     if control_queue_root.exists() {
         let _ = fs::remove_dir_all(&control_queue_root);
     }
     if session_dir.exists() {
-        let _ = fs::remove_dir(&session_dir);
+        let _ = fs::remove_dir_all(&session_dir);
     }
     Ok(())
 }
@@ -2652,16 +3155,8 @@ fn request_via_control_queue(
 }
 
 fn control_queue_response_timeout(message: &ClientMessage) -> Duration {
-    match message {
-        ClientMessage::WorkerOffload { request } => Duration::from_secs(
-            request
-                .timeout_seconds
-                .unwrap_or(180)
-                .saturating_add(30)
-                .max(30),
-        ),
-        _ => Duration::from_secs(5),
-    }
+    let _ = message;
+    Duration::from_secs(5)
 }
 
 fn write_json_file(path: &Path, value: &impl Serialize) -> anyhow::Result<()> {
