@@ -148,6 +148,7 @@ pub struct NodeRegisterOptions {
 #[derive(Debug, Clone)]
 pub struct NodeVisitOptions {
     pub node: String,
+    pub from_node: Option<String>,
     pub prompt: String,
     pub working_directory: Option<String>,
     pub namespace: Option<String>,
@@ -158,15 +159,37 @@ pub struct NodeVisitOptions {
     pub ephemeral: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeVisitResult {
     pub node: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_node: Option<String>,
     pub namespace: String,
     pub exit_status: i32,
     pub final_message: String,
     pub stdout: String,
     pub stderr: String,
     pub cleanup_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeInspectResult {
+    pub node: String,
+    pub target: String,
+    pub available: bool,
+    pub facts: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeCleanupResult {
+    pub node: String,
+    pub target: String,
+    pub restored_leases: Vec<String>,
+    pub skipped_active_leases: Vec<String>,
+    pub removed_visit_artifacts: usize,
+    pub stderr: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -975,6 +998,9 @@ pub fn run_node_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitResu
         !options.prompt.trim().is_empty(),
         "visit prompt must not be empty"
     );
+    if options.from_node.is_some() {
+        return run_node_relay_visit(options);
+    }
     let manifest = load_manifest(ResourceKind::Node, &options.node, None)?;
     let ResourceManifest::Node(node) = manifest else {
         bail!("resource '{}' is not a Node", options.node);
@@ -1000,7 +1026,9 @@ pub fn run_node_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitResu
         },
     )?;
 
+    let started_at_epoch_ms = now_epoch_ms();
     let visit_result = run_remote_codex_exec_visit(&target, &options, &namespace);
+    let finished_at_epoch_ms = now_epoch_ms();
     let cleanup_result = cleanup_codex_auth_lease_on_remote_node(&node, &namespace);
 
     let mut result = visit_result?;
@@ -1008,6 +1036,11 @@ pub fn run_node_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitResu
         Ok(()) => "restored".to_string(),
         Err(error) => format!("failed: {error}"),
     };
+    result.archive_path = Some(
+        archive_visit_result(&options, &result, started_at_epoch_ms, finished_at_epoch_ms)?
+            .display()
+            .to_string(),
+    );
     ensure!(
         result.cleanup_status == "restored",
         "visit '{}' completed, but Codex auth cleanup failed on Node '{}': {}",
@@ -1015,7 +1048,59 @@ pub fn run_node_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitResu
         node.metadata.name,
         result.cleanup_status
     );
+    ensure!(
+        result.exit_status == 0,
+        "remote Codex visit '{}' on Node '{}' failed with exit status {}: {}",
+        namespace,
+        node.metadata.name,
+        result.exit_status,
+        result.stderr.trim()
+    );
     Ok(result)
+}
+
+pub fn inspect_node(name: &str) -> anyhow::Result<NodeInspectResult> {
+    let manifest = load_manifest(ResourceKind::Node, name, None)?;
+    let ResourceManifest::Node(node) = manifest else {
+        bail!("resource '{}' is not a Node", name);
+    };
+    let target = node_ssh_target(&node.spec).unwrap_or_else(|| "local".to_string());
+    let output = run_node_inspect_command(if node_is_local(&node) {
+        None
+    } else {
+        Some(target.as_str())
+    })?;
+    let mut facts = parse_probe_output(&output);
+    if let Some(workspace_root) = node.spec.workspace_root.as_deref() {
+        facts.insert(
+            "configured_workspace_root".to_string(),
+            workspace_root.to_string(),
+        );
+    }
+    Ok(NodeInspectResult {
+        node: node.metadata.name,
+        target,
+        available: true,
+        facts,
+    })
+}
+
+pub fn cleanup_node(name: &str, max_age_days: u64) -> anyhow::Result<NodeCleanupResult> {
+    let manifest = load_manifest(ResourceKind::Node, name, None)?;
+    let ResourceManifest::Node(node) = manifest else {
+        bail!("resource '{}' is not a Node", name);
+    };
+    let target = node_ssh_target(&node.spec).unwrap_or_else(|| "local".to_string());
+    run_node_cleanup_command(
+        if node_is_local(&node) {
+            None
+        } else {
+            Some(target.as_str())
+        },
+        &node.metadata.name,
+        &target,
+        max_age_days,
+    )
 }
 
 pub fn render_node_probe_output(name: &str, output: ControlPlaneOutput) -> anyhow::Result<String> {
@@ -1494,23 +1579,167 @@ fn run_remote_codex_exec_visit(
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let final_message = extract_visit_final_message(&stdout).unwrap_or_else(|| stdout.clone());
     let exit_status = output.status.code().unwrap_or(-1);
-    ensure!(
-        output.status.success(),
-        "remote Codex visit '{}' on '{}' failed with status {}: {}",
-        namespace,
-        target,
-        output.status,
-        stderr.trim()
-    );
 
     Ok(NodeVisitResult {
         node: options.node.clone(),
+        from_node: None,
         namespace: namespace.to_string(),
         exit_status,
         final_message,
         stdout,
         stderr,
         cleanup_status: "pending".to_string(),
+        archive_path: None,
+    })
+}
+
+fn run_node_relay_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitResult> {
+    let from_node_name = options
+        .from_node
+        .as_deref()
+        .context("relay visit missing from_node")?;
+    let manifest = load_manifest(ResourceKind::Node, from_node_name, None)?;
+    let ResourceManifest::Node(from_node) = manifest else {
+        bail!("resource '{}' is not a Node", from_node_name);
+    };
+    ensure!(
+        !node_is_local(&from_node),
+        "relay source '{}' must be a remote SSH node",
+        from_node.metadata.name
+    );
+    let target = node_ssh_target(&from_node.spec)
+        .ok_or_else(|| anyhow!("Node '{}' has no SSH target", from_node.metadata.name))?;
+    let namespace = options.namespace.clone().unwrap_or_else(|| {
+        format!(
+            "visit-{}-to-{}-{}",
+            slugify(&from_node.metadata.name),
+            slugify(&options.node),
+            now_epoch_ms()
+        )
+    });
+    let started_at_epoch_ms = now_epoch_ms();
+    let mut result = run_remote_jarvis_visit(&target, &options, &namespace)?;
+    let finished_at_epoch_ms = now_epoch_ms();
+    result.from_node = Some(from_node.metadata.name.clone());
+    result.archive_path = Some(
+        archive_visit_result(&options, &result, started_at_epoch_ms, finished_at_epoch_ms)?
+            .display()
+            .to_string(),
+    );
+    ensure!(
+        result.exit_status == 0,
+        "relay visit '{}' from Node '{}' failed with exit status {}: {}",
+        namespace,
+        from_node.metadata.name,
+        result.exit_status,
+        result.stderr.trim()
+    );
+    Ok(result)
+}
+
+fn run_remote_jarvis_visit(
+    target: &str,
+    options: &NodeVisitOptions,
+    namespace: &str,
+) -> anyhow::Result<NodeVisitResult> {
+    let mut visit_args = vec![
+        "jarvisctl".to_string(),
+        "visit".to_string(),
+        "--node".to_string(),
+        options.node.clone(),
+        "--namespace".to_string(),
+        namespace.to_string(),
+        "--timeout-seconds".to_string(),
+        options.timeout_seconds.to_string(),
+        "--sandbox".to_string(),
+        options
+            .sandbox_mode
+            .clone()
+            .unwrap_or_else(|| "read-only".to_string()),
+        "--full".to_string(),
+    ];
+    if let Some(working_directory) = options.working_directory.as_deref() {
+        visit_args.push("--working-directory".to_string());
+        visit_args.push(working_directory.to_string());
+    }
+    if let Some(model) = options.model.as_deref() {
+        visit_args.push("--model".to_string());
+        visit_args.push(model.to_string());
+    }
+    if let Some(reasoning_effort) = options.reasoning_effort.as_deref() {
+        visit_args.push("--reasoning-effort".to_string());
+        visit_args.push(reasoning_effort.to_string());
+    }
+    if options.ephemeral {
+        visit_args.push("--ephemeral".to_string());
+    }
+
+    let remote_script = format!(
+        "set -eu; tmp=$(mktemp -t jarvisctl-visit.XXXXXX); trap 'rm -f \"$tmp\"' EXIT; cat > \"$tmp\"; {} --file \"$tmp\"",
+        shell_words::join(visit_args),
+    );
+    let remote_command = shell_words::join([
+        "sh".to_string(),
+        "-lc".to_string(),
+        remote_script.to_string(),
+    ]);
+    let timeout_duration = format!("{}s", options.timeout_seconds.saturating_add(30));
+    let mut child = ProcessCommand::new("timeout")
+        .args([
+            "--kill-after=5s",
+            &timeout_duration,
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            target,
+            &remote_command,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start relay visit on '{target}'"))?;
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to open relay visit stdin")?;
+        stdin
+            .write_all(options.prompt.as_bytes())
+            .context("failed to stream relay visit prompt")?;
+    }
+    let output = child
+        .wait_with_output()
+        .context("failed waiting for relay visit")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if output.status.success() {
+        let trimmed = stdout.trim();
+        if trimmed.starts_with('{') {
+            let mut result: NodeVisitResult =
+                serde_json::from_str(trimmed).context("failed to parse relay visit JSON")?;
+            result.stderr = if result.stderr.is_empty() {
+                stderr
+            } else if stderr.trim().is_empty() {
+                result.stderr
+            } else {
+                format!("{}\n{}", result.stderr, stderr)
+            };
+            return Ok(result);
+        }
+    }
+    Ok(NodeVisitResult {
+        node: options.node.clone(),
+        from_node: options.from_node.clone(),
+        namespace: namespace.to_string(),
+        exit_status: output.status.code().unwrap_or(-1),
+        final_message: stdout.clone(),
+        stdout,
+        stderr,
+        cleanup_status: "unknown".to_string(),
+        archive_path: None,
     })
 }
 
@@ -1522,6 +1751,217 @@ fn extract_visit_final_message(stdout: &str) -> Option<String> {
 
 fn shell_escape(value: &str) -> String {
     shell_words::join([value.to_string()])
+}
+
+#[derive(Debug, Serialize)]
+struct VisitArchiveRecord<'a> {
+    version: u32,
+    started_at_epoch_ms: u128,
+    finished_at_epoch_ms: u128,
+    duration_ms: u128,
+    prompt: &'a str,
+    options: VisitArchiveOptions<'a>,
+    result: &'a NodeVisitResult,
+}
+
+#[derive(Debug, Serialize)]
+struct VisitArchiveOptions<'a> {
+    node: &'a str,
+    from_node: Option<&'a str>,
+    working_directory: Option<&'a str>,
+    namespace: Option<&'a str>,
+    timeout_seconds: u64,
+    sandbox_mode: Option<&'a str>,
+    model: Option<&'a str>,
+    reasoning_effort: Option<&'a str>,
+    ephemeral: bool,
+}
+
+fn archive_visit_result(
+    options: &NodeVisitOptions,
+    result: &NodeVisitResult,
+    started_at_epoch_ms: u128,
+    finished_at_epoch_ms: u128,
+) -> anyhow::Result<PathBuf> {
+    let archive_dir = jarvis_codex_visits_dir()?;
+    fs::create_dir_all(&archive_dir)
+        .with_context(|| format!("failed to create '{}'", archive_dir.display()))?;
+    let filename = format!(
+        "{}-{}-{}.json",
+        started_at_epoch_ms,
+        slugify(&result.node),
+        slugify(&result.namespace)
+    );
+    let path = archive_dir.join(filename);
+    let record = VisitArchiveRecord {
+        version: 1,
+        started_at_epoch_ms,
+        finished_at_epoch_ms,
+        duration_ms: finished_at_epoch_ms.saturating_sub(started_at_epoch_ms),
+        prompt: &options.prompt,
+        options: VisitArchiveOptions {
+            node: &options.node,
+            from_node: options.from_node.as_deref(),
+            working_directory: options.working_directory.as_deref(),
+            namespace: options.namespace.as_deref(),
+            timeout_seconds: options.timeout_seconds,
+            sandbox_mode: options.sandbox_mode.as_deref(),
+            model: options.model.as_deref(),
+            reasoning_effort: options.reasoning_effort.as_deref(),
+            ephemeral: options.ephemeral,
+        },
+        result,
+    };
+    let raw = serde_json::to_string_pretty(&record).context("failed to encode visit archive")?;
+    atomic_write_string(&path, &raw)?;
+    Ok(path)
+}
+
+fn jarvis_codex_visits_dir() -> anyhow::Result<PathBuf> {
+    let home = env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home)
+        .join(".jarvis")
+        .join("codex")
+        .join("visits"))
+}
+
+fn run_node_inspect_command(target: Option<&str>) -> anyhow::Result<String> {
+    let script = "printf 'hostname='; hostname 2>/dev/null || true; printf 'cwd='; pwd; printf 'home='; printf '%s\\n' \"$HOME\"; printf 'codex_cli='; (codex --version 2>/dev/null || command -v codex 2>/dev/null || true) | head -n 1; printf 'jarvisctl='; (jarvisctl --version 2>/dev/null || command -v jarvisctl 2>/dev/null || true) | head -n 1; printf 'vault_path=%s/codex\\n' \"$HOME\"; printf 'vault='; test -d \"$HOME/codex\" && echo present || echo missing; printf 'vault_entries='; if [ -d \"$HOME/codex\" ]; then find \"$HOME/codex\" -mindepth 1 -maxdepth 1 -printf '%f,' 2>/dev/null | sed 's/,$//'; fi; printf '\\n'; printf 'memory='; test -d \"$HOME/.codex/memories\" && echo present || echo missing; printf 'work_dir='; test -d \"$HOME/work\" && echo present || echo missing; printf 'work_entries='; if [ -d \"$HOME/work\" ]; then find \"$HOME/work\" -mindepth 1 -maxdepth 1 -printf '%f,' 2>/dev/null | sed 's/,$//'; fi; printf '\\n'; printf 'legacy_jarvisctl='; test -d \"$HOME/documents/jarvisctl\" && echo present || echo missing; printf 'auth_leases='; find \"$HOME/.jarvis/codex/auth-leases\" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l; printf 'visit_artifacts='; find \"$HOME/.jarvis/codex/visits\" -type f 2>/dev/null | wc -l; printf 'codex_auth='; test -s \"$HOME/.codex/auth.json\" && echo present || echo missing";
+    run_shell_probe(target, script, "node inspect")
+}
+
+fn run_shell_probe(target: Option<&str>, script: &str, label: &str) -> anyhow::Result<String> {
+    let output = if let Some(target) = target {
+        let remote_command =
+            shell_words::join(["sh".to_string(), "-lc".to_string(), script.to_string()]);
+        ProcessCommand::new("ssh")
+            .args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                target,
+                &remote_command,
+            ])
+            .output()
+            .with_context(|| format!("failed to run {label} for '{target}'"))?
+    } else {
+        ProcessCommand::new("sh")
+            .args(["-lc", script])
+            .output()
+            .with_context(|| format!("failed to run local {label}"))?
+    };
+    ensure!(
+        output.status.success(),
+        "{label} exited with status {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn run_node_cleanup_command(
+    target: Option<&str>,
+    node_name: &str,
+    target_label: &str,
+    max_age_days: u64,
+) -> anyhow::Result<NodeCleanupResult> {
+    let script = format!(
+        r#"set -u
+lease_root="$HOME/.jarvis/codex/auth-leases"
+visit_root="$HOME/.jarvis/codex/visits"
+active="$(jarvisctl list --json 2>/dev/null || printf '[]')"
+restored=""
+skipped=""
+mkdir -p "$HOME/.codex"
+if [ -d "$lease_root" ]; then
+  for lease_dir in "$lease_root"/*; do
+    [ -d "$lease_dir" ] || continue
+    lease="$(basename "$lease_dir")"
+    case "$active" in
+      *"\"$lease\""*) skipped="${{skipped}}${{lease}},"; continue ;;
+    esac
+    if [ -d "$lease_dir/backup" ]; then
+      for f in auth.json config.toml version.json; do
+        if [ -e "$lease_dir/backup/$f" ]; then
+          cp -p "$lease_dir/backup/$f" "$HOME/.codex/$f"
+        elif [ -e "$lease_dir/backup/$f.missing" ]; then
+          rm -f "$HOME/.codex/$f"
+        fi
+      done
+    fi
+    rm -rf "$lease_dir"
+    restored="${{restored}}${{lease}},"
+  done
+fi
+chmod 700 "$HOME/.codex" 2>/dev/null || true
+chmod 600 "$HOME/.codex/auth.json" "$HOME/.codex/config.toml" "$HOME/.codex/version.json" 2>/dev/null || true
+removed=0
+if [ -d "$visit_root" ]; then
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    rm -f "$file" && removed=$((removed + 1))
+  done <<EOF
+$(find "$visit_root" -type f -mtime +{} 2>/dev/null)
+EOF
+fi
+printf 'restored_leases=%s\n' "${{restored%,}}"
+printf 'skipped_active_leases=%s\n' "${{skipped%,}}"
+printf 'removed_visit_artifacts=%s\n' "$removed"
+"#,
+        max_age_days
+    );
+
+    let output = if let Some(target) = target {
+        let remote_command = shell_words::join(["sh".to_string(), "-lc".to_string(), script]);
+        ProcessCommand::new("ssh")
+            .args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                target,
+                &remote_command,
+            ])
+            .output()
+            .with_context(|| format!("failed to run cleanup for '{target}'"))?
+    } else {
+        ProcessCommand::new("sh")
+            .args(["-lc", &script])
+            .output()
+            .context("failed to run local cleanup")?
+    };
+    ensure!(
+        output.status.success(),
+        "cleanup exited with status {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let values = parse_probe_output(&String::from_utf8_lossy(&output.stdout));
+    Ok(NodeCleanupResult {
+        node: node_name.to_string(),
+        target: target_label.to_string(),
+        restored_leases: split_csv(values.get("restored_leases")),
+        skipped_active_leases: split_csv(values.get("skipped_active_leases")),
+        removed_visit_artifacts: values
+            .get("removed_visit_artifacts")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+fn split_csv(value: Option<&String>) -> Vec<String> {
+    value
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn local_hostname() -> Option<String> {

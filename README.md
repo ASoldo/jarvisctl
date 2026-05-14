@@ -187,6 +187,8 @@ jarvisctl node register archiebald --address 100.115.119.27 --ssh-host archiebal
 jarvisctl get nodes
 jarvisctl node ping archiebald
 jarvisctl node sync-codex-auth archiebald
+jarvisctl node inspect archiebald
+jarvisctl node cleanup archiebald
 jarvisctl node cordon archiebald
 jarvisctl node uncordon archiebald
 ```
@@ -228,9 +230,21 @@ Useful options:
 * `--working-directory <path>` runs the remote visit from a specific path on that node.
 * `--sandbox read-only|workspace-write|danger-full-access` controls the remote Codex sandbox.
 * `--timeout-seconds <n>` bounds the whole SSH/Codex visit.
+* `--from-current` builds a capsule from the current shell/workspace, live Jarvis sessions, and latest local Codex transcript tail.
+* `--from-node <node>` relays the visit through another registered node so one machine can visit another.
 * `--full` prints the captured stdout/stderr envelope and cleanup status.
 
 The visit does not require the remote node to share this machine's `/home/rootster/codex` vault. The remote Codex sees that node's own home directory, vault, memory, and local files.
+Every visit writes a local archive under `~/.jarvis/codex/visits/` with the prompt capsule, selected options, final answer, stdout/stderr, duration, and cleanup status.
+
+Node inspection and cleanup support the visit lifecycle:
+
+```bash
+jarvisctl node inspect archiebald
+jarvisctl node cleanup archiebald --max-age-days 7
+```
+
+`node inspect` reports vault, memory, work directory, tool, auth, stale lease, and visit-artifact facts. `node cleanup` restores stale auth leases that do not match live runtimes and prunes old remote visit artifacts.
 
 ### Inspect rollout status and history
 

@@ -1,5 +1,6 @@
 //! jarvisctl: Operator-first control plane for local and hybrid coding agents
 
+use anyhow::{Context, bail, ensure};
 use clap::{Parser, Subcommand, ValueEnum, ValueHint};
 use std::{
     env,
@@ -38,13 +39,14 @@ use codex_app::{
 use control_plane::{
     ControlPlaneOutput, ControlPlaneResourceKindArg, KubernetesRenderOutput, NodeRegisterOptions,
     NodeVisitOptions, apply_kubernetes_resources, apply_kustomization, apply_manifests,
-    attach_cluster_runtime_session, authorize_runtime_message, delete_cluster_runtime_session,
-    interrupt_cluster_runtime_session, pause_deployment_rollout, register_node,
-    render_describe_output, render_get_output, render_kubernetes_resources,
-    render_node_probe_output, render_rollout_history_output, render_rollout_status_output,
-    resolve_service_target, resolve_service_target_for_message, restart_deployment_rollout,
-    resume_deployment_rollout, run_node_visit, set_node_cordoned, sync_codex_auth_to_node,
-    tell_cluster_runtime_session, undo_deployment_rollout, wait_for_rollout_status_output,
+    attach_cluster_runtime_session, authorize_runtime_message, cleanup_node,
+    delete_cluster_runtime_session, inspect_node, interrupt_cluster_runtime_session,
+    pause_deployment_rollout, register_node, render_describe_output, render_get_output,
+    render_kubernetes_resources, render_node_probe_output, render_rollout_history_output,
+    render_rollout_status_output, resolve_service_target, resolve_service_target_for_message,
+    restart_deployment_rollout, resume_deployment_rollout, run_node_visit, set_node_cordoned,
+    sync_codex_auth_to_node, tell_cluster_runtime_session, undo_deployment_rollout,
+    wait_for_rollout_status_output,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use native::{
@@ -267,13 +269,21 @@ enum Command {
         #[arg(long)]
         node: String,
 
+        /// Run the visit from another registered node instead of this control node
+        #[arg(long = "from-node")]
+        from_node: Option<String>,
+
         /// Prompt text to send to the remote Codex
-        #[arg(long, conflicts_with = "prompt_file")]
+        #[arg(long, conflicts_with_all = ["prompt_file", "from_current"])]
         text: Option<String>,
 
         /// Prompt file to send to the remote Codex
-        #[arg(long = "file", value_hint = ValueHint::FilePath, conflicts_with = "text")]
+        #[arg(long = "file", value_hint = ValueHint::FilePath, conflicts_with_all = ["text", "from_current"])]
         prompt_file: Option<PathBuf>,
+
+        /// Build a capsule from this shell/workspace and the latest local Codex transcript tail
+        #[arg(long = "from-current", default_value_t = false, conflicts_with_all = ["text", "prompt_file"])]
+        from_current: bool,
 
         /// Remote working directory; defaults to the remote user's home directory
         #[arg(long, value_hint = ValueHint::DirPath)]
@@ -563,6 +573,25 @@ enum NodeCommand {
 
     /// Copy this machine's Codex auth/config to a node over SSH
     SyncCodexAuth { name: String },
+
+    /// Inspect a node's vault, memory, tools, work dirs, and stale lease counts
+    Inspect {
+        name: String,
+
+        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Restore stale auth leases and prune old visit artifacts on a node
+    Cleanup {
+        name: String,
+
+        #[arg(long = "max-age-days", default_value_t = 7)]
+        max_age_days: u64,
+
+        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -897,8 +926,10 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         .map_err(JarvisError::from),
         Command::Visit {
             node,
+            from_node,
             text,
             prompt_file,
+            from_current,
             working_directory,
             namespace,
             timeout_seconds,
@@ -909,8 +940,10 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             full,
         } => visit_node(
             node,
+            from_node,
             text,
             prompt_file,
+            from_current,
             working_directory,
             namespace,
             timeout_seconds,
@@ -1146,8 +1179,10 @@ fn apply_resources(
 #[allow(clippy::too_many_arguments)]
 fn visit_node(
     node: String,
+    from_node: Option<String>,
     text: Option<String>,
     prompt_file: Option<PathBuf>,
+    from_current: bool,
     working_directory: Option<String>,
     namespace: Option<String>,
     timeout_seconds: u64,
@@ -1157,29 +1192,31 @@ fn visit_node(
     ephemeral: bool,
     full: bool,
 ) -> Result<(), JarvisError> {
-    let prompt = match (text, prompt_file) {
-        (Some(text), None) => text,
-        (None, Some(path)) => fs::read_to_string(&path).map_err(|error| {
+    let prompt = match (text, prompt_file, from_current) {
+        (Some(text), None, false) => text,
+        (None, Some(path), false) => fs::read_to_string(&path).map_err(|error| {
             JarvisError::Other(anyhow::anyhow!(
                 "failed to read visit prompt file '{}': {}",
                 path.display(),
                 error
             ))
         })?,
-        (None, None) => {
+        (None, None, true) => build_current_visit_capsule().map_err(JarvisError::from)?,
+        (None, None, false) => {
             return Err(JarvisError::Other(anyhow::anyhow!(
-                "provide --text or --file for the visit prompt"
+                "provide --text, --file, or --from-current for the visit prompt"
             )));
         }
-        (Some(_), Some(_)) => {
+        _ => {
             return Err(JarvisError::Other(anyhow::anyhow!(
-                "use either --text or --file, not both"
+                "use only one of --text, --file, or --from-current"
             )));
         }
     };
 
     let result = run_node_visit(NodeVisitOptions {
         node,
+        from_node,
         prompt,
         working_directory,
         namespace,
@@ -1202,6 +1239,125 @@ fn visit_node(
             "visit={} node={} cleanup={}",
             result.namespace, result.node, result.cleanup_status
         );
+    }
+    Ok(())
+}
+
+fn build_current_visit_capsule() -> anyhow::Result<String> {
+    let cwd = env::current_dir().context("failed to read current directory")?;
+    let hostname = fs::read_to_string("/proc/sys/kernel/hostname")
+        .unwrap_or_else(|_| "unknown".to_string())
+        .trim()
+        .to_string();
+    let git_status = command_output(
+        ProcessCommand::new("git")
+            .arg("status")
+            .arg("--short")
+            .arg("--branch")
+            .current_dir(&cwd),
+    )
+    .unwrap_or_else(|error| format!("git status unavailable: {error}"));
+    let live_sessions = command_output(ProcessCommand::new("jarvisctl").arg("list").arg("--json"))
+        .unwrap_or_else(|error| format!("jarvisctl list unavailable: {error}"));
+    let transcript_tail = latest_codex_transcript_tail(80)
+        .unwrap_or_else(|error| format!("latest transcript unavailable: {error}"));
+
+    let transcript_tail = truncate_middle(&transcript_tail, 4_000);
+
+    Ok(format!(
+        "Remote visit capsule from the current operator context.\n\nOrigin:\n- hostname: {hostname}\n- cwd: {}\n\nCurrent git status:\n```text\n{}\n```\n\nCurrent Jarvis runtimes:\n```json\n{}\n```\n\nLatest local Codex transcript tail, if available:\n```jsonl\n{}\n```\n\nUse the destination node's own filesystem, vault, memory, and tools. Compare or inspect only what is needed for the user's request, then return concise findings and any recommended next actions.",
+        cwd.display(),
+        git_status.trim(),
+        live_sessions.trim(),
+        transcript_tail.trim(),
+    ))
+}
+
+fn command_output(command: &mut ProcessCommand) -> anyhow::Result<String> {
+    let output = command.output().context("failed to run command")?;
+    ensure!(
+        output.status.success(),
+        "command exited with status {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn latest_codex_transcript_tail(lines: usize) -> anyhow::Result<String> {
+    let home = env::var_os("HOME").context("HOME is not set")?;
+    let sessions_dir = PathBuf::from(home).join(".codex").join("sessions");
+    ensure!(
+        sessions_dir.exists(),
+        "{} does not exist",
+        sessions_dir.display()
+    );
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    collect_newest_file(&sessions_dir, &mut newest)?;
+    let Some((_, path)) = newest else {
+        bail!(
+            "no Codex transcript files found under {}",
+            sessions_dir.display()
+        );
+    };
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read transcript '{}'", path.display()))?;
+    let all_lines = raw
+        .lines()
+        .filter(|line| {
+            !line.contains("\"type\":\"token_count\"")
+                && !line.contains("\"encrypted_content\"")
+                && !line.contains("\"cached_input_tokens\"")
+        })
+        .map(|line| truncate_middle(line, 900))
+        .collect::<Vec<_>>();
+    let start = all_lines.len().saturating_sub(lines);
+    Ok(all_lines[start..].join("\n"))
+}
+
+fn truncate_middle(value: &str, max_chars: usize) -> String {
+    let total = value.chars().count();
+    if total <= max_chars {
+        return value.to_string();
+    }
+    let keep_each_side = max_chars.saturating_sub(80) / 2;
+    let prefix = value.chars().take(keep_each_side).collect::<String>();
+    let suffix = value
+        .chars()
+        .rev()
+        .take(keep_each_side)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!(
+        "{prefix}\n\n[truncated {} chars from middle of latest transcript]\n\n{suffix}",
+        total.saturating_sub(keep_each_side * 2)
+    )
+}
+
+fn collect_newest_file(
+    dir: &std::path::Path,
+    newest: &mut Option<(std::time::SystemTime, PathBuf)>,
+) -> anyhow::Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read '{}'", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            collect_newest_file(&path, newest)?;
+        } else if metadata.is_file() {
+            let modified = metadata
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let replace = newest
+                .as_ref()
+                .map(|(current, _)| modified > *current)
+                .unwrap_or(true);
+            if replace {
+                *newest = Some((modified, path));
+            }
+        }
     }
     Ok(())
 }
@@ -1288,6 +1444,64 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                 "{}",
                 sync_codex_auth_to_node(&name).map_err(JarvisError::from)?
             );
+            Ok(())
+        }
+        NodeCommand::Inspect { name, output } => {
+            let result = inspect_node(&name).map_err(JarvisError::from)?;
+            match output {
+                ControlPlaneOutput::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).map_err(anyhow::Error::from)?
+                ),
+                ControlPlaneOutput::Yaml => {
+                    println!(
+                        "{}",
+                        serde_yaml::to_string(&result).map_err(anyhow::Error::from)?
+                    )
+                }
+                ControlPlaneOutput::Table => {
+                    println!("NODE\tTARGET\tAVAILABLE\tKEY\tVALUE");
+                    for (key, value) in result.facts {
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}",
+                            result.node, result.target, result.available, key, value
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        NodeCommand::Cleanup {
+            name,
+            max_age_days,
+            output,
+        } => {
+            let result = cleanup_node(&name, max_age_days).map_err(JarvisError::from)?;
+            match output {
+                ControlPlaneOutput::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).map_err(anyhow::Error::from)?
+                ),
+                ControlPlaneOutput::Yaml => {
+                    println!(
+                        "{}",
+                        serde_yaml::to_string(&result).map_err(anyhow::Error::from)?
+                    )
+                }
+                ControlPlaneOutput::Table => {
+                    println!(
+                        "NODE\tTARGET\tRESTORED_LEASES\tSKIPPED_ACTIVE_LEASES\tREMOVED_VISIT_ARTIFACTS"
+                    );
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        result.node,
+                        result.target,
+                        result.restored_leases.join(","),
+                        result.skipped_active_leases.join(","),
+                        result.removed_visit_artifacts
+                    );
+                }
+            }
             Ok(())
         }
     }
