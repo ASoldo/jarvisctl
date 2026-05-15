@@ -1364,40 +1364,75 @@ pub fn bootstrap_node(options: NodeBootstrapOptions) -> anyhow::Result<Vec<Strin
         Some(user) => format!("{}@{}", user, options.ssh_host),
         None => options.ssh_host.clone(),
     };
-    let current_exe = env::current_exe().context("failed to locate current jarvisctl binary")?;
     run_shell_probe(
         Some(&target),
         "set -eu; mkdir -p \"$HOME/.local/bin\" \"$HOME/.cargo/bin\" \"$HOME/.jarvis/codex\"",
         "node bootstrap prepare",
     )?;
-    let status = ProcessCommand::new("scp")
-        .args([
-            "-q",
-            current_exe
-                .to_str()
-                .ok_or_else(|| anyhow!("jarvisctl path is not valid UTF-8"))?,
-            &format!("{target}:~/.local/bin/jarvisctl"),
-        ])
-        .status()
-        .with_context(|| format!("failed to copy jarvisctl to '{target}'"))?;
-    ensure!(
-        status.success(),
-        "scp jarvisctl to '{target}' failed with {status}"
-    );
+    let local_arch = run_shell_probe(None, "uname -m", "local bootstrap arch")?
+        .trim()
+        .to_string();
+    let remote_arch = run_shell_probe(Some(&target), "uname -m", "node bootstrap arch")?
+        .trim()
+        .to_string();
+    if local_arch == remote_arch {
+        let current_exe =
+            env::current_exe().context("failed to locate current jarvisctl binary")?;
+        let upload_target = format!("{target}:~/.local/bin/jarvisctl.upload");
+        let status = ProcessCommand::new("scp")
+            .args([
+                "-q",
+                current_exe
+                    .to_str()
+                    .ok_or_else(|| anyhow!("jarvisctl path is not valid UTF-8"))?,
+                &upload_target,
+            ])
+            .status()
+            .with_context(|| format!("failed to copy jarvisctl to '{target}'"))?;
+        ensure!(
+            status.success(),
+            "scp jarvisctl to '{target}' failed with {status}"
+        );
+        run_shell_probe(
+            Some(&target),
+            "set -eu; mv \"$HOME/.local/bin/jarvisctl.upload\" \"$HOME/.local/bin/jarvisctl\"; chmod 0755 \"$HOME/.local/bin/jarvisctl\"",
+            "node bootstrap jarvisctl install",
+        )?;
+    } else {
+        run_shell_probe(
+            Some(&target),
+            "command -v jarvisctl >/dev/null",
+            "node bootstrap jarvisctl check",
+        )
+        .with_context(|| {
+            format!(
+                "remote architecture is {remote_arch}, local architecture is {local_arch}; install or build jarvisctl on the remote node first"
+            )
+        })?;
+    }
 
     let codex_path = options
         .codex_path
         .unwrap_or_else(|| "$HOME/.nvm/versions/node/v24.15.0/bin/codex".to_string());
     let bootstrap_script = format!(
         r#"set -eu
-chmod 0755 "$HOME/.local/bin/jarvisctl"
-ln -sf "$HOME/.local/bin/jarvisctl" "$HOME/.cargo/bin/jarvisctl"
+if [ -x "$HOME/.local/bin/jarvisctl" ]; then
+  ln -sf "$HOME/.local/bin/jarvisctl" "$HOME/.cargo/bin/jarvisctl"
+else
+  jarvis_bin="$(command -v jarvisctl)"
+  ln -sf "$jarvis_bin" "$HOME/.cargo/bin/jarvisctl"
+fi
+rm -f "$HOME/.cargo/bin/codex"
 cat > "$HOME/.cargo/bin/codex" <<'EOF'
 #!/bin/sh
 CODEX_BIN="{codex_path}"
 case "$CODEX_BIN" in
   \$HOME/*) CODEX_BIN="$HOME/${{CODEX_BIN#\$HOME/}}" ;;
 esac
+if [ "$CODEX_BIN" = "$HOME/.cargo/bin/codex" ]; then
+  echo "bootstrap codex wrapper points to itself" >&2
+  exit 126
+fi
 CODEX_DIR="$(dirname "$CODEX_BIN")"
 export PATH="$CODEX_DIR:$PATH"
 exec "$CODEX_BIN" "$@"
