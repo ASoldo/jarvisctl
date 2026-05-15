@@ -1854,7 +1854,7 @@ fn run_remote_codex_exec_visit(
         .unwrap_or_else(|| "cd;".to_string());
     let output_name = slugify(namespace);
     let remote_script = format!(
-        "set -u; mkdir -p \"$HOME/.jarvis/codex/visits\"; capsule=\"$HOME/.jarvis/codex/visits/{}.capsule.json\"; out=\"$HOME/.jarvis/codex/visits/{}.last-message.md\"; rm -f \"$capsule\" \"$out\"; cat > \"$capsule\"; jarvisctl capsule-open < \"$capsule\" | {} {} --output-last-message \"$out\" -; visit_status=$?; printf '\\n__JARVIS_VISIT_LAST_MESSAGE_BEGIN__\\n'; if [ -f \"$out\" ]; then cat \"$out\"; fi; printf '\\n__JARVIS_VISIT_LAST_MESSAGE_END__\\n'; rm -f \"$capsule\"; exit \"$visit_status\"",
+        "set -u; mkdir -p \"$HOME/.jarvis/codex/visits\"; capsule=\"$HOME/.jarvis/codex/visits/{}.capsule.json\"; out=\"$HOME/.jarvis/codex/visits/{}.last-message.md\"; rm -f \"$capsule\" \"$out\"; cat > \"$capsule\"; jarvisctl capsule-open < \"$capsule\" | ({} {} --output-last-message \"$out\" -); visit_status=$?; printf '\\n__JARVIS_VISIT_LAST_MESSAGE_BEGIN__\\n'; if [ -f \"$out\" ]; then cat \"$out\"; fi; printf '\\n__JARVIS_VISIT_LAST_MESSAGE_END__\\n'; rm -f \"$capsule\"; exit \"$visit_status\"",
         output_name,
         output_name,
         cd_command,
