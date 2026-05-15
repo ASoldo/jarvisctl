@@ -6,6 +6,7 @@ use std::{
     env,
     ffi::OsStr,
     fs,
+    io::{self, Read},
     net::TcpStream,
     path::PathBuf,
     process::{Child, Command as ProcessCommand, ExitCode, Stdio},
@@ -37,14 +38,16 @@ use codex_app::{
     tell_codex_app_with_mode_tcp,
 };
 use control_plane::{
-    ControlPlaneOutput, ControlPlaneResourceKindArg, KubernetesRenderOutput, NodeRegisterOptions,
-    NodeVisitOptions, apply_kubernetes_resources, apply_kustomization, apply_manifests,
-    attach_cluster_runtime_session, authorize_runtime_message, cleanup_node,
+    ControlPlaneOutput, ControlPlaneResourceKindArg, KubernetesRenderOutput, NodeBootstrapOptions,
+    NodeRegisterOptions, NodeScheduleOptions, NodeVisitOptions, apply_kubernetes_resources,
+    apply_kustomization, apply_manifests, attach_cluster_runtime_session,
+    authorize_runtime_message, bootstrap_node, cleanup_node, cluster_index,
     delete_cluster_runtime_session, inspect_node, interrupt_cluster_runtime_session,
-    pause_deployment_rollout, register_node, render_describe_output, render_get_output,
-    render_kubernetes_resources, render_node_probe_output, render_rollout_history_output,
-    render_rollout_status_output, resolve_service_target, resolve_service_target_for_message,
-    restart_deployment_rollout, resume_deployment_rollout, run_node_visit, set_node_cordoned,
+    migrate_session_to_node, open_visit_capsule, pause_deployment_rollout, register_node,
+    render_describe_output, render_get_output, render_kubernetes_resources,
+    render_node_probe_output, render_rollout_history_output, render_rollout_status_output,
+    resolve_service_target, resolve_service_target_for_message, restart_deployment_rollout,
+    resume_deployment_rollout, run_node_visit, schedule_node, set_node_cordoned,
     sync_codex_auth_to_node, tell_cluster_runtime_session, undo_deployment_rollout,
     wait_for_rollout_status_output,
 };
@@ -265,8 +268,8 @@ enum Command {
 
     /// Send a bounded Codex prompt capsule to a remote node and return its result
     Visit {
-        /// Registered remote node to visit
-        #[arg(long)]
+        /// Registered remote node to visit, or `auto` to let the scheduler choose
+        #[arg(long, default_value = "auto")]
         node: String,
 
         /// Run the visit from another registered node instead of this control node
@@ -313,10 +316,18 @@ enum Command {
         #[arg(long, default_value_t = false)]
         ephemeral: bool,
 
+        /// Read an encrypted Jarvis visit capsule from --file
+        #[arg(long = "protected-capsule", default_value_t = false, hide = true)]
+        protected_capsule: bool,
+
         /// Print the full remote stdout/stderr envelope instead of just the final answer
         #[arg(long, default_value_t = false)]
         full: bool,
     },
+
+    /// Decrypt a protected Jarvis visit capsule from stdin
+    #[command(name = "capsule-open", hide = true)]
+    CapsuleOpen,
 
     /// Apply declarative control-plane resources from YAML manifests
     Apply {
@@ -573,6 +584,74 @@ enum NodeCommand {
 
     /// Copy this machine's Codex auth/config to a node over SSH
     SyncCodexAuth { name: String },
+
+    /// Pick the best available remote worker node
+    Schedule {
+        #[arg(long)]
+        role: Option<String>,
+
+        #[arg(long = "label")]
+        labels: Vec<String>,
+
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+
+        #[arg(long = "require-codex-auth", default_value_t = true)]
+        require_codex_auth: bool,
+
+        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Show running cluster sessions and finished/running visits from one index
+    Index {
+        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Send a resume-style migration capsule for an existing session to a node
+    Migrate {
+        #[arg(long)]
+        session: String,
+
+        #[arg(long = "to-node", default_value = "auto")]
+        to_node: String,
+
+        #[arg(long = "timeout-seconds", default_value_t = 900)]
+        timeout_seconds: u64,
+
+        #[arg(long, default_value_t = false)]
+        full: bool,
+    },
+
+    /// Prepare a new SSH node with jarvisctl/codex wrappers and register it
+    Bootstrap {
+        name: String,
+
+        #[arg(long)]
+        address: Option<String>,
+
+        #[arg(long = "ssh-host")]
+        ssh_host: String,
+
+        #[arg(long = "ssh-user")]
+        ssh_user: Option<String>,
+
+        #[arg(long = "role")]
+        roles: Vec<String>,
+
+        #[arg(long = "label")]
+        labels: Vec<String>,
+
+        #[arg(long = "workspace-root", value_hint = ValueHint::DirPath)]
+        workspace_root: Option<String>,
+
+        #[arg(long = "max-sessions")]
+        max_sessions: Option<usize>,
+
+        #[arg(long = "codex-path")]
+        codex_path: Option<String>,
+    },
 
     /// Inspect a node's vault, memory, tools, work dirs, and stale lease counts
     Inspect {
@@ -937,6 +1016,7 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             model,
             reasoning_effort,
             ephemeral,
+            protected_capsule,
             full,
         } => visit_node(
             node,
@@ -951,8 +1031,10 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             model,
             reasoning_effort,
             ephemeral,
+            protected_capsule,
             full,
         ),
+        Command::CapsuleOpen => capsule_open(),
         Command::Apply { file, kustomize } => apply_resources(&file, kustomize.as_deref()),
         Command::Get {
             kind,
@@ -1190,9 +1272,10 @@ fn visit_node(
     model: Option<String>,
     reasoning_effort: Option<String>,
     ephemeral: bool,
+    protected_capsule: bool,
     full: bool,
 ) -> Result<(), JarvisError> {
-    let prompt = match (text, prompt_file, from_current) {
+    let mut prompt = match (text, prompt_file, from_current) {
         (Some(text), None, false) => text,
         (None, Some(path), false) => fs::read_to_string(&path).map_err(|error| {
             JarvisError::Other(anyhow::anyhow!(
@@ -1213,6 +1296,9 @@ fn visit_node(
             )));
         }
     };
+    if protected_capsule {
+        prompt = open_visit_capsule(&prompt).map_err(JarvisError::from)?;
+    }
 
     let result = run_node_visit(NodeVisitOptions {
         node,
@@ -1240,6 +1326,13 @@ fn visit_node(
             result.namespace, result.node, result.cleanup_status
         );
     }
+    Ok(())
+}
+
+fn capsule_open() -> Result<(), JarvisError> {
+    let mut raw = String::new();
+    io::stdin().read_to_string(&mut raw)?;
+    print!("{}", open_visit_capsule(&raw).map_err(JarvisError::from)?);
     Ok(())
 }
 
@@ -1444,6 +1537,164 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                 "{}",
                 sync_codex_auth_to_node(&name).map_err(JarvisError::from)?
             );
+            Ok(())
+        }
+        NodeCommand::Schedule {
+            role,
+            labels,
+            exclude,
+            require_codex_auth,
+            output,
+        } => {
+            let result = schedule_node(NodeScheduleOptions {
+                role,
+                labels: parse_key_value_pairs(&labels)?,
+                exclude,
+                require_codex_auth,
+            })
+            .map_err(JarvisError::from)?;
+            match output {
+                ControlPlaneOutput::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).map_err(anyhow::Error::from)?
+                ),
+                ControlPlaneOutput::Yaml => {
+                    println!(
+                        "{}",
+                        serde_yaml::to_string(&result).map_err(anyhow::Error::from)?
+                    )
+                }
+                ControlPlaneOutput::Table => {
+                    println!("NODE\tTARGET\tSCORE\tREASONS");
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        result.node,
+                        result.target,
+                        result.score,
+                        result.reasons.join(",")
+                    );
+                }
+            }
+            Ok(())
+        }
+        NodeCommand::Index { output } => {
+            let result = cluster_index().map_err(JarvisError::from)?;
+            match output {
+                ControlPlaneOutput::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).map_err(anyhow::Error::from)?
+                ),
+                ControlPlaneOutput::Yaml => {
+                    println!(
+                        "{}",
+                        serde_yaml::to_string(&result).map_err(anyhow::Error::from)?
+                    )
+                }
+                ControlPlaneOutput::Table => {
+                    println!("SESSIONS:");
+                    if result.sessions.is_empty() {
+                        println!("(none)");
+                    } else {
+                        println!("NAMESPACE\tBACKEND\tNODE\tCREATED");
+                        for session in result.sessions {
+                            let node = session
+                                .context
+                                .as_ref()
+                                .and_then(|context| context.labels.get("jarvisctl.io/node"))
+                                .cloned()
+                                .unwrap_or_else(|| "local".to_string());
+                            println!(
+                                "{}\t{}\t{}\t{}",
+                                session.namespace,
+                                session.backend,
+                                node,
+                                session.created_at_epoch_ms
+                            );
+                        }
+                    }
+                    println!("VISITS:");
+                    if result.visits.is_empty() {
+                        println!("(none)");
+                    } else {
+                        println!("NAMESPACE\tSTATUS\tNODE\tFROM\tSTARTED\tEXIT");
+                        for visit in result.visits {
+                            println!(
+                                "{}\t{}\t{}\t{}\t{}\t{}",
+                                visit.namespace,
+                                visit.status,
+                                visit.node,
+                                visit.from_node.unwrap_or_else(|| "-".to_string()),
+                                visit.started_at_epoch_ms,
+                                visit
+                                    .exit_status
+                                    .map(|value| value.to_string())
+                                    .unwrap_or_else(|| "-".to_string())
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        NodeCommand::Migrate {
+            session,
+            to_node,
+            timeout_seconds,
+            full,
+        } => {
+            let target = if to_node == "auto" {
+                schedule_node(NodeScheduleOptions {
+                    role: Some("worker".to_string()),
+                    require_codex_auth: true,
+                    ..NodeScheduleOptions::default()
+                })
+                .map_err(JarvisError::from)?
+                .node
+            } else {
+                to_node
+            };
+            let result = migrate_session_to_node(&session, &target, timeout_seconds)
+                .map_err(JarvisError::from)?;
+            if full {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).map_err(anyhow::Error::from)?
+                );
+            } else {
+                println!("{}", result.final_message);
+                eprintln!(
+                    "migration_visit={} node={} cleanup={}",
+                    result.namespace, result.node, result.cleanup_status
+                );
+            }
+            Ok(())
+        }
+        NodeCommand::Bootstrap {
+            name,
+            address,
+            ssh_host,
+            ssh_user,
+            roles,
+            labels,
+            workspace_root,
+            max_sessions,
+            codex_path,
+        } => {
+            let messages = bootstrap_node(NodeBootstrapOptions {
+                name,
+                address,
+                ssh_host,
+                ssh_user,
+                roles,
+                labels: parse_key_value_pairs(&labels)?,
+                workspace_root,
+                max_sessions,
+                codex_path,
+            })
+            .map_err(JarvisError::from)?;
+            for message in messages {
+                println!("{message}");
+            }
             Ok(())
         }
         NodeCommand::Inspect { name, output } => {

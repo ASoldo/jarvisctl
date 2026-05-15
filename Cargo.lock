@@ -930,6 +930,7 @@ dependencies = [
  "libc",
  "portable-pty",
  "ratatui",
+ "ring",
  "serde",
  "serde_json",
  "serde_yaml",

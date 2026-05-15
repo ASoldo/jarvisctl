@@ -227,6 +227,7 @@ jarvisctl visit \
 
 Useful options:
 
+* `--node auto` is the default and asks the scheduler to pick the best available remote worker.
 * `--working-directory <path>` runs the remote visit from a specific path on that node.
 * `--sandbox read-only|workspace-write|danger-full-access` controls the remote Codex sandbox.
 * `--timeout-seconds <n>` bounds the whole SSH/Codex visit.
@@ -235,7 +236,20 @@ Useful options:
 * `--full` prints the captured stdout/stderr envelope and cleanup status.
 
 The visit does not require the remote node to share this machine's `/home/rootster/codex` vault. The remote Codex sees that node's own home directory, vault, memory, and local files.
-Every visit writes a local archive under `~/.jarvis/codex/visits/` with the prompt capsule, selected options, final answer, stdout/stderr, duration, and cleanup status.
+Every visit sends a signed and encrypted capsule opened by `jarvisctl` on the receiving node, writes a local archive under `~/.jarvis/codex/visits/` with the selected options, final answer, stdout/stderr, duration, and cleanup status, and updates `~/.jarvis/codex/visit-index/` so running and finished visits can be listed.
+
+Cluster orchestration helpers:
+
+```bash
+jarvisctl node schedule
+jarvisctl node index
+jarvisctl node migrate --session <namespace> --to-node auto
+jarvisctl node bootstrap archiebald --ssh-host archiebald --ssh-user rootster --role worker --workspace-root /home/rootster --max-sessions 6
+```
+
+`node schedule` picks a reachable, uncordoned worker with Codex, Jarvis, auth, vault, and memory facts. `node index` combines live local/remote runtime sessions with the visit index. `node migrate` sends a resume-style capsule for an existing session to another node so that node can reconstruct useful context in its own vault/memory. `node bootstrap` copies the current `jarvisctl` binary to a new SSH node, installs stable non-interactive `jarvisctl` and `codex` wrappers, and registers the node.
+
+Auth lease events are appended to `~/.jarvis/codex/audit.jsonl` without recording token contents. The capsule key is stored at `~/.jarvis/codex/capsule.key` with mode `0600` and copied to nodes during visits/bootstrap so capsules are protected in transit and at rest in temporary files.
 
 Node inspection and cleanup support the visit lifecycle:
 

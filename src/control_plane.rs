@@ -9,8 +9,10 @@ use crate::native::{
 };
 use crate::ticket::slugify;
 use anyhow::{Context, anyhow, bail, ensure};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::Utc;
 use clap::ValueEnum;
+use ring::{aead, rand};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_yaml::Value;
@@ -159,6 +161,23 @@ pub struct NodeVisitOptions {
     pub ephemeral: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct NodeScheduleOptions {
+    pub role: Option<String>,
+    pub labels: BTreeMap<String, String>,
+    pub exclude: Vec<String>,
+    pub require_codex_auth: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeScheduleResult {
+    pub node: String,
+    pub target: String,
+    pub score: i64,
+    pub reasons: Vec<String>,
+    pub facts: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeVisitResult {
     pub node: String,
@@ -190,6 +209,42 @@ pub struct NodeCleanupResult {
     pub skipped_active_leases: Vec<String>,
     pub removed_visit_artifacts: usize,
     pub stderr: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisitIndexEntry {
+    pub namespace: String,
+    pub node: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_node: Option<String>,
+    pub status: String,
+    pub started_at_epoch_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at_epoch_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_status: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterIndexResult {
+    pub generated_at_epoch_ms: u128,
+    pub sessions: Vec<NativeSessionMetadata>,
+    pub visits: Vec<VisitIndexEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeBootstrapOptions {
+    pub name: String,
+    pub address: Option<String>,
+    pub ssh_host: String,
+    pub ssh_user: Option<String>,
+    pub roles: Vec<String>,
+    pub labels: BTreeMap<String, String>,
+    pub workspace_root: Option<String>,
+    pub max_sessions: Option<usize>,
+    pub codex_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1001,6 +1056,15 @@ pub fn run_node_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitResu
     if options.from_node.is_some() {
         return run_node_relay_visit(options);
     }
+    let mut options = options;
+    if options.node == "auto" {
+        let scheduled = schedule_node(NodeScheduleOptions {
+            role: Some("worker".to_string()),
+            require_codex_auth: true,
+            ..NodeScheduleOptions::default()
+        })?;
+        options.node = scheduled.node;
+    }
     let manifest = load_manifest(ResourceKind::Node, &options.node, None)?;
     let ResourceManifest::Node(node) = manifest else {
         bail!("resource '{}' is not a Node", options.node);
@@ -1017,6 +1081,14 @@ pub fn run_node_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitResu
         .clone()
         .unwrap_or_else(|| format!("visit-{}-{}", slugify(&node.metadata.name), now_epoch_ms()));
     let auth_files = local_codex_auth_files()?;
+    sync_capsule_key_to_remote_node(&node)?;
+    append_auth_audit_event(
+        "auth_lease_create_start",
+        &node.metadata.name,
+        &namespace,
+        "start",
+        "",
+    )?;
     sync_codex_auth_to_remote_node_for_namespace(&node, &auth_files, &namespace).with_context(
         || {
             format!(
@@ -1025,11 +1097,51 @@ pub fn run_node_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitResu
             )
         },
     )?;
+    append_auth_audit_event(
+        "auth_lease_create_complete",
+        &node.metadata.name,
+        &namespace,
+        "ok",
+        "",
+    )?;
 
     let started_at_epoch_ms = now_epoch_ms();
+    write_visit_index_entry(&VisitIndexEntry {
+        namespace: namespace.clone(),
+        node: options.node.clone(),
+        from_node: options.from_node.clone(),
+        status: "running".to_string(),
+        started_at_epoch_ms,
+        finished_at_epoch_ms: None,
+        exit_status: None,
+        archive_path: None,
+    })?;
     let visit_result = run_remote_codex_exec_visit(&target, &options, &namespace);
     let finished_at_epoch_ms = now_epoch_ms();
+    append_auth_audit_event(
+        "auth_lease_restore_start",
+        &node.metadata.name,
+        &namespace,
+        "start",
+        "",
+    )?;
     let cleanup_result = cleanup_codex_auth_lease_on_remote_node(&node, &namespace);
+    append_auth_audit_event(
+        "auth_lease_restore_complete",
+        &node.metadata.name,
+        &namespace,
+        if cleanup_result.is_ok() {
+            "ok"
+        } else {
+            "failed"
+        },
+        cleanup_result
+            .as_ref()
+            .err()
+            .map(|error| error.to_string())
+            .as_deref()
+            .unwrap_or(""),
+    )?;
 
     let mut result = visit_result?;
     result.cleanup_status = match cleanup_result {
@@ -1041,6 +1153,20 @@ pub fn run_node_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitResu
             .display()
             .to_string(),
     );
+    write_visit_index_entry(&VisitIndexEntry {
+        namespace: namespace.clone(),
+        node: result.node.clone(),
+        from_node: result.from_node.clone(),
+        status: if result.exit_status == 0 && result.cleanup_status == "restored" {
+            "finished".to_string()
+        } else {
+            "failed".to_string()
+        },
+        started_at_epoch_ms,
+        finished_at_epoch_ms: Some(finished_at_epoch_ms),
+        exit_status: Some(result.exit_status),
+        archive_path: result.archive_path.clone(),
+    })?;
     ensure!(
         result.cleanup_status == "restored",
         "visit '{}' completed, but Codex auth cleanup failed on Node '{}': {}",
@@ -1101,6 +1227,199 @@ pub fn cleanup_node(name: &str, max_age_days: u64) -> anyhow::Result<NodeCleanup
         &target,
         max_age_days,
     )
+}
+
+pub fn schedule_node(options: NodeScheduleOptions) -> anyhow::Result<NodeScheduleResult> {
+    let nodes = load_manifests_by_kind(ResourceKind::Node, None)?
+        .into_iter()
+        .filter_map(|manifest| match manifest {
+            ResourceManifest::Node(node) => Some(node),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    ensure!(!nodes.is_empty(), "no registered Nodes exist");
+
+    let mut candidates = Vec::new();
+    for node in nodes {
+        if node.spec.cordoned || !node.spec.taints.is_empty() {
+            continue;
+        }
+        if options
+            .exclude
+            .iter()
+            .any(|name| name == &node.metadata.name)
+        {
+            continue;
+        }
+        if let Some(role) = options.role.as_deref() {
+            if !node.spec.roles.iter().any(|candidate| candidate == role) {
+                continue;
+            }
+        }
+        let labels = node_effective_labels(&node);
+        if options
+            .labels
+            .iter()
+            .any(|(key, value)| labels.get(key) != Some(value))
+        {
+            continue;
+        }
+        if node_is_local(&node) {
+            continue;
+        }
+        let Ok(inspect) = inspect_node(&node.metadata.name) else {
+            continue;
+        };
+        if options.require_codex_auth
+            && inspect.facts.get("codex_auth").map(String::as_str) != Some("present")
+        {
+            continue;
+        }
+        if inspect.facts.get("codex_cli").is_none() || inspect.facts.get("jarvisctl").is_none() {
+            continue;
+        }
+
+        let active_sessions = inspect
+            .facts
+            .get("active_sessions")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let max_sessions = node.spec.max_sessions.unwrap_or(1).max(1) as i64;
+        let mut score = 100 - active_sessions * 20 + max_sessions * 5;
+        let mut reasons = vec![
+            format!("active_sessions={active_sessions}"),
+            format!("max_sessions={max_sessions}"),
+        ];
+        if inspect.facts.get("memory").map(String::as_str) == Some("present") {
+            score += 5;
+            reasons.push("memory=present".to_string());
+        }
+        if inspect.facts.get("vault").map(String::as_str) == Some("present") {
+            score += 5;
+            reasons.push("vault=present".to_string());
+        }
+        if let Some(arch) = inspect.facts.get("arch") {
+            reasons.push(format!("arch={arch}"));
+        }
+        candidates.push(NodeScheduleResult {
+            node: node.metadata.name,
+            target: inspect.target,
+            score,
+            reasons,
+            facts: inspect.facts,
+        });
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .score
+            .cmp(&left.score)
+            .then_with(|| left.node.cmp(&right.node))
+    });
+    candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no schedulable remote Node matched the requested constraints"))
+}
+
+pub fn cluster_index() -> anyhow::Result<ClusterIndexResult> {
+    Ok(ClusterIndexResult {
+        generated_at_epoch_ms: now_epoch_ms(),
+        sessions: collect_runtime_sessions()?,
+        visits: read_visit_index_entries()?,
+    })
+}
+
+pub fn migrate_session_to_node(
+    namespace: &str,
+    to_node: &str,
+    timeout_seconds: u64,
+) -> anyhow::Result<NodeVisitResult> {
+    let session = load_runtime_session_by_namespace(namespace)?;
+    let session_json = serde_json::to_string_pretty(&session)?;
+    let prompt = format!(
+        "Resume-style migration capsule for Jarvis runtime session `{namespace}`.\n\nSession metadata:\n```json\n{session_json}\n```\n\nUse this destination node's own vault, memory, and filesystem. Reconstruct the useful working context for this running conversation, inspect any local state that helps, save any relevant notes in this node's memory/vault if appropriate, and return a concise migration summary with next actions."
+    );
+    run_node_visit(NodeVisitOptions {
+        node: to_node.to_string(),
+        from_node: None,
+        prompt,
+        working_directory: None,
+        namespace: Some(format!(
+            "migrate-{}-to-{}-{}",
+            slugify(namespace),
+            slugify(to_node),
+            now_epoch_ms()
+        )),
+        timeout_seconds,
+        sandbox_mode: Some("read-only".to_string()),
+        model: None,
+        reasoning_effort: None,
+        ephemeral: false,
+    })
+}
+
+pub fn bootstrap_node(options: NodeBootstrapOptions) -> anyhow::Result<Vec<String>> {
+    let target = match options.ssh_user.as_deref() {
+        Some(user) => format!("{}@{}", user, options.ssh_host),
+        None => options.ssh_host.clone(),
+    };
+    let current_exe = env::current_exe().context("failed to locate current jarvisctl binary")?;
+    run_shell_probe(
+        Some(&target),
+        "set -eu; mkdir -p \"$HOME/.local/bin\" \"$HOME/.cargo/bin\" \"$HOME/.jarvis/codex\"",
+        "node bootstrap prepare",
+    )?;
+    let status = ProcessCommand::new("scp")
+        .args([
+            "-q",
+            current_exe
+                .to_str()
+                .ok_or_else(|| anyhow!("jarvisctl path is not valid UTF-8"))?,
+            &format!("{target}:~/.local/bin/jarvisctl"),
+        ])
+        .status()
+        .with_context(|| format!("failed to copy jarvisctl to '{target}'"))?;
+    ensure!(
+        status.success(),
+        "scp jarvisctl to '{target}' failed with {status}"
+    );
+
+    let codex_path = options
+        .codex_path
+        .unwrap_or_else(|| "$HOME/.nvm/versions/node/v24.15.0/bin/codex".to_string());
+    let bootstrap_script = format!(
+        r#"set -eu
+chmod 0755 "$HOME/.local/bin/jarvisctl"
+ln -sf "$HOME/.local/bin/jarvisctl" "$HOME/.cargo/bin/jarvisctl"
+cat > "$HOME/.cargo/bin/codex" <<'EOF'
+#!/bin/sh
+CODEX_BIN="{codex_path}"
+case "$CODEX_BIN" in
+  \$HOME/*) CODEX_BIN="$HOME/${{CODEX_BIN#\$HOME/}}" ;;
+esac
+CODEX_DIR="$(dirname "$CODEX_BIN")"
+export PATH="$CODEX_DIR:$PATH"
+exec "$CODEX_BIN" "$@"
+EOF
+chmod 0755 "$HOME/.cargo/bin/codex"
+"#,
+        codex_path = codex_path
+    );
+    run_shell_probe(Some(&target), &bootstrap_script, "node bootstrap install")?;
+    let mut messages = register_node(NodeRegisterOptions {
+        name: options.name,
+        address: options.address,
+        ssh_host: Some(options.ssh_host),
+        ssh_user: options.ssh_user,
+        roles: options.roles,
+        labels: options.labels,
+        workspace_root: options.workspace_root,
+        max_sessions: options.max_sessions,
+        local: false,
+    })?;
+    messages.push(format!("bootstrapped remote wrappers on {target}"));
+    Ok(messages)
 }
 
 pub fn render_node_probe_output(name: &str, output: ControlPlaneOutput) -> anyhow::Result<String> {
@@ -1535,7 +1854,8 @@ fn run_remote_codex_exec_visit(
         .unwrap_or_else(|| "cd;".to_string());
     let output_name = slugify(namespace);
     let remote_script = format!(
-        "set -u; mkdir -p \"$HOME/.jarvis/codex/visits\"; out=\"$HOME/.jarvis/codex/visits/{}.last-message.md\"; rm -f \"$out\"; {} {} --output-last-message \"$out\" -; visit_status=$?; printf '\\n__JARVIS_VISIT_LAST_MESSAGE_BEGIN__\\n'; if [ -f \"$out\" ]; then cat \"$out\"; fi; printf '\\n__JARVIS_VISIT_LAST_MESSAGE_END__\\n'; exit \"$visit_status\"",
+        "set -u; mkdir -p \"$HOME/.jarvis/codex/visits\"; capsule=\"$HOME/.jarvis/codex/visits/{}.capsule.json\"; out=\"$HOME/.jarvis/codex/visits/{}.last-message.md\"; rm -f \"$capsule\" \"$out\"; cat > \"$capsule\"; jarvisctl capsule-open < \"$capsule\" | {} {} --output-last-message \"$out\" -; visit_status=$?; printf '\\n__JARVIS_VISIT_LAST_MESSAGE_BEGIN__\\n'; if [ -f \"$out\" ]; then cat \"$out\"; fi; printf '\\n__JARVIS_VISIT_LAST_MESSAGE_END__\\n'; rm -f \"$capsule\"; exit \"$visit_status\"",
+        output_name,
         output_name,
         cd_command,
         shell_words::join(codex_args),
@@ -1566,9 +1886,10 @@ fn run_remote_codex_exec_visit(
         .with_context(|| format!("failed to start remote Codex visit on '{target}'"))?;
 
     {
+        let protected_prompt = protect_visit_capsule(&options.prompt)?;
         let stdin = child.stdin.as_mut().context("failed to open visit stdin")?;
         stdin
-            .write_all(options.prompt.as_bytes())
+            .write_all(protected_prompt.as_bytes())
             .context("failed to stream visit prompt to remote Codex")?;
     }
 
@@ -1594,6 +1915,16 @@ fn run_remote_codex_exec_visit(
 }
 
 fn run_node_relay_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitResult> {
+    let mut options = options;
+    if options.node == "auto" {
+        let scheduled = schedule_node(NodeScheduleOptions {
+            role: Some("worker".to_string()),
+            require_codex_auth: true,
+            exclude: options.from_node.clone().into_iter().collect(),
+            ..NodeScheduleOptions::default()
+        })?;
+        options.node = scheduled.node;
+    }
     let from_node_name = options
         .from_node
         .as_deref()
@@ -1609,6 +1940,7 @@ fn run_node_relay_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitRe
     );
     let target = node_ssh_target(&from_node.spec)
         .ok_or_else(|| anyhow!("Node '{}' has no SSH target", from_node.metadata.name))?;
+    sync_capsule_key_to_remote_node(&from_node)?;
     let namespace = options.namespace.clone().unwrap_or_else(|| {
         format!(
             "visit-{}-to-{}-{}",
@@ -1618,6 +1950,16 @@ fn run_node_relay_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitRe
         )
     });
     let started_at_epoch_ms = now_epoch_ms();
+    write_visit_index_entry(&VisitIndexEntry {
+        namespace: namespace.clone(),
+        node: options.node.clone(),
+        from_node: Some(from_node.metadata.name.clone()),
+        status: "running".to_string(),
+        started_at_epoch_ms,
+        finished_at_epoch_ms: None,
+        exit_status: None,
+        archive_path: None,
+    })?;
     let mut result = run_remote_jarvis_visit(&target, &options, &namespace)?;
     let finished_at_epoch_ms = now_epoch_ms();
     result.from_node = Some(from_node.metadata.name.clone());
@@ -1626,6 +1968,20 @@ fn run_node_relay_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitRe
             .display()
             .to_string(),
     );
+    write_visit_index_entry(&VisitIndexEntry {
+        namespace: namespace.clone(),
+        node: result.node.clone(),
+        from_node: result.from_node.clone(),
+        status: if result.exit_status == 0 {
+            "finished".to_string()
+        } else {
+            "failed".to_string()
+        },
+        started_at_epoch_ms,
+        finished_at_epoch_ms: Some(finished_at_epoch_ms),
+        exit_status: Some(result.exit_status),
+        archive_path: result.archive_path.clone(),
+    })?;
     ensure!(
         result.exit_status == 0,
         "relay visit '{}' from Node '{}' failed with exit status {}: {}",
@@ -1657,6 +2013,7 @@ fn run_remote_jarvis_visit(
             .clone()
             .unwrap_or_else(|| "read-only".to_string()),
         "--full".to_string(),
+        "--protected-capsule".to_string(),
     ];
     if let Some(working_directory) = options.working_directory.as_deref() {
         visit_args.push("--working-directory".to_string());
@@ -1702,12 +2059,13 @@ fn run_remote_jarvis_visit(
         .spawn()
         .with_context(|| format!("failed to start relay visit on '{target}'"))?;
     {
+        let protected_prompt = protect_visit_capsule(&options.prompt)?;
         let stdin = child
             .stdin
             .as_mut()
             .context("failed to open relay visit stdin")?;
         stdin
-            .write_all(options.prompt.as_bytes())
+            .write_all(protected_prompt.as_bytes())
             .context("failed to stream relay visit prompt")?;
     }
     let output = child
@@ -1825,8 +2183,224 @@ fn jarvis_codex_visits_dir() -> anyhow::Result<PathBuf> {
         .join("visits"))
 }
 
+fn jarvis_codex_dir() -> anyhow::Result<PathBuf> {
+    let home = env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".jarvis").join("codex"))
+}
+
+fn jarvis_capsule_key_path() -> anyhow::Result<PathBuf> {
+    Ok(jarvis_codex_dir()?.join("capsule.key"))
+}
+
+fn load_or_create_capsule_key() -> anyhow::Result<[u8; 32]> {
+    let path = jarvis_capsule_key_path()?;
+    if path.exists() {
+        let raw = fs::read(&path)
+            .with_context(|| format!("failed to read capsule key '{}'", path.display()))?;
+        ensure!(
+            raw.len() == 32,
+            "capsule key '{}' must be 32 bytes",
+            path.display()
+        );
+        let mut key = [0_u8; 32];
+        key.copy_from_slice(&raw);
+        return Ok(key);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let rng = rand::SystemRandom::new();
+    let mut key = [0_u8; 32];
+    rand::SecureRandom::fill(&rng, &mut key)
+        .map_err(|_| anyhow!("failed to generate capsule key"))?;
+    fs::write(&path, key)
+        .with_context(|| format!("failed to write capsule key '{}'", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(key)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProtectedCapsule {
+    version: u32,
+    algorithm: String,
+    nonce: String,
+    ciphertext: String,
+}
+
+pub fn protect_visit_capsule(prompt: &str) -> anyhow::Result<String> {
+    let key = load_or_create_capsule_key()?;
+    let unbound = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &key)
+        .map_err(|_| anyhow!("failed to initialize capsule key"))?;
+    let sealing_key = aead::LessSafeKey::new(unbound);
+    let rng = rand::SystemRandom::new();
+    let mut nonce_bytes = [0_u8; 12];
+    rand::SecureRandom::fill(&rng, &mut nonce_bytes)
+        .map_err(|_| anyhow!("failed to generate nonce"))?;
+    let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
+    let mut in_out = prompt.as_bytes().to_vec();
+    sealing_key
+        .seal_in_place_append_tag(
+            nonce,
+            aead::Aad::from(b"jarvisctl-visit-capsule-v1"),
+            &mut in_out,
+        )
+        .map_err(|_| anyhow!("failed to encrypt visit capsule"))?;
+    let envelope = ProtectedCapsule {
+        version: 1,
+        algorithm: "CHACHA20-POLY1305".to_string(),
+        nonce: BASE64.encode(nonce_bytes),
+        ciphertext: BASE64.encode(in_out),
+    };
+    serde_json::to_string(&envelope).context("failed to encode protected capsule")
+}
+
+pub fn open_visit_capsule(raw: &str) -> anyhow::Result<String> {
+    let envelope: ProtectedCapsule =
+        serde_json::from_str(raw).context("failed to parse protected capsule")?;
+    ensure!(
+        envelope.version == 1,
+        "unsupported capsule version {}",
+        envelope.version
+    );
+    ensure!(
+        envelope.algorithm == "CHACHA20-POLY1305",
+        "unsupported capsule algorithm {}",
+        envelope.algorithm
+    );
+    let key = load_or_create_capsule_key()?;
+    let nonce_raw = BASE64
+        .decode(envelope.nonce.as_bytes())
+        .context("failed to decode capsule nonce")?;
+    ensure!(nonce_raw.len() == 12, "capsule nonce must be 12 bytes");
+    let mut nonce_bytes = [0_u8; 12];
+    nonce_bytes.copy_from_slice(&nonce_raw);
+    let nonce = aead::Nonce::assume_unique_for_key(nonce_bytes);
+    let mut in_out = BASE64
+        .decode(envelope.ciphertext.as_bytes())
+        .context("failed to decode capsule ciphertext")?;
+    let unbound = aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &key)
+        .map_err(|_| anyhow!("failed to initialize capsule key"))?;
+    let opening_key = aead::LessSafeKey::new(unbound);
+    let plaintext = opening_key
+        .open_in_place(
+            nonce,
+            aead::Aad::from(b"jarvisctl-visit-capsule-v1"),
+            &mut in_out,
+        )
+        .map_err(|_| anyhow!("failed to authenticate or decrypt capsule"))?;
+    String::from_utf8(plaintext.to_vec()).context("capsule plaintext was not UTF-8")
+}
+
+fn sync_capsule_key_to_remote_node(node: &ResourceEnvelope<NodeSpec>) -> anyhow::Result<()> {
+    if node_is_local(node) {
+        let _ = load_or_create_capsule_key()?;
+        return Ok(());
+    }
+    let target = node_ssh_target(&node.spec)
+        .ok_or_else(|| anyhow!("Node '{}' has no SSH target", node.metadata.name))?;
+    let key_path = jarvis_capsule_key_path()?;
+    let _ = load_or_create_capsule_key()?;
+    let remote = format!("{target}:~/.jarvis/codex/capsule.key");
+    run_shell_probe(
+        Some(&target),
+        "set -eu; mkdir -p \"$HOME/.jarvis/codex\"; chmod 700 \"$HOME/.jarvis\" \"$HOME/.jarvis/codex\" 2>/dev/null || true",
+        "capsule key prepare",
+    )?;
+    let status = ProcessCommand::new("scp")
+        .args([
+            "-q",
+            key_path
+                .to_str()
+                .ok_or_else(|| anyhow!("capsule key path is not valid UTF-8"))?,
+            &remote,
+        ])
+        .status()
+        .with_context(|| {
+            format!(
+                "failed to copy capsule key to Node '{}'",
+                node.metadata.name
+            )
+        })?;
+    ensure!(
+        status.success(),
+        "capsule key copy to Node '{}' failed with {status}",
+        node.metadata.name
+    );
+    run_shell_probe(
+        Some(&target),
+        "chmod 600 \"$HOME/.jarvis/codex/capsule.key\"",
+        "capsule key permissions",
+    )?;
+    Ok(())
+}
+
+fn append_auth_audit_event(
+    event: &str,
+    node: &str,
+    namespace: &str,
+    status: &str,
+    detail: &str,
+) -> anyhow::Result<()> {
+    let path = jarvis_codex_dir()?.join("audit.jsonl");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let record = json!({
+        "ts_epoch_ms": now_epoch_ms(),
+        "event": event,
+        "node": node,
+        "namespace": namespace,
+        "status": status,
+        "detail": detail,
+    });
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("failed to open audit log '{}'", path.display()))?;
+    writeln!(file, "{}", serde_json::to_string(&record)?)?;
+    Ok(())
+}
+
+fn visit_index_dir() -> anyhow::Result<PathBuf> {
+    Ok(jarvis_codex_dir()?.join("visit-index"))
+}
+
+fn write_visit_index_entry(entry: &VisitIndexEntry) -> anyhow::Result<()> {
+    let dir = visit_index_dir()?;
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.json", slugify(&entry.namespace)));
+    atomic_write_string(&path, &serde_json::to_string_pretty(entry)?)?;
+    Ok(())
+}
+
+fn read_visit_index_entries() -> anyhow::Result<Vec<VisitIndexEntry>> {
+    let dir = visit_index_dir()?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        if let Ok(raw) = fs::read_to_string(&path) {
+            if let Ok(entry) = serde_json::from_str::<VisitIndexEntry>(&raw) {
+                entries.push(entry);
+            }
+        }
+    }
+    entries.sort_by(|left, right| right.started_at_epoch_ms.cmp(&left.started_at_epoch_ms));
+    Ok(entries)
+}
+
 fn run_node_inspect_command(target: Option<&str>) -> anyhow::Result<String> {
-    let script = "printf 'hostname='; (cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || true) | head -n 1; printf 'cwd='; pwd; printf 'home='; printf '%s\\n' \"$HOME\"; printf 'codex_cli='; (codex --version 2>/dev/null || command -v codex 2>/dev/null || true) | head -n 1; printf 'jarvisctl='; (jarvisctl --version 2>/dev/null || command -v jarvisctl 2>/dev/null || true) | head -n 1; printf 'vault_path=%s/codex\\n' \"$HOME\"; printf 'vault='; test -d \"$HOME/codex\" && echo present || echo missing; printf 'vault_entries='; if [ -d \"$HOME/codex\" ]; then find \"$HOME/codex\" -mindepth 1 -maxdepth 1 -printf '%f,' 2>/dev/null | sed 's/,$//'; fi; printf '\\n'; printf 'memory='; test -d \"$HOME/.codex/memories\" && echo present || echo missing; printf 'work_dir='; test -d \"$HOME/work\" && echo present || echo missing; printf 'work_entries='; if [ -d \"$HOME/work\" ]; then find \"$HOME/work\" -mindepth 1 -maxdepth 1 -printf '%f,' 2>/dev/null | sed 's/,$//'; fi; printf '\\n'; printf 'legacy_jarvisctl='; test -d \"$HOME/documents/jarvisctl\" && echo present || echo missing; printf 'auth_leases='; find \"$HOME/.jarvis/codex/auth-leases\" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l; printf 'visit_artifacts='; find \"$HOME/.jarvis/codex/visits\" -type f 2>/dev/null | wc -l; printf 'codex_auth='; test -s \"$HOME/.codex/auth.json\" && echo present || echo missing";
+    let script = "printf 'hostname='; (cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || true) | head -n 1; printf 'cwd='; pwd; printf 'home='; printf '%s\\n' \"$HOME\"; printf 'arch='; uname -m 2>/dev/null || true; printf 'codex_cli='; (codex --version 2>/dev/null || command -v codex 2>/dev/null || true) | head -n 1; printf 'jarvisctl='; (jarvisctl --version 2>/dev/null || command -v jarvisctl 2>/dev/null || true) | head -n 1; printf 'active_sessions='; jarvisctl list --json 2>/dev/null | sed -n 's/^[[:space:]]*\\[//p' | wc -l; printf 'vault_path=%s/codex\\n' \"$HOME\"; printf 'vault='; test -d \"$HOME/codex\" && echo present || echo missing; printf 'vault_entries='; if [ -d \"$HOME/codex\" ]; then find \"$HOME/codex\" -mindepth 1 -maxdepth 1 -printf '%f,' 2>/dev/null | sed 's/,$//'; fi; printf '\\n'; printf 'memory='; test -d \"$HOME/.codex/memories\" && echo present || echo missing; printf 'work_dir='; test -d \"$HOME/work\" && echo present || echo missing; printf 'work_entries='; if [ -d \"$HOME/work\" ]; then find \"$HOME/work\" -mindepth 1 -maxdepth 1 -printf '%f,' 2>/dev/null | sed 's/,$//'; fi; printf '\\n'; printf 'legacy_jarvisctl='; test -d \"$HOME/documents/jarvisctl\" && echo present || echo missing; printf 'auth_leases='; find \"$HOME/.jarvis/codex/auth-leases\" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l; printf 'visit_artifacts='; find \"$HOME/.jarvis/codex/visits\" -type f 2>/dev/null | wc -l; printf 'codex_auth='; test -s \"$HOME/.codex/auth.json\" && echo present || echo missing";
     run_shell_probe(target, script, "node inspect")
 }
 
