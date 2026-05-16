@@ -242,12 +242,15 @@ Cluster orchestration helpers:
 
 ```bash
 jarvisctl node schedule
+jarvisctl node doctor
 jarvisctl node index
+jarvisctl node audit
+jarvisctl node fanout --role worker --text "Report local Codex readiness in one line."
 jarvisctl node migrate --session <namespace> --to-node auto
 jarvisctl node bootstrap archiebald --ssh-host archiebald --ssh-user rootster --role worker --workspace-root /home/rootster --max-sessions 6
 ```
 
-`node schedule` picks a reachable, uncordoned worker with Codex, Jarvis, auth, vault, and memory facts. `node index` combines live local/remote runtime sessions with the visit index. `node migrate` sends a resume-style capsule for an existing session to another node so that node can reconstruct useful context in its own vault/memory. `node bootstrap` copies the current `jarvisctl` binary to a new SSH node, installs stable non-interactive `jarvisctl` and `codex` wrappers, and registers the node.
+`node schedule` picks a reachable, uncordoned worker with Codex, Jarvis, auth, vault, and memory facts. `node doctor` checks all registered nodes for orchestration readiness. `node index` combines live local/remote runtime sessions with local and remote visit indexes. `node audit` prints auth lease create/restore events. `node fanout` sends one protected visit prompt to every selected remote node and returns a per-node result table. `node migrate` sends a resume-style capsule for an existing session to another node so that node can reconstruct useful context in its own vault/memory. `node bootstrap` prepares stable non-interactive `jarvisctl` and `codex` wrappers and registers the node; it only copies the current binary when local and remote CPU architectures match, otherwise it requires an existing remote `jarvisctl`.
 
 Auth lease events are appended to `~/.jarvis/codex/audit.jsonl` without recording token contents. The capsule key is stored at `~/.jarvis/codex/capsule.key` with mode `0600` and copied to nodes during visits/bootstrap so capsules are protected in transit and at rest in temporary files.
 

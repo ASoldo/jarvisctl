@@ -169,6 +169,19 @@ pub struct NodeScheduleOptions {
     pub require_codex_auth: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct NodeFanoutOptions {
+    pub nodes: Vec<String>,
+    pub role: Option<String>,
+    pub labels: BTreeMap<String, String>,
+    pub prompt: String,
+    pub timeout_seconds: u64,
+    pub sandbox_mode: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub ephemeral: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeScheduleResult {
     pub node: String,
@@ -213,6 +226,8 @@ pub struct NodeCleanupResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisitIndexEntry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_source: Option<String>,
     pub namespace: String,
     pub node: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -227,11 +242,44 @@ pub struct VisitIndexEntry {
     pub archive_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterIndexResult {
     pub generated_at_epoch_ms: u128,
     pub sessions: Vec<NativeSessionMetadata>,
     pub visits: Vec<VisitIndexEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthAuditEvent {
+    pub ts_epoch_ms: u128,
+    pub event: String,
+    pub node: String,
+    pub namespace: String,
+    pub status: String,
+    #[serde(default)]
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeDoctorCheck {
+    pub node: String,
+    pub available: bool,
+    pub schedulable: bool,
+    pub issues: Vec<String>,
+    pub facts: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeFanoutFailure {
+    pub node: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeFanoutResult {
+    pub requested_nodes: Vec<String>,
+    pub results: Vec<NodeVisitResult>,
+    pub failures: Vec<NodeFanoutFailure>,
 }
 
 #[derive(Debug, Clone)]
@@ -1107,6 +1155,7 @@ pub fn run_node_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitResu
 
     let started_at_epoch_ms = now_epoch_ms();
     write_visit_index_entry(&VisitIndexEntry {
+        index_source: None,
         namespace: namespace.clone(),
         node: options.node.clone(),
         from_node: options.from_node.clone(),
@@ -1154,6 +1203,7 @@ pub fn run_node_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitResu
             .to_string(),
     );
     write_visit_index_entry(&VisitIndexEntry {
+        index_source: None,
         namespace: namespace.clone(),
         node: result.node.clone(),
         from_node: result.from_node.clone(),
@@ -1322,12 +1372,165 @@ pub fn schedule_node(options: NodeScheduleOptions) -> anyhow::Result<NodeSchedul
         .ok_or_else(|| anyhow!("no schedulable remote Node matched the requested constraints"))
 }
 
+pub fn doctor_nodes() -> anyhow::Result<Vec<NodeDoctorCheck>> {
+    let nodes = load_manifests_by_kind(ResourceKind::Node, None)?
+        .into_iter()
+        .filter_map(|manifest| match manifest {
+            ResourceManifest::Node(node) => Some(node),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut checks = Vec::new();
+    for node in nodes {
+        let mut issues = Vec::new();
+        if node.spec.cordoned {
+            issues.push("cordoned".to_string());
+        }
+        if !node.spec.taints.is_empty() {
+            issues.push(format!("taints={}", node.spec.taints.join(",")));
+        }
+        let inspect = inspect_node(&node.metadata.name);
+        let (available, facts) = match inspect {
+            Ok(inspect) => (true, inspect.facts),
+            Err(error) => {
+                issues.push(format!("inspect_failed={error}"));
+                (false, BTreeMap::new())
+            }
+        };
+        if available {
+            for (key, expected) in [
+                ("codex_auth", "present"),
+                ("memory", "present"),
+                ("vault", "present"),
+            ] {
+                if facts.get(key).map(String::as_str) != Some(expected) {
+                    issues.push(format!("{key}_not_{expected}"));
+                }
+            }
+            if facts.get("codex_cli").is_none() {
+                issues.push("codex_missing".to_string());
+            }
+            if facts.get("jarvisctl").is_none() {
+                issues.push("jarvisctl_missing".to_string());
+            }
+        }
+        checks.push(NodeDoctorCheck {
+            node: node.metadata.name,
+            available,
+            schedulable: available && issues.is_empty(),
+            issues,
+            facts,
+        });
+    }
+    checks.sort_by(|left, right| left.node.cmp(&right.node));
+    Ok(checks)
+}
+
+pub fn run_node_fanout(options: NodeFanoutOptions) -> anyhow::Result<NodeFanoutResult> {
+    ensure!(
+        !options.prompt.trim().is_empty(),
+        "fanout prompt must not be empty"
+    );
+    let mut requested_nodes = if options.nodes.is_empty() {
+        matching_remote_nodes(options.role.as_deref(), &options.labels)?
+    } else {
+        options.nodes.clone()
+    };
+    requested_nodes.sort();
+    requested_nodes.dedup();
+    ensure!(
+        !requested_nodes.is_empty(),
+        "no remote nodes matched fanout target constraints"
+    );
+
+    let mut results = Vec::new();
+    let mut failures = Vec::new();
+    for node in &requested_nodes {
+        let visit = run_node_visit(NodeVisitOptions {
+            node: node.clone(),
+            from_node: None,
+            prompt: options.prompt.clone(),
+            working_directory: None,
+            namespace: Some(format!("fanout-{}-{}", slugify(node), now_epoch_ms())),
+            timeout_seconds: options.timeout_seconds,
+            sandbox_mode: options.sandbox_mode.clone(),
+            model: options.model.clone(),
+            reasoning_effort: options.reasoning_effort.clone(),
+            ephemeral: options.ephemeral,
+        });
+        match visit {
+            Ok(result) => results.push(result),
+            Err(error) => failures.push(NodeFanoutFailure {
+                node: node.clone(),
+                error: error.to_string(),
+            }),
+        }
+    }
+    Ok(NodeFanoutResult {
+        requested_nodes,
+        results,
+        failures,
+    })
+}
+
+fn matching_remote_nodes(
+    role: Option<&str>,
+    labels: &BTreeMap<String, String>,
+) -> anyhow::Result<Vec<String>> {
+    let mut nodes = Vec::new();
+    for manifest in load_manifests_by_kind(ResourceKind::Node, None)? {
+        let ResourceManifest::Node(node) = manifest else {
+            continue;
+        };
+        if node_is_local(&node) || node.spec.cordoned || !node.spec.taints.is_empty() {
+            continue;
+        }
+        if let Some(role) = role {
+            if !node.spec.roles.iter().any(|candidate| candidate == role) {
+                continue;
+            }
+        }
+        let effective = node_effective_labels(&node);
+        if labels
+            .iter()
+            .any(|(key, value)| effective.get(key) != Some(value))
+        {
+            continue;
+        }
+        nodes.push(node.metadata.name);
+    }
+    Ok(nodes)
+}
+
 pub fn cluster_index() -> anyhow::Result<ClusterIndexResult> {
+    let mut visits = read_visit_index_entries()?;
+    if env::var_os("JARVIS_NODE_INDEX_LOCAL_ONLY").is_none() {
+        visits.extend(collect_remote_visit_index_entries()?);
+        visits.sort_by(|left, right| right.started_at_epoch_ms.cmp(&left.started_at_epoch_ms));
+    }
     Ok(ClusterIndexResult {
         generated_at_epoch_ms: now_epoch_ms(),
         sessions: collect_runtime_sessions()?,
-        visits: read_visit_index_entries()?,
+        visits,
     })
+}
+
+pub fn read_auth_audit_events(limit: Option<usize>) -> anyhow::Result<Vec<AuthAuditEvent>> {
+    let path = jarvis_codex_dir()?.join("audit.jsonl");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read audit log '{}'", path.display()))?;
+    let mut events = raw
+        .lines()
+        .filter_map(|line| serde_json::from_str::<AuthAuditEvent>(line).ok())
+        .collect::<Vec<_>>();
+    events.sort_by(|left, right| right.ts_epoch_ms.cmp(&left.ts_epoch_ms));
+    if let Some(limit) = limit {
+        events.truncate(limit);
+    }
+    Ok(events)
 }
 
 pub fn migrate_session_to_node(
@@ -1986,6 +2189,7 @@ fn run_node_relay_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitRe
     });
     let started_at_epoch_ms = now_epoch_ms();
     write_visit_index_entry(&VisitIndexEntry {
+        index_source: None,
         namespace: namespace.clone(),
         node: options.node.clone(),
         from_node: Some(from_node.metadata.name.clone()),
@@ -2004,6 +2208,7 @@ fn run_node_relay_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitRe
             .to_string(),
     );
     write_visit_index_entry(&VisitIndexEntry {
+        index_source: None,
         namespace: namespace.clone(),
         node: result.node.clone(),
         from_node: result.from_node.clone(),
@@ -2431,6 +2636,49 @@ fn read_visit_index_entries() -> anyhow::Result<Vec<VisitIndexEntry>> {
         }
     }
     entries.sort_by(|left, right| right.started_at_epoch_ms.cmp(&left.started_at_epoch_ms));
+    Ok(entries)
+}
+
+fn collect_remote_visit_index_entries() -> anyhow::Result<Vec<VisitIndexEntry>> {
+    let nodes = load_manifests_by_kind(ResourceKind::Node, None)?
+        .into_iter()
+        .filter_map(|manifest| match manifest {
+            ResourceManifest::Node(node) if !node_is_local(&node) => Some(node),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut entries = Vec::new();
+    for node in nodes {
+        let Some(target) = node_ssh_target(&node.spec) else {
+            continue;
+        };
+        let output = ProcessCommand::new("timeout")
+            .args([
+                "--kill-after=5s",
+                "25s",
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                &target,
+                "JARVIS_NODE_INDEX_LOCAL_ONLY=1 jarvisctl node index --output json",
+            ])
+            .output();
+        let Ok(output) = output else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let Ok(index) = serde_json::from_slice::<ClusterIndexResult>(&output.stdout) else {
+            continue;
+        };
+        for mut entry in index.visits {
+            entry.index_source = Some(node.metadata.name.clone());
+            entries.push(entry);
+        }
+    }
     Ok(entries)
 }
 

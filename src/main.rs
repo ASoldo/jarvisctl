@@ -39,17 +39,17 @@ use codex_app::{
 };
 use control_plane::{
     ControlPlaneOutput, ControlPlaneResourceKindArg, KubernetesRenderOutput, NodeBootstrapOptions,
-    NodeRegisterOptions, NodeScheduleOptions, NodeVisitOptions, apply_kubernetes_resources,
-    apply_kustomization, apply_manifests, attach_cluster_runtime_session,
-    authorize_runtime_message, bootstrap_node, cleanup_node, cluster_index,
-    delete_cluster_runtime_session, inspect_node, interrupt_cluster_runtime_session,
-    migrate_session_to_node, open_visit_capsule, pause_deployment_rollout, register_node,
-    render_describe_output, render_get_output, render_kubernetes_resources,
-    render_node_probe_output, render_rollout_history_output, render_rollout_status_output,
-    resolve_service_target, resolve_service_target_for_message, restart_deployment_rollout,
-    resume_deployment_rollout, run_node_visit, schedule_node, set_node_cordoned,
-    sync_codex_auth_to_node, tell_cluster_runtime_session, undo_deployment_rollout,
-    wait_for_rollout_status_output,
+    NodeFanoutOptions, NodeRegisterOptions, NodeScheduleOptions, NodeVisitOptions,
+    apply_kubernetes_resources, apply_kustomization, apply_manifests,
+    attach_cluster_runtime_session, authorize_runtime_message, bootstrap_node, cleanup_node,
+    cluster_index, delete_cluster_runtime_session, doctor_nodes, inspect_node,
+    interrupt_cluster_runtime_session, migrate_session_to_node, open_visit_capsule,
+    pause_deployment_rollout, read_auth_audit_events, register_node, render_describe_output,
+    render_get_output, render_kubernetes_resources, render_node_probe_output,
+    render_rollout_history_output, render_rollout_status_output, resolve_service_target,
+    resolve_service_target_for_message, restart_deployment_rollout, resume_deployment_rollout,
+    run_node_fanout, run_node_visit, schedule_node, set_node_cordoned, sync_codex_auth_to_node,
+    tell_cluster_runtime_session, undo_deployment_rollout, wait_for_rollout_status_output,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use native::{
@@ -603,10 +603,61 @@ enum NodeCommand {
         output: ControlPlaneOutput,
     },
 
+    /// Check all registered nodes for orchestration readiness
+    Doctor {
+        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
     /// Show running cluster sessions and finished/running visits from one index
     Index {
         #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
+    },
+
+    /// Show auth lease audit events
+    Audit {
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+
+        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Send the same protected visit prompt to multiple nodes
+    Fanout {
+        #[arg(long = "node")]
+        nodes: Vec<String>,
+
+        #[arg(long)]
+        role: Option<String>,
+
+        #[arg(long = "label")]
+        labels: Vec<String>,
+
+        #[arg(long)]
+        text: Option<String>,
+
+        #[arg(long = "file", value_hint = ValueHint::FilePath)]
+        prompt_file: Option<PathBuf>,
+
+        #[arg(long = "timeout-seconds", default_value_t = 900)]
+        timeout_seconds: u64,
+
+        #[arg(long, default_value = "read-only")]
+        sandbox: String,
+
+        #[arg(long)]
+        model: Option<String>,
+
+        #[arg(long = "reasoning-effort")]
+        reasoning_effort: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        ephemeral: bool,
+
+        #[arg(long, default_value_t = false)]
+        full: bool,
     },
 
     /// Send a resume-style migration capsule for an existing session to a node
@@ -1577,6 +1628,38 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
             }
             Ok(())
         }
+        NodeCommand::Doctor { output } => {
+            let result = doctor_nodes().map_err(JarvisError::from)?;
+            match output {
+                ControlPlaneOutput::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).map_err(anyhow::Error::from)?
+                ),
+                ControlPlaneOutput::Yaml => {
+                    println!(
+                        "{}",
+                        serde_yaml::to_string(&result).map_err(anyhow::Error::from)?
+                    )
+                }
+                ControlPlaneOutput::Table => {
+                    println!("NODE\tAVAILABLE\tSCHEDULABLE\tISSUES");
+                    for check in result {
+                        println!(
+                            "{}\t{}\t{}\t{}",
+                            check.node,
+                            check.available,
+                            check.schedulable,
+                            if check.issues.is_empty() {
+                                "-".to_string()
+                            } else {
+                                check.issues.join(",")
+                            }
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
         NodeCommand::Index { output } => {
             let result = cluster_index().map_err(JarvisError::from)?;
             match output {
@@ -1616,14 +1699,15 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                     if result.visits.is_empty() {
                         println!("(none)");
                     } else {
-                        println!("NAMESPACE\tSTATUS\tNODE\tFROM\tSTARTED\tEXIT");
+                        println!("NAMESPACE\tSTATUS\tNODE\tFROM\tINDEX_SOURCE\tSTARTED\tEXIT");
                         for visit in result.visits {
                             println!(
-                                "{}\t{}\t{}\t{}\t{}\t{}",
+                                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                                 visit.namespace,
                                 visit.status,
                                 visit.node,
                                 visit.from_node.unwrap_or_else(|| "-".to_string()),
+                                visit.index_source.unwrap_or_else(|| "local".to_string()),
                                 visit.started_at_epoch_ms,
                                 visit
                                     .exit_status
@@ -1632,6 +1716,106 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                             );
                         }
                     }
+                }
+            }
+            Ok(())
+        }
+        NodeCommand::Audit { limit, output } => {
+            let result = read_auth_audit_events(Some(limit)).map_err(JarvisError::from)?;
+            match output {
+                ControlPlaneOutput::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).map_err(anyhow::Error::from)?
+                ),
+                ControlPlaneOutput::Yaml => {
+                    println!(
+                        "{}",
+                        serde_yaml::to_string(&result).map_err(anyhow::Error::from)?
+                    )
+                }
+                ControlPlaneOutput::Table => {
+                    println!("TS\tEVENT\tNODE\tNAMESPACE\tSTATUS\tDETAIL");
+                    for event in result {
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}\t{}",
+                            event.ts_epoch_ms,
+                            event.event,
+                            event.node,
+                            event.namespace,
+                            event.status,
+                            event.detail
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        NodeCommand::Fanout {
+            nodes,
+            role,
+            labels,
+            text,
+            prompt_file,
+            timeout_seconds,
+            sandbox,
+            model,
+            reasoning_effort,
+            ephemeral,
+            full,
+        } => {
+            let prompt = match (text, prompt_file) {
+                (Some(text), None) => text,
+                (None, Some(path)) => fs::read_to_string(&path).map_err(|error| {
+                    JarvisError::Other(anyhow::anyhow!(
+                        "failed to read fanout prompt file '{}': {}",
+                        path.display(),
+                        error
+                    ))
+                })?,
+                (None, None) => {
+                    return Err(JarvisError::Other(anyhow::anyhow!(
+                        "provide --text or --file for fanout"
+                    )));
+                }
+                _ => {
+                    return Err(JarvisError::Other(anyhow::anyhow!(
+                        "use only one of --text or --file for fanout"
+                    )));
+                }
+            };
+            let result = run_node_fanout(NodeFanoutOptions {
+                nodes,
+                role,
+                labels: parse_key_value_pairs(&labels)?,
+                prompt,
+                timeout_seconds,
+                sandbox_mode: Some(sandbox),
+                model,
+                reasoning_effort,
+                ephemeral,
+            })
+            .map_err(JarvisError::from)?;
+            if full {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).map_err(anyhow::Error::from)?
+                );
+            } else {
+                println!("NODE\tSTATUS\tNAMESPACE\tMESSAGE");
+                for visit in &result.results {
+                    println!(
+                        "{}\tok\t{}\t{}",
+                        visit.node,
+                        visit.namespace,
+                        visit.final_message.replace('\n', "\\n")
+                    );
+                }
+                for failure in &result.failures {
+                    println!(
+                        "{}\tfailed\t-\t{}",
+                        failure.node,
+                        failure.error.replace('\n', "\\n")
+                    );
                 }
             }
             Ok(())
