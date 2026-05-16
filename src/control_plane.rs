@@ -151,6 +151,9 @@ pub struct NodeRegisterOptions {
 pub struct NodeVisitOptions {
     pub node: String,
     pub from_node: Option<String>,
+    pub role: Option<String>,
+    pub labels: BTreeMap<String, String>,
+    pub retries: usize,
     pub prompt: String,
     pub working_directory: Option<String>,
     pub namespace: Option<String>,
@@ -180,6 +183,7 @@ pub struct NodeFanoutOptions {
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub ephemeral: bool,
+    pub max_concurrency: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1105,14 +1109,30 @@ pub fn run_node_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitResu
         return run_node_relay_visit(options);
     }
     let mut options = options;
-    if options.node == "auto" {
-        let scheduled = schedule_node(NodeScheduleOptions {
-            role: Some("worker".to_string()),
-            require_codex_auth: true,
-            ..NodeScheduleOptions::default()
-        })?;
-        options.node = scheduled.node;
+    let mut attempted = Vec::new();
+    let attempts = options.retries.saturating_add(1);
+    let mut last_error: Option<anyhow::Error> = None;
+    for _ in 0..attempts {
+        if options.node == "auto" || !attempted.is_empty() {
+            let scheduled = schedule_node(NodeScheduleOptions {
+                role: options.role.clone().or_else(|| Some("worker".to_string())),
+                labels: options.labels.clone(),
+                exclude: attempted.clone(),
+                require_codex_auth: true,
+            })?;
+            options.node = scheduled.node;
+        }
+        let node_name = options.node.clone();
+        attempted.push(node_name);
+        match run_node_visit_direct(options.clone()) {
+            Ok(result) => return Ok(result),
+            Err(error) => last_error = Some(error),
+        }
     }
+    Err(last_error.unwrap_or_else(|| anyhow!("visit did not run any attempts")))
+}
+
+fn run_node_visit_direct(options: NodeVisitOptions) -> anyhow::Result<NodeVisitResult> {
     let manifest = load_manifest(ResourceKind::Node, &options.node, None)?;
     let ResourceManifest::Node(node) = manifest else {
         bail!("resource '{}' is not a Node", options.node);
@@ -1291,7 +1311,7 @@ pub fn schedule_node(options: NodeScheduleOptions) -> anyhow::Result<NodeSchedul
 
     let mut candidates = Vec::new();
     for node in nodes {
-        if node.spec.cordoned || !node.spec.taints.is_empty() {
+        if node_is_local(&node) || node.spec.cordoned || !node.spec.taints.is_empty() {
             continue;
         }
         if options
@@ -1445,25 +1465,46 @@ pub fn run_node_fanout(options: NodeFanoutOptions) -> anyhow::Result<NodeFanoutR
 
     let mut results = Vec::new();
     let mut failures = Vec::new();
-    for node in &requested_nodes {
-        let visit = run_node_visit(NodeVisitOptions {
-            node: node.clone(),
-            from_node: None,
-            prompt: options.prompt.clone(),
-            working_directory: None,
-            namespace: Some(format!("fanout-{}-{}", slugify(node), now_epoch_ms())),
-            timeout_seconds: options.timeout_seconds,
-            sandbox_mode: options.sandbox_mode.clone(),
-            model: options.model.clone(),
-            reasoning_effort: options.reasoning_effort.clone(),
-            ephemeral: options.ephemeral,
-        });
-        match visit {
-            Ok(result) => results.push(result),
-            Err(error) => failures.push(NodeFanoutFailure {
-                node: node.clone(),
-                error: error.to_string(),
-            }),
+    let max_concurrency = options.max_concurrency.max(1);
+    for batch in requested_nodes.chunks(max_concurrency) {
+        let mut handles = Vec::new();
+        for node in batch {
+            let node = node.clone();
+            let options = options.clone();
+            handles.push(std::thread::spawn(move || {
+                let visit = run_node_visit(NodeVisitOptions {
+                    node: node.clone(),
+                    from_node: None,
+                    role: None,
+                    labels: BTreeMap::new(),
+                    retries: 0,
+                    prompt: options.prompt,
+                    working_directory: None,
+                    namespace: Some(format!("fanout-{}-{}", slugify(&node), now_epoch_ms())),
+                    timeout_seconds: options.timeout_seconds,
+                    sandbox_mode: options.sandbox_mode,
+                    model: options.model,
+                    reasoning_effort: options.reasoning_effort,
+                    ephemeral: options.ephemeral,
+                });
+                match visit {
+                    Ok(result) => Ok(result),
+                    Err(error) => Err(NodeFanoutFailure {
+                        node,
+                        error: error.to_string(),
+                    }),
+                }
+            }));
+        }
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(result)) => results.push(result),
+                Ok(Err(failure)) => failures.push(failure),
+                Err(_) => failures.push(NodeFanoutFailure {
+                    node: "unknown".to_string(),
+                    error: "fanout worker thread panicked".to_string(),
+                }),
+            }
         }
     }
     Ok(NodeFanoutResult {
@@ -1546,6 +1587,9 @@ pub fn migrate_session_to_node(
     run_node_visit(NodeVisitOptions {
         node: to_node.to_string(),
         from_node: None,
+        role: None,
+        labels: BTreeMap::new(),
+        retries: 0,
         prompt,
         working_directory: None,
         namespace: Some(format!(
@@ -2156,10 +2200,10 @@ fn run_node_relay_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitRe
     let mut options = options;
     if options.node == "auto" {
         let scheduled = schedule_node(NodeScheduleOptions {
-            role: Some("worker".to_string()),
+            role: options.role.clone().or_else(|| Some("worker".to_string())),
+            labels: options.labels.clone(),
             require_codex_auth: true,
             exclude: options.from_node.clone().into_iter().collect(),
-            ..NodeScheduleOptions::default()
         })?;
         options.node = scheduled.node;
     }
@@ -2258,6 +2302,18 @@ fn run_remote_jarvis_visit(
     if let Some(working_directory) = options.working_directory.as_deref() {
         visit_args.push("--working-directory".to_string());
         visit_args.push(working_directory.to_string());
+    }
+    if let Some(role) = options.role.as_deref() {
+        visit_args.push("--role".to_string());
+        visit_args.push(role.to_string());
+    }
+    for (key, value) in &options.labels {
+        visit_args.push("--label".to_string());
+        visit_args.push(format!("{key}={value}"));
+    }
+    if options.retries > 0 {
+        visit_args.push("--retries".to_string());
+        visit_args.push(options.retries.to_string());
     }
     if let Some(model) = options.model.as_deref() {
         visit_args.push("--model".to_string());

@@ -276,6 +276,18 @@ enum Command {
         #[arg(long = "from-node")]
         from_node: Option<String>,
 
+        /// Scheduler role constraint when --node auto is used
+        #[arg(long)]
+        role: Option<String>,
+
+        /// Scheduler label constraint when --node auto is used
+        #[arg(long = "label")]
+        labels: Vec<String>,
+
+        /// Retry a scheduled visit on another eligible node after failure
+        #[arg(long, default_value_t = 0)]
+        retries: usize,
+
         /// Prompt text to send to the remote Codex
         #[arg(long, conflicts_with_all = ["prompt_file", "from_current"])]
         text: Option<String>,
@@ -640,6 +652,45 @@ enum NodeCommand {
 
         #[arg(long = "file", value_hint = ValueHint::FilePath)]
         prompt_file: Option<PathBuf>,
+
+        #[arg(long = "timeout-seconds", default_value_t = 900)]
+        timeout_seconds: u64,
+
+        #[arg(long, default_value = "read-only")]
+        sandbox: String,
+
+        #[arg(long)]
+        model: Option<String>,
+
+        #[arg(long = "reasoning-effort")]
+        reasoning_effort: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        ephemeral: bool,
+
+        #[arg(long = "max-concurrency", default_value_t = 4)]
+        max_concurrency: usize,
+
+        #[arg(long, default_value_t = false)]
+        full: bool,
+    },
+
+    /// Run one scheduled AI task with retry/failover semantics
+    Task {
+        #[arg(long)]
+        text: Option<String>,
+
+        #[arg(long = "file", value_hint = ValueHint::FilePath)]
+        prompt_file: Option<PathBuf>,
+
+        #[arg(long)]
+        role: Option<String>,
+
+        #[arg(long = "label")]
+        labels: Vec<String>,
+
+        #[arg(long, default_value_t = 1)]
+        retries: usize,
 
         #[arg(long = "timeout-seconds", default_value_t = 900)]
         timeout_seconds: u64,
@@ -1057,6 +1108,9 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         Command::Visit {
             node,
             from_node,
+            role,
+            labels,
+            retries,
             text,
             prompt_file,
             from_current,
@@ -1072,6 +1126,9 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         } => visit_node(
             node,
             from_node,
+            role,
+            labels,
+            retries,
             text,
             prompt_file,
             from_current,
@@ -1313,6 +1370,9 @@ fn apply_resources(
 fn visit_node(
     node: String,
     from_node: Option<String>,
+    role: Option<String>,
+    labels: Vec<String>,
+    retries: usize,
     text: Option<String>,
     prompt_file: Option<PathBuf>,
     from_current: bool,
@@ -1354,6 +1414,9 @@ fn visit_node(
     let result = run_node_visit(NodeVisitOptions {
         node,
         from_node,
+        role,
+        labels: parse_key_value_pairs(&labels)?,
+        retries,
         prompt,
         working_directory,
         namespace,
@@ -1385,6 +1448,13 @@ fn capsule_open() -> Result<(), JarvisError> {
     io::stdin().read_to_string(&mut raw)?;
     print!("{}", open_visit_capsule(&raw).map_err(JarvisError::from)?);
     Ok(())
+}
+
+fn now_millis_for_namespace() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
 }
 
 fn build_current_visit_capsule() -> anyhow::Result<String> {
@@ -1761,6 +1831,7 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
             model,
             reasoning_effort,
             ephemeral,
+            max_concurrency,
             full,
         } => {
             let prompt = match (text, prompt_file) {
@@ -1793,6 +1864,7 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                 model,
                 reasoning_effort,
                 ephemeral,
+                max_concurrency,
             })
             .map_err(JarvisError::from)?;
             if full {
@@ -1817,6 +1889,69 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                         failure.error.replace('\n', "\\n")
                     );
                 }
+            }
+            Ok(())
+        }
+        NodeCommand::Task {
+            text,
+            prompt_file,
+            role,
+            labels,
+            retries,
+            timeout_seconds,
+            sandbox,
+            model,
+            reasoning_effort,
+            ephemeral,
+            full,
+        } => {
+            let prompt = match (text, prompt_file) {
+                (Some(text), None) => text,
+                (None, Some(path)) => fs::read_to_string(&path).map_err(|error| {
+                    JarvisError::Other(anyhow::anyhow!(
+                        "failed to read task prompt file '{}': {}",
+                        path.display(),
+                        error
+                    ))
+                })?,
+                (None, None) => {
+                    return Err(JarvisError::Other(anyhow::anyhow!(
+                        "provide --text or --file for task"
+                    )));
+                }
+                _ => {
+                    return Err(JarvisError::Other(anyhow::anyhow!(
+                        "use only one of --text or --file for task"
+                    )));
+                }
+            };
+            let result = run_node_visit(NodeVisitOptions {
+                node: "auto".to_string(),
+                from_node: None,
+                role,
+                labels: parse_key_value_pairs(&labels)?,
+                retries,
+                prompt,
+                working_directory: None,
+                namespace: Some(format!("task-{}", now_millis_for_namespace())),
+                timeout_seconds,
+                sandbox_mode: Some(sandbox),
+                model,
+                reasoning_effort,
+                ephemeral,
+            })
+            .map_err(JarvisError::from)?;
+            if full {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).map_err(anyhow::Error::from)?
+                );
+            } else {
+                println!("{}", result.final_message);
+                eprintln!(
+                    "task_visit={} node={} cleanup={}",
+                    result.namespace, result.node, result.cleanup_status
+                );
             }
             Ok(())
         }
