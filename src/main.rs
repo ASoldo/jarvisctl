@@ -1982,10 +1982,12 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                     if result.visits.is_empty() {
                         println!("(none)");
                     } else {
-                        println!("NAMESPACE\tSTATUS\tNODE\tFROM\tINDEX_SOURCE\tSTARTED\tEXIT");
+                        println!(
+                            "NAMESPACE\tSTATUS\tNODE\tFROM\tINDEX_SOURCE\tSTARTED\tEXIT\tCLASS\tRETRYABLE"
+                        );
                         for visit in result.visits {
                             println!(
-                                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                                 visit.namespace,
                                 visit.status,
                                 visit.node,
@@ -1994,6 +1996,11 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                                 visit.started_at_epoch_ms,
                                 visit
                                     .exit_status
+                                    .map(|value| value.to_string())
+                                    .unwrap_or_else(|| "-".to_string()),
+                                visit.failure_class.unwrap_or_else(|| "-".to_string()),
+                                visit
+                                    .retryable
                                     .map(|value| value.to_string())
                                     .unwrap_or_else(|| "-".to_string())
                             );

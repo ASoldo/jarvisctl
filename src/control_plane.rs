@@ -345,6 +345,10 @@ pub struct VisitIndexEntry {
     pub exit_status: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archive_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1291,6 +1295,8 @@ fn run_node_visit_direct(options: NodeVisitOptions) -> anyhow::Result<NodeVisitR
         finished_at_epoch_ms: None,
         exit_status: None,
         archive_path: None,
+        failure_class: None,
+        retryable: None,
     })?;
     let visit_result = run_remote_codex_exec_visit(&target, &options, &namespace);
     let finished_at_epoch_ms = now_epoch_ms();
@@ -1343,6 +1349,8 @@ fn run_node_visit_direct(options: NodeVisitOptions) -> anyhow::Result<NodeVisitR
         finished_at_epoch_ms: Some(finished_at_epoch_ms),
         exit_status: Some(result.exit_status),
         archive_path: result.archive_path.clone(),
+        failure_class: result.failure_class.clone(),
+        retryable: result.retryable,
     })?;
     ensure!(
         result.cleanup_status == "restored",
@@ -1816,8 +1824,11 @@ fn start_node_session_once(
         remote_args.extend(options.command.clone());
     }
     let remote_command = shell_words::join(remote_args);
-    let output = ProcessCommand::new("ssh")
+    let output = ProcessCommand::new("timeout")
         .args([
+            "--kill-after=5s",
+            "45s",
+            "ssh",
             "-o",
             "BatchMode=yes",
             "-o",
@@ -2239,8 +2250,11 @@ fn node_ssh_target(spec: &NodeSpec) -> Option<String> {
 fn run_probe_command(target: Option<&str>) -> anyhow::Result<String> {
     let script = "printf 'arch='; uname -m 2>/dev/null || true; printf '\\nos='; uname -s 2>/dev/null || true; printf '\\ncodex='; (codex --version 2>/dev/null || command -v codex 2>/dev/null || true) | head -n 1; printf '\\njarvisctl='; (jarvisctl --version 2>/dev/null || command -v jarvisctl 2>/dev/null || true) | head -n 1; printf '\\ncodex_auth='; test -s \"$HOME/.codex/auth.json\" && echo present || echo missing; printf '\\n'";
     let output = if let Some(target) = target {
-        ProcessCommand::new("ssh")
+        ProcessCommand::new("timeout")
             .args([
+                "--kill-after=5s",
+                "20s",
+                "ssh",
                 "-o",
                 "BatchMode=yes",
                 "-o",
@@ -2412,8 +2426,11 @@ fn cleanup_codex_auth_lease_on_remote_node(
         .ok_or_else(|| anyhow!("Node '{}' has no SSH target", node.metadata.name))?;
     let lease_name = auth_lease_name(runtime_namespace);
     let remote_script = "set -eu; lease=\"${JARVIS_CODEX_AUTH_LEASE:-}\"; [ -n \"$lease\" ] || exit 0; lease_dir=\"$HOME/.jarvis/codex/auth-leases/$lease\"; [ -d \"$lease_dir/backup\" ] || exit 0; mkdir -p \"$HOME/.codex\"; for f in auth.json config.toml version.json; do if [ -e \"$lease_dir/backup/$f\" ]; then cp -p \"$lease_dir/backup/$f\" \"$HOME/.codex/$f\"; elif [ -e \"$lease_dir/backup/$f.missing\" ]; then rm -f \"$HOME/.codex/$f\"; fi; done; chmod 700 \"$HOME/.codex\" 2>/dev/null || true; chmod 600 \"$HOME/.codex/auth.json\" \"$HOME/.codex/config.toml\" \"$HOME/.codex/version.json\" 2>/dev/null || true; rm -rf \"$lease_dir\"";
-    let output = ProcessCommand::new("ssh")
+    let output = ProcessCommand::new("timeout")
         .args([
+            "--kill-after=5s",
+            "45s",
+            "ssh",
             "-o",
             "BatchMode=yes",
             "-o",
@@ -2593,6 +2610,8 @@ fn run_node_relay_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitRe
         finished_at_epoch_ms: None,
         exit_status: None,
         archive_path: None,
+        failure_class: None,
+        retryable: None,
     })?;
     let mut result = run_remote_jarvis_visit(&target, &options, &namespace)?;
     let finished_at_epoch_ms = now_epoch_ms();
@@ -2616,6 +2635,8 @@ fn run_node_relay_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitRe
         finished_at_epoch_ms: Some(finished_at_epoch_ms),
         exit_status: Some(result.exit_status),
         archive_path: result.archive_path.clone(),
+        failure_class: result.failure_class.clone(),
+        retryable: result.retryable,
     })?;
     ensure!(
         result.exit_status == 0,
@@ -3148,8 +3169,11 @@ fn run_shell_probe(target: Option<&str>, script: &str, label: &str) -> anyhow::R
     let output = if let Some(target) = target {
         let remote_command =
             shell_words::join(["sh".to_string(), "-lc".to_string(), script.to_string()]);
-        ProcessCommand::new("ssh")
+        ProcessCommand::new("timeout")
             .args([
+                "--kill-after=5s",
+                "30s",
+                "ssh",
                 "-o",
                 "BatchMode=yes",
                 "-o",
@@ -3228,8 +3252,11 @@ printf 'removed_visit_artifacts=%s\n' "$removed"
 
     let output = if let Some(target) = target {
         let remote_command = shell_words::join(["sh".to_string(), "-lc".to_string(), script]);
-        ProcessCommand::new("ssh")
+        ProcessCommand::new("timeout")
             .args([
+                "--kill-after=5s",
+                "45s",
+                "ssh",
                 "-o",
                 "BatchMode=yes",
                 "-o",
@@ -4770,8 +4797,11 @@ fn launch_remote_replica_set_replica(
     }
     command_parts.extend(remote_args);
     let remote_command = shell_words::join(command_parts);
-    let output = ProcessCommand::new("ssh")
+    let output = ProcessCommand::new("timeout")
         .args([
+            "--kill-after=5s",
+            "45s",
+            "ssh",
             "-o",
             "BatchMode=yes",
             "-o",
@@ -5985,8 +6015,11 @@ fn collect_remote_runtime_sessions() -> anyhow::Result<Vec<NativeSessionMetadata
         let Some(target) = node_ssh_target(&node.spec) else {
             continue;
         };
-        let output = ProcessCommand::new("ssh")
+        let output = ProcessCommand::new("timeout")
             .args([
+                "--kill-after=5s",
+                "25s",
+                "ssh",
                 "-o",
                 "BatchMode=yes",
                 "-o",
@@ -6106,8 +6139,11 @@ fn run_remote_runtime_command(
     let target = node_ssh_target(&node.spec)
         .ok_or_else(|| anyhow!("Node '{}' has no SSH target", node.metadata.name))?;
     let remote_command = shell_words::join(command);
-    let output = ProcessCommand::new("ssh")
+    let output = ProcessCommand::new("timeout")
         .args([
+            "--kill-after=5s",
+            "45s",
+            "ssh",
             "-o",
             "BatchMode=yes",
             "-o",
@@ -6751,5 +6787,29 @@ spec:
             service["metadata"]["labels"]["jarvisctl.io/runtime-deployment"].as_str(),
             Some("codex-runtime")
         );
+    }
+
+    #[test]
+    fn classifies_retryable_and_non_retryable_failures() {
+        assert_eq!(
+            classify_failure("ERROR: You've hit your usage limit."),
+            "codex_limit"
+        );
+        assert!(failure_is_retryable("codex_limit"));
+
+        assert_eq!(classify_failure("Permission denied (publickey)."), "auth");
+        assert!(!failure_is_retryable("auth"));
+
+        assert_eq!(
+            classify_failure("ssh: connect to host node port 22: Connection timed out"),
+            "timeout"
+        );
+        assert!(failure_is_retryable("timeout"));
+
+        assert_eq!(
+            classify_failure("jarvisctl: command not found"),
+            "missing_tool"
+        );
+        assert!(!failure_is_retryable("missing_tool"));
     }
 }
