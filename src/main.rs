@@ -39,11 +39,11 @@ use codex_app::{
 };
 use control_plane::{
     ControlPlaneOutput, ControlPlaneResourceKindArg, KubernetesRenderOutput, NodeBootstrapOptions,
-    NodeFanoutOptions, NodeRegisterOptions, NodeScheduleOptions, NodeStartSessionOptions,
-    NodeVisitOptions, apply_kubernetes_resources, apply_kustomization, apply_manifests,
-    attach_cluster_runtime_session, authorize_runtime_message, bootstrap_node, cleanup_node,
-    cluster_index, delete_cluster_runtime_session, doctor_nodes, inspect_node,
-    interrupt_cluster_runtime_session, load_or_create_orchestration_policy,
+    NodeFanoutOptions, NodeLinksOptions, NodeRegisterOptions, NodeScheduleOptions,
+    NodeStartSessionOptions, NodeVisitOptions, apply_kubernetes_resources, apply_kustomization,
+    apply_manifests, attach_cluster_runtime_session, authorize_runtime_message, bootstrap_node,
+    check_node_links, cleanup_node, cluster_index, delete_cluster_runtime_session, doctor_nodes,
+    inspect_node, interrupt_cluster_runtime_session, load_or_create_orchestration_policy,
     migrate_session_to_node, open_visit_capsule, orchestration_policy_path,
     pause_deployment_rollout, read_auth_audit_events, reconcile_nodes, register_node,
     render_describe_output, render_get_output, render_kubernetes_resources,
@@ -619,6 +619,18 @@ enum NodeCommand {
 
     /// Check all registered nodes for orchestration readiness
     Doctor {
+        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Check directed SSH reachability between registered nodes
+    Links {
+        #[arg(long = "from")]
+        from: Vec<String>,
+
+        #[arg(long = "to")]
+        to: Vec<String>,
+
         #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
@@ -1802,6 +1814,38 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                             } else {
                                 check.issues.join(",")
                             }
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        NodeCommand::Links { from, to, output } => {
+            let result =
+                check_node_links(NodeLinksOptions { from, to }).map_err(JarvisError::from)?;
+            match output {
+                ControlPlaneOutput::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).map_err(anyhow::Error::from)?
+                ),
+                ControlPlaneOutput::Yaml => {
+                    println!(
+                        "{}",
+                        serde_yaml::to_string(&result).map_err(anyhow::Error::from)?
+                    )
+                }
+                ControlPlaneOutput::Table => {
+                    println!("FROM\tTO\tOK\tEXIT\tCLASS\tAUTH_URL\tDETAIL");
+                    for check in result {
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                            check.from,
+                            check.to,
+                            check.ok,
+                            check.exit_status,
+                            check.failure_class.unwrap_or_else(|| "-".to_string()),
+                            check.auth_url.unwrap_or_else(|| "-".to_string()),
+                            check.detail.replace('\n', "\\n")
                         );
                     }
                 }

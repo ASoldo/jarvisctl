@@ -233,6 +233,12 @@ pub struct NodeFanoutOptions {
     pub max_concurrency: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct NodeLinksOptions {
+    pub from: Vec<String>,
+    pub to: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeScheduleResult {
     pub node: String,
@@ -389,6 +395,19 @@ pub struct NodeFanoutResult {
     pub requested_nodes: Vec<String>,
     pub results: Vec<NodeVisitResult>,
     pub failures: Vec<NodeFanoutFailure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeLinkCheck {
+    pub from: String,
+    pub to: String,
+    pub ok: bool,
+    pub exit_status: i32,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1559,6 +1578,158 @@ pub fn doctor_nodes() -> anyhow::Result<Vec<NodeDoctorCheck>> {
     }
     checks.sort_by(|left, right| left.node.cmp(&right.node));
     Ok(checks)
+}
+
+pub fn check_node_links(options: NodeLinksOptions) -> anyhow::Result<Vec<NodeLinkCheck>> {
+    let nodes = load_manifests_by_kind(ResourceKind::Node, None)?
+        .into_iter()
+        .filter_map(|manifest| match manifest {
+            ResourceManifest::Node(node) => Some(node),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    ensure!(!nodes.is_empty(), "no registered Nodes exist");
+
+    let from_filter = options.from.into_iter().collect::<BTreeSet<_>>();
+    let to_filter = options.to.into_iter().collect::<BTreeSet<_>>();
+    let mut checks = Vec::new();
+    for source in &nodes {
+        if !from_filter.is_empty() && !from_filter.contains(&source.metadata.name) {
+            continue;
+        }
+        for target in &nodes {
+            if source.metadata.name == target.metadata.name {
+                continue;
+            }
+            if !to_filter.is_empty() && !to_filter.contains(&target.metadata.name) {
+                continue;
+            }
+            checks.push(check_node_link(source, target));
+        }
+    }
+    checks.sort_by(|left, right| {
+        left.from
+            .cmp(&right.from)
+            .then_with(|| left.to.cmp(&right.to))
+    });
+    Ok(checks)
+}
+
+fn check_node_link(
+    source: &ResourceEnvelope<NodeSpec>,
+    target: &ResourceEnvelope<NodeSpec>,
+) -> NodeLinkCheck {
+    let result = if node_is_local(source) {
+        check_direct_ssh_link(target)
+    } else {
+        check_relay_ssh_link(source, target)
+    };
+    match result {
+        Ok((status, stdout, stderr)) => {
+            let ok = status == 0;
+            let detail = if ok {
+                stdout.trim().to_string()
+            } else {
+                stderr.trim().to_string()
+            };
+            NodeLinkCheck {
+                from: source.metadata.name.clone(),
+                to: target.metadata.name.clone(),
+                ok,
+                exit_status: status,
+                failure_class: (!ok).then(|| classify_failure(&format!("{stderr}\n{stdout}"))),
+                auth_url: extract_auth_url(&format!("{stderr}\n{stdout}")),
+                detail,
+            }
+        }
+        Err(error) => {
+            let detail = error.to_string();
+            NodeLinkCheck {
+                from: source.metadata.name.clone(),
+                to: target.metadata.name.clone(),
+                ok: false,
+                exit_status: -1,
+                failure_class: Some(classify_failure(&detail)),
+                auth_url: extract_auth_url(&detail),
+                detail,
+            }
+        }
+    }
+}
+
+fn check_direct_ssh_link(
+    target: &ResourceEnvelope<NodeSpec>,
+) -> anyhow::Result<(i32, String, String)> {
+    let target_label = node_link_target(target);
+    run_link_probe_command(vec![
+        "timeout".to_string(),
+        "--kill-after=5s".to_string(),
+        "25s".to_string(),
+        "ssh".to_string(),
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=10".to_string(),
+        target_label,
+        link_probe_script().to_string(),
+    ])
+}
+
+fn check_relay_ssh_link(
+    source: &ResourceEnvelope<NodeSpec>,
+    target: &ResourceEnvelope<NodeSpec>,
+) -> anyhow::Result<(i32, String, String)> {
+    let source_target = node_ssh_target(&source.spec)
+        .ok_or_else(|| anyhow!("Node '{}' has no SSH target", source.metadata.name))?;
+    let target_label = node_link_target(target);
+    let nested = shell_words::join([
+        "timeout".to_string(),
+        "--kill-after=5s".to_string(),
+        "25s".to_string(),
+        "ssh".to_string(),
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=10".to_string(),
+        target_label,
+        link_probe_script().to_string(),
+    ]);
+    run_link_probe_command(vec![
+        "timeout".to_string(),
+        "--kill-after=5s".to_string(),
+        "35s".to_string(),
+        "ssh".to_string(),
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=10".to_string(),
+        source_target,
+        nested,
+    ])
+}
+
+fn run_link_probe_command(command: Vec<String>) -> anyhow::Result<(i32, String, String)> {
+    let mut parts = command.into_iter();
+    let program = parts
+        .next()
+        .ok_or_else(|| anyhow!("link probe command is empty"))?;
+    let output = ProcessCommand::new(program)
+        .args(parts.collect::<Vec<_>>())
+        .output()
+        .context("failed to run node link probe")?;
+    Ok((
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    ))
+}
+
+fn node_link_target(node: &ResourceEnvelope<NodeSpec>) -> String {
+    node_ssh_target(&node.spec).unwrap_or_else(|| node.metadata.name.clone())
+}
+
+fn link_probe_script() -> &'static str {
+    "printf 'jarvisctl='; (jarvisctl --version 2>/dev/null || command -v jarvisctl 2>/dev/null || true) | head -n 1"
 }
 
 pub fn run_node_fanout(options: NodeFanoutOptions) -> anyhow::Result<NodeFanoutResult> {
@@ -2825,6 +2996,13 @@ fn failure_is_retryable(classification: &str) -> bool {
         classification,
         "timeout" | "transport" | "codex_limit" | "unknown"
     )
+}
+
+fn extract_auth_url(message: &str) -> Option<String> {
+    message
+        .split_whitespace()
+        .find(|part| part.starts_with("https://login.tailscale.com/a/"))
+        .map(|part| part.trim_end_matches(['.', ',', ';']).to_string())
 }
 
 #[derive(Debug, Serialize)]
@@ -6811,5 +6989,15 @@ spec:
             "missing_tool"
         );
         assert!(!failure_is_retryable("missing_tool"));
+    }
+
+    #[test]
+    fn extracts_tailscale_auth_url_from_probe_output() {
+        let message = "# Tailscale SSH requires an additional check.\n# To authenticate, visit: https://login.tailscale.com/a/l6c9487034871a";
+        assert_eq!(
+            extract_auth_url(message).as_deref(),
+            Some("https://login.tailscale.com/a/l6c9487034871a")
+        );
+        assert!(extract_auth_url("plain ssh failure").is_none());
     }
 }
