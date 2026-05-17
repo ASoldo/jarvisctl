@@ -130,7 +130,7 @@ enum Command {
         backend: SessionBackend,
 
         /// Namespace name
-        #[arg(long)]
+        #[arg(long, alias = "ns")]
         namespace: String,
 
         /// Number of agents
@@ -138,7 +138,7 @@ enum Command {
         agents: usize,
 
         /// Working directory for each agent
-        #[arg(long, value_hint = ValueHint::DirPath)]
+        #[arg(long, alias = "wd", value_hint = ValueHint::DirPath)]
         working_directory: Option<String>,
 
         /// Command and args to run per agent
@@ -157,15 +157,15 @@ enum Command {
         driver: CodexRuntimeDriver,
 
         /// Ticket or task note with YAML frontmatter
-        #[arg(long, value_hint = ValueHint::FilePath)]
+        #[arg(long, alias = "tn", value_hint = ValueHint::FilePath)]
         task_note: PathBuf,
 
         /// Override the runtime namespace
-        #[arg(long)]
+        #[arg(long, alias = "ns")]
         namespace: Option<String>,
 
         /// Bind the launched Codex runtime to a control-plane namespace
-        #[arg(long = "control-namespace")]
+        #[arg(long = "control-namespace", alias = "cns")]
         control_namespace: Option<String>,
 
         /// Internal control-plane deployment metadata for scheduled launches
@@ -173,7 +173,7 @@ enum Command {
         deployment: Option<String>,
 
         /// Internal control-plane runtime label metadata for scheduled launches
-        #[arg(long = "runtime-label", hide = true)]
+        #[arg(long = "runtime-label", alias = "rl", hide = true)]
         runtime_labels: Vec<String>,
 
         /// Number of Codex agents to create
@@ -189,15 +189,15 @@ enum Command {
         fresh: bool,
 
         /// Explicit Codex session id to resume instead of reusing the latest ticket session
-        #[arg(long)]
+        #[arg(long = "resume-session-id", alias = "sid")]
         resume_session_id: Option<String>,
 
         /// Override the working directory instead of repo_path from the note
-        #[arg(long, value_hint = ValueHint::DirPath)]
+        #[arg(long, alias = "wd", value_hint = ValueHint::DirPath)]
         working_directory: Option<PathBuf>,
 
         /// Use an explicit prompt file instead of rendering from the task note
-        #[arg(long, value_hint = ValueHint::FilePath)]
+        #[arg(long, alias = "pf", value_hint = ValueHint::FilePath)]
         prompt_file: Option<PathBuf>,
 
         /// Additional operator message to send with the launch or resume prompt
@@ -209,7 +209,7 @@ enum Command {
         image: Vec<PathBuf>,
 
         /// Wait this long before injecting the prompt
-        #[arg(long, default_value_t = 1500)]
+        #[arg(long, alias = "delay-ms", default_value_t = 1500)]
         startup_delay_ms: u64,
 
         /// Codex command override, defaults to `codex`
@@ -228,11 +228,11 @@ enum Command {
         driver: CodexRuntimeDriver,
 
         /// Vault root used to resolve board links and default boards
-        #[arg(long, value_hint = ValueHint::DirPath, default_value = "/home/rootster/codex")]
+        #[arg(long, alias = "vault", value_hint = ValueHint::DirPath, default_value = "/home/rootster/codex")]
         vault_path: PathBuf,
 
         /// Board file to scan; may be repeated. Defaults to the dispatch board and project boards in the vault.
-        #[arg(long, value_hint = ValueHint::FilePath)]
+        #[arg(long, alias = "b", value_hint = ValueHint::FilePath)]
         board: Vec<PathBuf>,
 
         /// Scan once and exit instead of looping as a daemon
@@ -244,11 +244,11 @@ enum Command {
         dry_run: bool,
 
         /// Polling interval in seconds when not using --once
-        #[arg(long, default_value_t = 15)]
+        #[arg(long, alias = "interval", default_value_t = 15)]
         interval_seconds: u64,
 
         /// Override the dispatch state file
-        #[arg(long, value_hint = ValueHint::FilePath)]
+        #[arg(long, alias = "state", value_hint = ValueHint::FilePath)]
         state_file: Option<PathBuf>,
 
         /// Agent to inject the prompt into
@@ -260,7 +260,7 @@ enum Command {
         agents: usize,
 
         /// Wait this long before injecting the prompt
-        #[arg(long, default_value_t = 1500)]
+        #[arg(long, alias = "delay-ms", default_value_t = 1500)]
         startup_delay_ms: u64,
 
         /// Codex command override, defaults to `codex`
@@ -271,11 +271,11 @@ enum Command {
     /// Send a bounded Codex prompt capsule to a remote node and return its result
     Visit {
         /// Registered remote node to visit, or `auto` to let the scheduler choose
-        #[arg(long, default_value = "auto")]
+        #[arg(long, alias = "n", default_value = "auto")]
         node: String,
 
         /// Run the visit from another registered node instead of this control node
-        #[arg(long = "from-node")]
+        #[arg(long = "from-node", alias = "from")]
         from_node: Option<String>,
 
         /// Scheduler role constraint when --node auto is used
@@ -283,7 +283,7 @@ enum Command {
         role: Option<String>,
 
         /// Scheduler label constraint when --node auto is used
-        #[arg(long = "label")]
+        #[arg(long = "label", alias = "lbl")]
         labels: Vec<String>,
 
         /// Retry a scheduled visit on another eligible node after failure
@@ -295,7 +295,7 @@ enum Command {
         text: Option<String>,
 
         /// Prompt file to send to the remote Codex
-        #[arg(long = "file", value_hint = ValueHint::FilePath, conflicts_with_all = ["text", "from_current"])]
+        #[arg(long = "file", alias = "f", value_hint = ValueHint::FilePath, conflicts_with_all = ["text", "from_current"])]
         prompt_file: Option<PathBuf>,
 
         /// Build a capsule from this shell/workspace and the latest local Codex transcript tail
@@ -303,15 +303,15 @@ enum Command {
         from_current: bool,
 
         /// Remote working directory; defaults to the remote user's home directory
-        #[arg(long, value_hint = ValueHint::DirPath)]
+        #[arg(long, alias = "wd", value_hint = ValueHint::DirPath)]
         working_directory: Option<String>,
 
         /// Override the generated visit namespace/lease name
-        #[arg(long)]
+        #[arg(long, alias = "ns")]
         namespace: Option<String>,
 
         /// Kill the remote visit if it runs longer than this
-        #[arg(long = "timeout-seconds", default_value_t = 900)]
+        #[arg(long = "timeout-seconds", alias = "timeout", default_value_t = 900)]
         timeout_seconds: u64,
 
         /// Remote Codex sandbox mode for the visit
@@ -323,7 +323,7 @@ enum Command {
         model: Option<String>,
 
         /// Remote Codex reasoning effort override
-        #[arg(long = "reasoning-effort")]
+        #[arg(long = "reasoning-effort", alias = "re")]
         reasoning_effort: Option<String>,
 
         /// Do not persist a Codex session file on the remote node
@@ -356,10 +356,10 @@ enum Command {
     Get {
         kind: ControlPlaneResourceKindArg,
 
-        #[arg(short = 'n', long = "resource-namespace")]
+        #[arg(short = 'n', long = "resource-namespace", alias = "ns", alias = "rns")]
         resource_namespace: Option<String>,
 
-        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
 
@@ -368,10 +368,10 @@ enum Command {
         kind: ControlPlaneResourceKindArg,
         name: String,
 
-        #[arg(short = 'n', long = "resource-namespace")]
+        #[arg(short = 'n', long = "resource-namespace", alias = "ns", alias = "rns")]
         resource_namespace: Option<String>,
 
-        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Yaml)]
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Yaml)]
         output: ControlPlaneOutput,
     },
 
@@ -398,7 +398,7 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
         backend: SessionBackend,
 
-        #[arg(long, default_value_t = 1000)]
+        #[arg(long, alias = "refresh", default_value_t = 1000)]
         refresh_ms: u64,
     },
 
@@ -407,7 +407,7 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
         backend: SessionBackend,
 
-        #[arg(long, required_unless_present = "service", conflicts_with = "service")]
+        #[arg(long, alias = "ns", required_unless_present = "service", conflicts_with = "service")]
         namespace: Option<String>,
 
         #[arg(
@@ -417,7 +417,7 @@ enum Command {
         )]
         service: Option<String>,
 
-        #[arg(short = 'n', long = "resource-namespace", requires = "service")]
+        #[arg(short = 'n', long = "resource-namespace", alias = "rns", requires = "service")]
         resource_namespace: Option<String>,
     },
 
@@ -426,7 +426,7 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
         backend: SessionBackend,
 
-        #[arg(long)]
+        #[arg(long, alias = "ns")]
         namespace: String,
     },
 
@@ -435,7 +435,7 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
         backend: SessionBackend,
 
-        #[arg(long)]
+        #[arg(long, alias = "ns")]
         namespace: Option<String>,
 
         #[arg(long, default_value_t = false)]
@@ -447,7 +447,7 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
         backend: SessionBackend,
 
-        #[arg(long, required_unless_present = "service", conflicts_with = "service")]
+        #[arg(long, alias = "ns", required_unless_present = "service", conflicts_with = "service")]
         namespace: Option<String>,
 
         #[arg(
@@ -457,7 +457,7 @@ enum Command {
         )]
         service: Option<String>,
 
-        #[arg(short = 'n', long = "resource-namespace", requires = "service")]
+        #[arg(short = 'n', long = "resource-namespace", alias = "rns", requires = "service")]
         resource_namespace: Option<String>,
 
         #[arg(long, default_value_t = true)]
@@ -472,7 +472,7 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
         backend: SessionBackend,
 
-        #[arg(long, required_unless_present = "service", conflicts_with = "service")]
+        #[arg(long, alias = "ns", required_unless_present = "service", conflicts_with = "service")]
         namespace: Option<String>,
 
         #[arg(
@@ -482,7 +482,7 @@ enum Command {
         )]
         service: Option<String>,
 
-        #[arg(short = 'n', long = "resource-namespace", requires = "service")]
+        #[arg(short = 'n', long = "resource-namespace", alias = "rns", requires = "service")]
         resource_namespace: Option<String>,
 
         #[arg(long, default_value = "agent0")]
@@ -494,7 +494,7 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
         backend: SessionBackend,
 
-        #[arg(long, required_unless_present = "service", conflicts_with = "service")]
+        #[arg(long, alias = "ns", required_unless_present = "service", conflicts_with = "service")]
         namespace: Option<String>,
         #[arg(
             long,
@@ -502,7 +502,7 @@ enum Command {
             conflicts_with = "namespace"
         )]
         service: Option<String>,
-        #[arg(short = 'n', long = "resource-namespace", requires = "service")]
+        #[arg(short = 'n', long = "resource-namespace", alias = "rns", requires = "service")]
         resource_namespace: Option<String>,
         #[arg(long, default_value = "agent0")]
         agent: String,
@@ -521,7 +521,7 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
         backend: SessionBackend,
 
-        #[arg(long, required_unless_present = "service", conflicts_with = "service")]
+        #[arg(long, alias = "ns", required_unless_present = "service", conflicts_with = "service")]
         namespace: Option<String>,
 
         #[arg(
@@ -531,7 +531,7 @@ enum Command {
         )]
         service: Option<String>,
 
-        #[arg(short = 'n', long = "resource-namespace", requires = "service")]
+        #[arg(short = 'n', long = "resource-namespace", alias = "rns", requires = "service")]
         resource_namespace: Option<String>,
 
         #[arg(long, default_value = "agent0")]
@@ -560,25 +560,25 @@ enum NodeCommand {
         #[arg(long)]
         address: Option<String>,
 
-        #[arg(long = "ssh-host")]
+        #[arg(long = "ssh-host", alias = "host")]
         ssh_host: Option<String>,
 
-        #[arg(long = "ssh-user")]
+        #[arg(long = "ssh-user", alias = "user")]
         ssh_user: Option<String>,
 
         #[arg(long, default_value_t = false)]
         local: bool,
 
-        #[arg(long = "role")]
+        #[arg(long = "role", alias = "r")]
         roles: Vec<String>,
 
-        #[arg(long = "label")]
+        #[arg(long = "label", alias = "lbl")]
         labels: Vec<String>,
 
-        #[arg(long = "workspace-root", value_hint = ValueHint::DirPath)]
+        #[arg(long = "workspace-root", alias = "wd", value_hint = ValueHint::DirPath)]
         workspace_root: Option<String>,
 
-        #[arg(long = "max-sessions")]
+        #[arg(long = "max-sessions", alias = "max")]
         max_sessions: Option<usize>,
     },
 
@@ -586,7 +586,7 @@ enum NodeCommand {
     Ping {
         name: String,
 
-        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
 
@@ -604,22 +604,22 @@ enum NodeCommand {
         #[arg(long)]
         role: Option<String>,
 
-        #[arg(long = "label")]
+        #[arg(long = "label", alias = "lbl")]
         labels: Vec<String>,
 
-        #[arg(long = "exclude")]
+        #[arg(long = "exclude", alias = "x")]
         exclude: Vec<String>,
 
-        #[arg(long = "require-codex-auth", default_value_t = true)]
+        #[arg(long = "require-codex-auth", alias = "auth", default_value_t = true)]
         require_codex_auth: bool,
 
-        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
 
     /// Check all registered nodes for orchestration readiness
     Doctor {
-        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
 
@@ -631,22 +631,22 @@ enum NodeCommand {
         #[arg(long = "to")]
         to: Vec<String>,
 
-        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
 
     /// Show or initialize persistent orchestration policy
     Policy {
-        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Yaml)]
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Yaml)]
         output: ControlPlaneOutput,
     },
 
     /// Run doctor plus stale lease/artifact cleanup across available nodes
     Reconcile {
-        #[arg(long = "max-age-days")]
+        #[arg(long = "max-age-days", alias = "max-age")]
         max_age_days: Option<u64>,
 
-        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
 
@@ -655,13 +655,13 @@ enum NodeCommand {
         #[arg(long = "no-sync", default_value_t = false)]
         no_sync: bool,
 
-        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
 
     /// Show running cluster sessions and finished/running visits from one index
     Index {
-        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
 
@@ -670,28 +670,28 @@ enum NodeCommand {
         #[arg(long, default_value_t = 20)]
         limit: usize,
 
-        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
 
     /// Send the same protected visit prompt to multiple nodes
     Fanout {
-        #[arg(long = "node")]
+        #[arg(long = "node", alias = "n")]
         nodes: Vec<String>,
 
         #[arg(long)]
         role: Option<String>,
 
-        #[arg(long = "label")]
+        #[arg(long = "label", alias = "lbl")]
         labels: Vec<String>,
 
         #[arg(long)]
         text: Option<String>,
 
-        #[arg(long = "file", value_hint = ValueHint::FilePath)]
+        #[arg(long = "file", alias = "f", value_hint = ValueHint::FilePath)]
         prompt_file: Option<PathBuf>,
 
-        #[arg(long = "timeout-seconds", default_value_t = 900)]
+        #[arg(long = "timeout-seconds", alias = "timeout", default_value_t = 900)]
         timeout_seconds: u64,
 
         #[arg(long, default_value = "read-only")]
@@ -700,13 +700,13 @@ enum NodeCommand {
         #[arg(long)]
         model: Option<String>,
 
-        #[arg(long = "reasoning-effort")]
+        #[arg(long = "reasoning-effort", alias = "re")]
         reasoning_effort: Option<String>,
 
         #[arg(long, default_value_t = false)]
         ephemeral: bool,
 
-        #[arg(long = "max-concurrency", default_value_t = 4)]
+        #[arg(long = "max-concurrency", alias = "mc", default_value_t = 4)]
         max_concurrency: usize,
 
         #[arg(long, default_value_t = false)]
@@ -718,19 +718,19 @@ enum NodeCommand {
         #[arg(long)]
         text: Option<String>,
 
-        #[arg(long = "file", value_hint = ValueHint::FilePath)]
+        #[arg(long = "file", alias = "f", value_hint = ValueHint::FilePath)]
         prompt_file: Option<PathBuf>,
 
         #[arg(long)]
         role: Option<String>,
 
-        #[arg(long = "label")]
+        #[arg(long = "label", alias = "lbl")]
         labels: Vec<String>,
 
         #[arg(long, default_value_t = 1)]
         retries: usize,
 
-        #[arg(long = "timeout-seconds", default_value_t = 900)]
+        #[arg(long = "timeout-seconds", alias = "timeout", default_value_t = 900)]
         timeout_seconds: u64,
 
         #[arg(long, default_value = "read-only")]
@@ -739,7 +739,7 @@ enum NodeCommand {
         #[arg(long)]
         model: Option<String>,
 
-        #[arg(long = "reasoning-effort")]
+        #[arg(long = "reasoning-effort", alias = "re")]
         reasoning_effort: Option<String>,
 
         #[arg(long, default_value_t = false)]
@@ -751,34 +751,34 @@ enum NodeCommand {
 
     /// Start a durable Codex app-server session on a scheduled remote node
     StartSession {
-        #[arg(long, default_value = "auto")]
+        #[arg(long, alias = "n", default_value = "auto")]
         node: String,
 
         #[arg(long)]
         role: Option<String>,
 
-        #[arg(long = "label")]
+        #[arg(long = "label", alias = "lbl")]
         labels: Vec<String>,
 
         #[arg(long)]
         retries: Option<usize>,
 
-        #[arg(long = "task-note", value_hint = ValueHint::FilePath)]
+        #[arg(long = "task-note", alias = "tn", value_hint = ValueHint::FilePath)]
         task_note: PathBuf,
 
-        #[arg(long)]
+        #[arg(long, alias = "ns")]
         namespace: Option<String>,
 
-        #[arg(long = "resume-session-id")]
+        #[arg(long = "resume-session-id", alias = "sid")]
         resume_session_id: Option<String>,
 
-        #[arg(long, value_hint = ValueHint::DirPath)]
+        #[arg(long, alias = "wd", value_hint = ValueHint::DirPath)]
         working_directory: Option<PathBuf>,
 
         #[arg(long)]
         message: Option<String>,
 
-        #[arg(long, default_value_t = 1500)]
+        #[arg(long, alias = "delay-ms", default_value_t = 1500)]
         startup_delay_ms: u64,
 
         #[arg(long, default_value_t = false)]
@@ -793,10 +793,10 @@ enum NodeCommand {
         #[arg(long)]
         session: String,
 
-        #[arg(long = "to-node", default_value = "auto")]
+        #[arg(long = "to-node", alias = "to", default_value = "auto")]
         to_node: String,
 
-        #[arg(long = "timeout-seconds", default_value_t = 900)]
+        #[arg(long = "timeout-seconds", alias = "timeout", default_value_t = 900)]
         timeout_seconds: u64,
 
         #[arg(long, default_value_t = false)]
@@ -810,25 +810,25 @@ enum NodeCommand {
         #[arg(long)]
         address: Option<String>,
 
-        #[arg(long = "ssh-host")]
+        #[arg(long = "ssh-host", alias = "host")]
         ssh_host: String,
 
-        #[arg(long = "ssh-user")]
+        #[arg(long = "ssh-user", alias = "user")]
         ssh_user: Option<String>,
 
-        #[arg(long = "role")]
+        #[arg(long = "role", alias = "r")]
         roles: Vec<String>,
 
-        #[arg(long = "label")]
+        #[arg(long = "label", alias = "lbl")]
         labels: Vec<String>,
 
-        #[arg(long = "workspace-root", value_hint = ValueHint::DirPath)]
+        #[arg(long = "workspace-root", alias = "wd", value_hint = ValueHint::DirPath)]
         workspace_root: Option<String>,
 
-        #[arg(long = "max-sessions")]
+        #[arg(long = "max-sessions", alias = "max")]
         max_sessions: Option<usize>,
 
-        #[arg(long = "codex-path")]
+        #[arg(long = "codex-path", alias = "codex")]
         codex_path: Option<String>,
     },
 
@@ -836,7 +836,7 @@ enum NodeCommand {
     Inspect {
         name: String,
 
-        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
 
@@ -844,10 +844,10 @@ enum NodeCommand {
     Cleanup {
         name: String,
 
-        #[arg(long = "max-age-days", default_value_t = 7)]
+        #[arg(long = "max-age-days", alias = "max-age", default_value_t = 7)]
         max_age_days: u64,
 
-        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
 }
@@ -858,16 +858,16 @@ enum RolloutCommand {
     Status {
         deployment: String,
 
-        #[arg(short = 'n', long = "resource-namespace")]
+        #[arg(short = 'n', long = "resource-namespace", alias = "ns", alias = "rns")]
         resource_namespace: Option<String>,
 
         #[arg(long, default_value_t = false)]
         watch: bool,
 
-        #[arg(long = "timeout-seconds", default_value_t = 300)]
+        #[arg(long = "timeout-seconds", alias = "timeout", default_value_t = 300)]
         timeout_seconds: u64,
 
-        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
 
@@ -875,10 +875,10 @@ enum RolloutCommand {
     History {
         deployment: String,
 
-        #[arg(short = 'n', long = "resource-namespace")]
+        #[arg(short = 'n', long = "resource-namespace", alias = "ns", alias = "rns")]
         resource_namespace: Option<String>,
 
-        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
 
@@ -886,7 +886,7 @@ enum RolloutCommand {
     Restart {
         deployment: String,
 
-        #[arg(short = 'n', long = "resource-namespace")]
+        #[arg(short = 'n', long = "resource-namespace", alias = "ns", alias = "rns")]
         resource_namespace: Option<String>,
     },
 
@@ -894,7 +894,7 @@ enum RolloutCommand {
     Pause {
         deployment: String,
 
-        #[arg(short = 'n', long = "resource-namespace")]
+        #[arg(short = 'n', long = "resource-namespace", alias = "ns", alias = "rns")]
         resource_namespace: Option<String>,
     },
 
@@ -902,7 +902,7 @@ enum RolloutCommand {
     Resume {
         deployment: String,
 
-        #[arg(short = 'n', long = "resource-namespace")]
+        #[arg(short = 'n', long = "resource-namespace", alias = "ns", alias = "rns")]
         resource_namespace: Option<String>,
     },
 
@@ -910,10 +910,10 @@ enum RolloutCommand {
     Undo {
         deployment: String,
 
-        #[arg(short = 'n', long = "resource-namespace")]
+        #[arg(short = 'n', long = "resource-namespace", alias = "ns", alias = "rns")]
         resource_namespace: Option<String>,
 
-        #[arg(long = "to-revision")]
+        #[arg(long = "to-revision", alias = "to")]
         to_revision: Option<u64>,
     },
 }
@@ -922,25 +922,25 @@ enum RolloutCommand {
 enum KubeCommand {
     /// Experimental: render the supported adapter subset as native Kubernetes manifests
     Render {
-        #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
+        #[arg(short = 'f', long = "file", alias = "manifest", value_hint = ValueHint::FilePath)]
         file: Vec<PathBuf>,
 
-        #[arg(short = 'k', long = "kustomize", value_hint = ValueHint::DirPath)]
+        #[arg(short = 'k', long = "kustomize", alias = "kustomization", value_hint = ValueHint::DirPath)]
         kustomize: Option<PathBuf>,
 
-        #[arg(long, value_enum, default_value_t = KubernetesRenderOutput::Yaml)]
+        #[arg(long, alias = "out", value_enum, default_value_t = KubernetesRenderOutput::Yaml)]
         output: KubernetesRenderOutput,
     },
 
     /// Experimental: apply the supported adapter subset onto the active Kubernetes cluster
     Apply {
-        #[arg(short = 'f', long = "file", value_hint = ValueHint::FilePath)]
+        #[arg(short = 'f', long = "file", alias = "manifest", value_hint = ValueHint::FilePath)]
         file: Vec<PathBuf>,
 
-        #[arg(short = 'k', long = "kustomize", value_hint = ValueHint::DirPath)]
+        #[arg(short = 'k', long = "kustomize", alias = "kustomization", value_hint = ValueHint::DirPath)]
         kustomize: Option<PathBuf>,
 
-        #[arg(long)]
+        #[arg(long, alias = "ctx")]
         context: Option<String>,
 
         #[arg(long = "dry-run-server", default_value_t = false)]
@@ -958,7 +958,7 @@ enum KubeCommand {
 enum KubeRuntimeCommand {
     /// Experimental: fetch live metadata from a pod-hosted Codex runtime
     Metadata {
-        #[arg(long, required_unless_present = "service", conflicts_with = "service")]
+        #[arg(long, alias = "deploy", required_unless_present = "service", conflicts_with = "service")]
         deployment: Option<String>,
 
         #[arg(
@@ -968,10 +968,10 @@ enum KubeRuntimeCommand {
         )]
         service: Option<String>,
 
-        #[arg(short = 'n', long = "resource-namespace")]
+        #[arg(short = 'n', long = "resource-namespace", alias = "ns", alias = "rns")]
         resource_namespace: String,
 
-        #[arg(long)]
+        #[arg(long, alias = "ctx")]
         context: Option<String>,
 
         #[arg(long, default_value_t = false)]
@@ -980,7 +980,7 @@ enum KubeRuntimeCommand {
 
     /// Experimental: attach to the live output stream of a pod-hosted Codex runtime
     Attach {
-        #[arg(long, required_unless_present = "service", conflicts_with = "service")]
+        #[arg(long, alias = "deploy", required_unless_present = "service", conflicts_with = "service")]
         deployment: Option<String>,
 
         #[arg(
@@ -990,16 +990,16 @@ enum KubeRuntimeCommand {
         )]
         service: Option<String>,
 
-        #[arg(short = 'n', long = "resource-namespace")]
+        #[arg(short = 'n', long = "resource-namespace", alias = "ns", alias = "rns")]
         resource_namespace: String,
 
-        #[arg(long)]
+        #[arg(long, alias = "ctx")]
         context: Option<String>,
     },
 
     /// Experimental: send text into a pod-hosted Codex runtime
     Tell {
-        #[arg(long, required_unless_present = "service", conflicts_with = "service")]
+        #[arg(long, alias = "deploy", required_unless_present = "service", conflicts_with = "service")]
         deployment: Option<String>,
 
         #[arg(
@@ -1009,13 +1009,13 @@ enum KubeRuntimeCommand {
         )]
         service: Option<String>,
 
-        #[arg(short = 'n', long = "resource-namespace")]
+        #[arg(short = 'n', long = "resource-namespace", alias = "ns", alias = "rns")]
         resource_namespace: String,
 
-        #[arg(long)]
+        #[arg(long, alias = "ctx")]
         context: Option<String>,
 
-        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "text")]
+        #[arg(long, alias = "f", value_hint = ValueHint::FilePath, conflicts_with = "text")]
         file: Option<String>,
 
         #[arg(long, conflicts_with = "file")]
@@ -1027,7 +1027,7 @@ enum KubeRuntimeCommand {
 
     /// Experimental: interrupt the active turn inside a pod-hosted Codex runtime
     Interrupt {
-        #[arg(long, required_unless_present = "service", conflicts_with = "service")]
+        #[arg(long, alias = "deploy", required_unless_present = "service", conflicts_with = "service")]
         deployment: Option<String>,
 
         #[arg(
@@ -1037,10 +1037,10 @@ enum KubeRuntimeCommand {
         )]
         service: Option<String>,
 
-        #[arg(short = 'n', long = "resource-namespace")]
+        #[arg(short = 'n', long = "resource-namespace", alias = "ns", alias = "rns")]
         resource_namespace: String,
 
-        #[arg(long)]
+        #[arg(long, alias = "ctx")]
         context: Option<String>,
     },
 
@@ -1049,10 +1049,10 @@ enum KubeRuntimeCommand {
         #[arg(long)]
         deployment: String,
 
-        #[arg(short = 'n', long = "resource-namespace")]
+        #[arg(short = 'n', long = "resource-namespace", alias = "ns", alias = "rns")]
         resource_namespace: String,
 
-        #[arg(long)]
+        #[arg(long, alias = "ctx")]
         context: Option<String>,
     },
 }
