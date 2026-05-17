@@ -1480,15 +1480,17 @@ fn visit_node(
     effective_labels.extend(parse_key_value_pairs(&labels)?);
 
     let result = run_node_visit(NodeVisitOptions {
+        retries: if retries != 0 {
+            retries
+        } else if node == "auto" {
+            policy.retries
+        } else {
+            0
+        },
         node,
         from_node,
         role: role.or(Some(policy.default_role)),
         labels: effective_labels,
-        retries: if retries == 0 {
-            policy.retries
-        } else {
-            retries
-        },
         prompt,
         working_directory,
         namespace,
