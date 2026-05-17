@@ -11,6 +11,10 @@ pub(crate) fn save_manifest(manifest: &ResourceManifest) -> anyhow::Result<()> {
 }
 
 pub(crate) fn atomic_write_string(path: &Path, raw: &str) -> anyhow::Result<()> {
+    atomic_write_bytes(path, raw.as_bytes())
+}
+
+pub(crate) fn atomic_write_bytes(path: &Path, raw: &[u8]) -> anyhow::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("path '{}' has no parent", path.display()))?;

@@ -164,6 +164,53 @@ pub struct NodeVisitOptions {
     pub ephemeral: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchestrationPolicy {
+    #[serde(default = "default_policy_role")]
+    pub default_role: String,
+    #[serde(default)]
+    pub default_labels: BTreeMap<String, String>,
+    #[serde(default = "default_policy_retries")]
+    pub retries: usize,
+    #[serde(default = "default_policy_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_policy_fanout_concurrency")]
+    pub fanout_max_concurrency: usize,
+    #[serde(default = "default_policy_cleanup_retention_days")]
+    pub cleanup_retention_days: u64,
+    #[serde(default = "default_policy_remote_index_timeout_seconds")]
+    pub remote_index_timeout_seconds: u64,
+}
+
+impl Default for OrchestrationPolicy {
+    fn default() -> Self {
+        Self {
+            default_role: default_policy_role(),
+            default_labels: BTreeMap::new(),
+            retries: default_policy_retries(),
+            timeout_seconds: default_policy_timeout_seconds(),
+            fanout_max_concurrency: default_policy_fanout_concurrency(),
+            cleanup_retention_days: default_policy_cleanup_retention_days(),
+            remote_index_timeout_seconds: default_policy_remote_index_timeout_seconds(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeStartSessionOptions {
+    pub node: String,
+    pub role: Option<String>,
+    pub labels: BTreeMap<String, String>,
+    pub retries: usize,
+    pub task_note: PathBuf,
+    pub namespace: Option<String>,
+    pub resume_session_id: Option<String>,
+    pub working_directory: Option<PathBuf>,
+    pub message: Option<String>,
+    pub startup_delay_ms: u64,
+    pub command: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct NodeScheduleOptions {
     pub role: Option<String>,
@@ -208,6 +255,22 @@ pub struct NodeVisitResult {
     pub cleanup_status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archive_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeStartSessionResult {
+    pub node: String,
+    pub namespace: String,
+    pub exit_status: i32,
+    pub stdout: String,
+    pub stderr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    pub retryable: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -226,6 +289,44 @@ pub struct NodeCleanupResult {
     pub skipped_active_leases: Vec<String>,
     pub removed_visit_artifacts: usize,
     pub stderr: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeReconcileResult {
+    pub doctors: Vec<NodeDoctorCheck>,
+    pub cleanups: Vec<NodeCleanupResult>,
+    pub failures: Vec<NodeFanoutFailure>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CapsuleKeyRotationResult {
+    pub key_path: String,
+    pub synced_nodes: Vec<String>,
+    pub failures: Vec<NodeFanoutFailure>,
+}
+
+fn default_policy_role() -> String {
+    "worker".to_string()
+}
+
+fn default_policy_retries() -> usize {
+    1
+}
+
+fn default_policy_timeout_seconds() -> u64 {
+    900
+}
+
+fn default_policy_fanout_concurrency() -> usize {
+    4
+}
+
+fn default_policy_cleanup_retention_days() -> u64 {
+    7
+}
+
+fn default_policy_remote_index_timeout_seconds() -> u64 {
+    25
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1126,7 +1227,13 @@ pub fn run_node_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitResu
         attempted.push(node_name);
         match run_node_visit_direct(options.clone()) {
             Ok(result) => return Ok(result),
-            Err(error) => last_error = Some(error),
+            Err(error) => {
+                let retryable = failure_is_retryable(&classify_failure(&error.to_string()));
+                last_error = Some(error);
+                if !retryable {
+                    break;
+                }
+            }
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow!("visit did not run any attempts")))
@@ -1546,7 +1653,10 @@ fn matching_remote_nodes(
 pub fn cluster_index() -> anyhow::Result<ClusterIndexResult> {
     let mut visits = read_visit_index_entries()?;
     if env::var_os("JARVIS_NODE_INDEX_LOCAL_ONLY").is_none() {
-        visits.extend(collect_remote_visit_index_entries()?);
+        let policy = load_or_create_orchestration_policy()?;
+        visits.extend(collect_remote_visit_index_entries(
+            policy.remote_index_timeout_seconds,
+        )?);
         visits.sort_by(|left, right| right.started_at_epoch_ms.cmp(&left.started_at_epoch_ms));
     }
     Ok(ClusterIndexResult {
@@ -1572,6 +1682,242 @@ pub fn read_auth_audit_events(limit: Option<usize>) -> anyhow::Result<Vec<AuthAu
         events.truncate(limit);
     }
     Ok(events)
+}
+
+pub fn orchestration_policy_path() -> anyhow::Result<PathBuf> {
+    Ok(jarvis_codex_dir()?.join("orchestration.yaml"))
+}
+
+pub fn load_or_create_orchestration_policy() -> anyhow::Result<OrchestrationPolicy> {
+    let path = orchestration_policy_path()?;
+    if path.exists() {
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read '{}'", path.display()))?;
+        let mut policy: OrchestrationPolicy =
+            serde_yaml::from_str(&raw).context("failed to parse orchestration policy")?;
+        if policy.default_role.trim().is_empty() {
+            policy.default_role = default_policy_role();
+        }
+        return Ok(policy);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let policy = OrchestrationPolicy::default();
+    atomic_write_string(&path, &serde_yaml::to_string(&policy)?)?;
+    Ok(policy)
+}
+
+pub fn start_node_session(
+    options: NodeStartSessionOptions,
+) -> anyhow::Result<NodeStartSessionResult> {
+    let mut attempted = Vec::new();
+    let attempts = options.retries.saturating_add(1);
+    let mut last_result: Option<NodeStartSessionResult> = None;
+    for _ in 0..attempts {
+        let node_name = if options.node == "auto" || !attempted.is_empty() {
+            schedule_node(NodeScheduleOptions {
+                role: options.role.clone().or_else(|| Some(default_policy_role())),
+                labels: options.labels.clone(),
+                exclude: attempted.clone(),
+                require_codex_auth: true,
+            })?
+            .node
+        } else {
+            options.node.clone()
+        };
+        attempted.push(node_name.clone());
+        let result = start_node_session_once(&options, &node_name)?;
+        if result.exit_status == 0 {
+            return Ok(result);
+        }
+        if !result.retryable {
+            return Ok(result);
+        }
+        last_result = Some(result);
+    }
+    last_result.ok_or_else(|| anyhow!("remote session did not run any attempts"))
+}
+
+fn start_node_session_once(
+    options: &NodeStartSessionOptions,
+    node_name: &str,
+) -> anyhow::Result<NodeStartSessionResult> {
+    let manifest = load_manifest(ResourceKind::Node, node_name, None)?;
+    let ResourceManifest::Node(node) = manifest else {
+        bail!("resource '{}' is not a Node", node_name);
+    };
+    ensure!(
+        !node_is_local(&node),
+        "remote session start currently targets remote SSH nodes; '{}' is local",
+        node.metadata.name
+    );
+    let target = node_ssh_target(&node.spec)
+        .ok_or_else(|| anyhow!("Node '{}' has no SSH target", node.metadata.name))?;
+    let namespace = options.namespace.clone().unwrap_or_else(|| {
+        format!(
+            "codex-remote-{}-{}",
+            slugify(&node.metadata.name),
+            now_epoch_ms()
+        )
+    });
+    let auth_files = local_codex_auth_files()?;
+    append_auth_audit_event(
+        "auth_lease_create_start",
+        &node.metadata.name,
+        &namespace,
+        "start",
+        "remote_session",
+    )?;
+    sync_codex_auth_to_remote_node_for_namespace(&node, &auth_files, &namespace)?;
+    append_auth_audit_event(
+        "auth_lease_create_complete",
+        &node.metadata.name,
+        &namespace,
+        "ok",
+        "remote_session",
+    )?;
+
+    let mut remote_args = vec![
+        "jarvisctl".to_string(),
+        "codex".to_string(),
+        "--driver".to_string(),
+        "app-server".to_string(),
+        "--task-note".to_string(),
+        options.task_note.display().to_string(),
+        "--namespace".to_string(),
+        namespace.clone(),
+        "--runtime-label".to_string(),
+        format!("jarvisctl.io/node={}", node.metadata.name),
+        "--runtime-label".to_string(),
+        format!(
+            "jarvisctl.io/node-address={}",
+            node.spec.address.clone().unwrap_or_default()
+        ),
+        "--agent".to_string(),
+        "agent0".to_string(),
+        "--startup-delay-ms".to_string(),
+        options.startup_delay_ms.to_string(),
+    ];
+    if let Some(resume_session_id) = options.resume_session_id.as_deref() {
+        remote_args.push("--resume-session-id".to_string());
+        remote_args.push(resume_session_id.to_string());
+    }
+    if let Some(working_directory) = options.working_directory.as_deref() {
+        remote_args.push("--working-directory".to_string());
+        remote_args.push(working_directory.display().to_string());
+    }
+    if let Some(message) = options.message.as_deref() {
+        remote_args.push("--message".to_string());
+        remote_args.push(message.to_string());
+    }
+    if !options.command.is_empty() {
+        remote_args.push("--".to_string());
+        remote_args.extend(options.command.clone());
+    }
+    let remote_command = shell_words::join(remote_args);
+    let output = ProcessCommand::new("ssh")
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            &target,
+            &remote_command,
+        ])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to launch remote session '{}' on Node '{}'",
+                namespace, node.metadata.name
+            )
+        })?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_status = output.status.code().unwrap_or(-1);
+    let failure_class =
+        (exit_status != 0).then(|| classify_failure(&format!("{stderr}\n{stdout}")));
+    let retryable = failure_class
+        .as_deref()
+        .map(failure_is_retryable)
+        .unwrap_or(false);
+    if exit_status != 0 {
+        let _ = cleanup_codex_auth_lease_on_remote_node(&node, &namespace);
+    }
+    Ok(NodeStartSessionResult {
+        node: node.metadata.name,
+        namespace,
+        exit_status,
+        stdout,
+        stderr,
+        failure_class,
+        retryable,
+    })
+}
+
+pub fn reconcile_nodes(max_age_days: u64) -> anyhow::Result<NodeReconcileResult> {
+    let doctors = doctor_nodes()?;
+    let mut cleanups = Vec::new();
+    let mut failures = Vec::new();
+    for check in &doctors {
+        if !check.available {
+            continue;
+        }
+        match cleanup_node(&check.node, max_age_days) {
+            Ok(cleanup) => cleanups.push(cleanup),
+            Err(error) => failures.push(NodeFanoutFailure {
+                node: check.node.clone(),
+                error: error.to_string(),
+            }),
+        }
+    }
+    Ok(NodeReconcileResult {
+        doctors,
+        cleanups,
+        failures,
+    })
+}
+
+pub fn rotate_capsule_key(sync: bool) -> anyhow::Result<CapsuleKeyRotationResult> {
+    let path = jarvis_capsule_key_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let rng = rand::SystemRandom::new();
+    let mut key = [0_u8; 32];
+    rand::SecureRandom::fill(&rng, &mut key)
+        .map_err(|_| anyhow!("failed to generate capsule key"))?;
+    atomic_write_bytes(&path, &key)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    }
+
+    let mut synced_nodes = Vec::new();
+    let mut failures = Vec::new();
+    if sync {
+        for manifest in load_manifests_by_kind(ResourceKind::Node, None)? {
+            let ResourceManifest::Node(node) = manifest else {
+                continue;
+            };
+            if node_is_local(&node) {
+                continue;
+            }
+            match sync_capsule_key_to_remote_node(&node) {
+                Ok(()) => synced_nodes.push(node.metadata.name),
+                Err(error) => failures.push(NodeFanoutFailure {
+                    node: node.metadata.name,
+                    error: error.to_string(),
+                }),
+            }
+        }
+    }
+    Ok(CapsuleKeyRotationResult {
+        key_path: path.display().to_string(),
+        synced_nodes,
+        failures,
+    })
 }
 
 pub fn migrate_session_to_node(
@@ -2182,6 +2528,9 @@ fn run_remote_codex_exec_visit(
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let final_message = extract_visit_final_message(&stdout).unwrap_or_else(|| stdout.clone());
     let exit_status = output.status.code().unwrap_or(-1);
+    let failure_class =
+        (exit_status != 0).then(|| classify_failure(&format!("{stderr}\n{stdout}")));
+    let retryable = failure_class.as_deref().map(failure_is_retryable);
 
     Ok(NodeVisitResult {
         node: options.node.clone(),
@@ -2193,6 +2542,8 @@ fn run_remote_codex_exec_visit(
         stderr,
         cleanup_status: "pending".to_string(),
         archive_path: None,
+        failure_class,
+        retryable,
     })
 }
 
@@ -2394,6 +2745,8 @@ fn run_remote_jarvis_visit(
         stderr,
         cleanup_status: "unknown".to_string(),
         archive_path: None,
+        failure_class: Some(classify_failure("relay visit failed")),
+        retryable: Some(true),
     })
 }
 
@@ -2405,6 +2758,52 @@ fn extract_visit_final_message(stdout: &str) -> Option<String> {
 
 fn shell_escape(value: &str) -> String {
     shell_words::join([value.to_string()])
+}
+
+fn classify_failure(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("permission denied")
+        || lower.contains("auth")
+        || lower.contains("login")
+        || lower.contains("unauthorized")
+    {
+        "auth".to_string()
+    } else if lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("operation timed out")
+        || lower.contains("exit status 124")
+    {
+        "timeout".to_string()
+    } else if lower.contains("could not resolve")
+        || lower.contains("no route to host")
+        || lower.contains("connection refused")
+        || lower.contains("connection timed out")
+        || lower.contains("ssh")
+    {
+        "transport".to_string()
+    } else if lower.contains("command not found")
+        || lower.contains("no such file or directory")
+        || lower.contains("jarvisctl_missing")
+        || lower.contains("codex_missing")
+    {
+        "missing_tool".to_string()
+    } else if lower.contains("usage limit")
+        || lower.contains("rate limit")
+        || lower.contains("quota")
+    {
+        "codex_limit".to_string()
+    } else if lower.contains("sandbox") || lower.contains("approval") {
+        "policy".to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn failure_is_retryable(classification: &str) -> bool {
+    matches!(
+        classification,
+        "timeout" | "transport" | "codex_limit" | "unknown"
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -2695,7 +3094,9 @@ fn read_visit_index_entries() -> anyhow::Result<Vec<VisitIndexEntry>> {
     Ok(entries)
 }
 
-fn collect_remote_visit_index_entries() -> anyhow::Result<Vec<VisitIndexEntry>> {
+fn collect_remote_visit_index_entries(
+    timeout_seconds: u64,
+) -> anyhow::Result<Vec<VisitIndexEntry>> {
     let nodes = load_manifests_by_kind(ResourceKind::Node, None)?
         .into_iter()
         .filter_map(|manifest| match manifest {
@@ -2711,7 +3112,7 @@ fn collect_remote_visit_index_entries() -> anyhow::Result<Vec<VisitIndexEntry>> 
         let output = ProcessCommand::new("timeout")
             .args([
                 "--kill-after=5s",
-                "25s",
+                &format!("{}s", timeout_seconds.max(1)),
                 "ssh",
                 "-o",
                 "BatchMode=yes",

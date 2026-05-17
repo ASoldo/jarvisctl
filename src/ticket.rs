@@ -90,6 +90,16 @@ pub struct TicketFrontmatter {
     #[serde(default)]
     pub codex_add_dirs: Vec<String>,
     #[serde(default)]
+    pub jarvis_remote: Option<bool>,
+    #[serde(default)]
+    pub jarvis_node: Option<String>,
+    #[serde(default)]
+    pub jarvis_node_role: Option<String>,
+    #[serde(default)]
+    pub jarvis_node_labels: Vec<String>,
+    #[serde(default)]
+    pub jarvis_node_retries: Option<usize>,
+    #[serde(default)]
     pub created: Option<String>,
     #[serde(default)]
     pub updated: Option<String>,

@@ -4,6 +4,10 @@ use crate::codex::{
     CodexLaunchOptions, CodexRuntimeDriver, default_namespace_for_ticket,
     discover_codex_session_id, discover_latest_launch_session_id, launch_codex_ticket,
 };
+use crate::control_plane::{
+    NodeStartSessionOptions, NodeStartSessionResult, load_or_create_orchestration_policy,
+    start_node_session,
+};
 use crate::native::RuntimeContextMetadata;
 use crate::runtime::{
     RuntimeSessionState, cancel_runtime_session, delete_runtime_session_if_exists,
@@ -325,6 +329,67 @@ fn handle_ready_transition(
         return Ok(());
     }
 
+    let remote_requested = ticket.frontmatter.jarvis_remote == Some(true)
+        || ticket.frontmatter.jarvis_node.is_some()
+        || ticket.frontmatter.jarvis_node_role.is_some()
+        || !ticket.frontmatter.jarvis_node_labels.is_empty();
+
+    if remote_requested {
+        let policy = load_or_create_orchestration_policy()?;
+        let mut labels = policy.default_labels.clone();
+        labels.extend(parse_ticket_labels(&ticket.frontmatter.jarvis_node_labels)?);
+        let remote = start_node_session(NodeStartSessionOptions {
+            node: ticket
+                .frontmatter
+                .jarvis_node
+                .clone()
+                .unwrap_or_else(|| "auto".to_string()),
+            role: ticket
+                .frontmatter
+                .jarvis_node_role
+                .clone()
+                .or(Some(policy.default_role)),
+            labels,
+            retries: ticket
+                .frontmatter
+                .jarvis_node_retries
+                .unwrap_or(policy.retries),
+            task_note: ticket_path.clone(),
+            namespace: Some(expected_namespace.clone()),
+            resume_session_id: last_codex_session_id.clone(),
+            working_directory: None,
+            message: None,
+            startup_delay_ms: options.startup_delay_ms,
+            command: options.command.clone(),
+        })?;
+        ensure_remote_launch_succeeded(&remote)?;
+        board.move_card(ticket_link, CODEX_WORKING)?;
+        dirty_boards.insert(board.path.clone());
+        update_ticket_status(&ticket_path, "active")?;
+        remember_ticket_runtime(
+            state,
+            &ticket_key,
+            Some(remote.namespace.clone()),
+            None,
+            last_codex_session_id.clone(),
+            "active",
+        )?;
+        state.active_runs.insert(
+            ticket_key.clone(),
+            ActiveRunState {
+                ticket_note: ticket_key,
+                ticket_link: ticket_link.to_string(),
+                board_path: board.path.display().to_string(),
+                namespace: remote.namespace,
+                agent: options.agent.clone(),
+                record_file: String::new(),
+                launched_at_epoch_ms: now_epoch_ms()?,
+                codex_session_id: last_codex_session_id,
+            },
+        );
+        return Ok(());
+    }
+
     let launch = launch_codex_ticket(CodexLaunchOptions {
         backend: options.backend,
         driver: options.driver,
@@ -428,6 +493,39 @@ fn process_manual_cancellations(
     }
 
     Ok(canceled_links)
+}
+
+fn parse_ticket_labels(labels: &[String]) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut parsed = BTreeMap::new();
+    for label in labels {
+        let (key, value) = label.split_once('=').ok_or_else(|| {
+            anyhow!("invalid jarvis_node_labels entry '{label}', expected key=value")
+        })?;
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            return Err(anyhow!(
+                "invalid jarvis_node_labels entry '{label}', expected non-empty key=value"
+            ));
+        }
+        parsed.insert(key.to_string(), value.to_string());
+    }
+    Ok(parsed)
+}
+
+fn ensure_remote_launch_succeeded(result: &NodeStartSessionResult) -> anyhow::Result<()> {
+    if result.exit_status == 0 {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "remote launch '{}' on Node '{}' failed with exit status {} class={} retryable={}: {}",
+        result.namespace,
+        result.node,
+        result.exit_status,
+        result.failure_class.as_deref().unwrap_or("unknown"),
+        result.retryable,
+        result.stderr.trim()
+    ))
 }
 
 fn process_completed_runs(

@@ -39,17 +39,19 @@ use codex_app::{
 };
 use control_plane::{
     ControlPlaneOutput, ControlPlaneResourceKindArg, KubernetesRenderOutput, NodeBootstrapOptions,
-    NodeFanoutOptions, NodeRegisterOptions, NodeScheduleOptions, NodeVisitOptions,
-    apply_kubernetes_resources, apply_kustomization, apply_manifests,
+    NodeFanoutOptions, NodeRegisterOptions, NodeScheduleOptions, NodeStartSessionOptions,
+    NodeVisitOptions, apply_kubernetes_resources, apply_kustomization, apply_manifests,
     attach_cluster_runtime_session, authorize_runtime_message, bootstrap_node, cleanup_node,
     cluster_index, delete_cluster_runtime_session, doctor_nodes, inspect_node,
-    interrupt_cluster_runtime_session, migrate_session_to_node, open_visit_capsule,
-    pause_deployment_rollout, read_auth_audit_events, register_node, render_describe_output,
-    render_get_output, render_kubernetes_resources, render_node_probe_output,
-    render_rollout_history_output, render_rollout_status_output, resolve_service_target,
-    resolve_service_target_for_message, restart_deployment_rollout, resume_deployment_rollout,
-    run_node_fanout, run_node_visit, schedule_node, set_node_cordoned, sync_codex_auth_to_node,
-    tell_cluster_runtime_session, undo_deployment_rollout, wait_for_rollout_status_output,
+    interrupt_cluster_runtime_session, load_or_create_orchestration_policy,
+    migrate_session_to_node, open_visit_capsule, orchestration_policy_path,
+    pause_deployment_rollout, read_auth_audit_events, reconcile_nodes, register_node,
+    render_describe_output, render_get_output, render_kubernetes_resources,
+    render_node_probe_output, render_rollout_history_output, render_rollout_status_output,
+    resolve_service_target, resolve_service_target_for_message, restart_deployment_rollout,
+    resume_deployment_rollout, rotate_capsule_key, run_node_fanout, run_node_visit, schedule_node,
+    set_node_cordoned, start_node_session, sync_codex_auth_to_node, tell_cluster_runtime_session,
+    undo_deployment_rollout, wait_for_rollout_status_output,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use native::{
@@ -621,6 +623,30 @@ enum NodeCommand {
         output: ControlPlaneOutput,
     },
 
+    /// Show or initialize persistent orchestration policy
+    Policy {
+        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Yaml)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Run doctor plus stale lease/artifact cleanup across available nodes
+    Reconcile {
+        #[arg(long = "max-age-days")]
+        max_age_days: Option<u64>,
+
+        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Rotate the encrypted visit capsule key and sync it to remote nodes
+    RotateCapsuleKey {
+        #[arg(long = "no-sync", default_value_t = false)]
+        no_sync: bool,
+
+        #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
     /// Show running cluster sessions and finished/running visits from one index
     Index {
         #[arg(long, value_enum, default_value_t = ControlPlaneOutput::Table)]
@@ -709,6 +735,45 @@ enum NodeCommand {
 
         #[arg(long, default_value_t = false)]
         full: bool,
+    },
+
+    /// Start a durable Codex app-server session on a scheduled remote node
+    StartSession {
+        #[arg(long, default_value = "auto")]
+        node: String,
+
+        #[arg(long)]
+        role: Option<String>,
+
+        #[arg(long = "label")]
+        labels: Vec<String>,
+
+        #[arg(long)]
+        retries: Option<usize>,
+
+        #[arg(long = "task-note", value_hint = ValueHint::FilePath)]
+        task_note: PathBuf,
+
+        #[arg(long)]
+        namespace: Option<String>,
+
+        #[arg(long = "resume-session-id")]
+        resume_session_id: Option<String>,
+
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        working_directory: Option<PathBuf>,
+
+        #[arg(long)]
+        message: Option<String>,
+
+        #[arg(long, default_value_t = 1500)]
+        startup_delay_ms: u64,
+
+        #[arg(long, default_value_t = false)]
+        full: bool,
+
+        #[arg(last = true, value_hint = ValueHint::CommandString)]
+        command: Vec<String>,
     },
 
     /// Send a resume-style migration capsule for an existing session to a node
@@ -1410,17 +1475,28 @@ fn visit_node(
     if protected_capsule {
         prompt = open_visit_capsule(&prompt).map_err(JarvisError::from)?;
     }
+    let policy = load_or_create_orchestration_policy().map_err(JarvisError::from)?;
+    let mut effective_labels = policy.default_labels.clone();
+    effective_labels.extend(parse_key_value_pairs(&labels)?);
 
     let result = run_node_visit(NodeVisitOptions {
         node,
         from_node,
-        role,
-        labels: parse_key_value_pairs(&labels)?,
-        retries,
+        role: role.or(Some(policy.default_role)),
+        labels: effective_labels,
+        retries: if retries == 0 {
+            policy.retries
+        } else {
+            retries
+        },
         prompt,
         working_directory,
         namespace,
-        timeout_seconds,
+        timeout_seconds: if timeout_seconds == 900 {
+            policy.timeout_seconds
+        } else {
+            timeout_seconds
+        },
         sandbox_mode: Some(sandbox),
         model,
         reasoning_effort,
@@ -1730,6 +1806,141 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
             }
             Ok(())
         }
+        NodeCommand::Policy { output } => {
+            let policy = load_or_create_orchestration_policy().map_err(JarvisError::from)?;
+            match output {
+                ControlPlaneOutput::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&policy).map_err(anyhow::Error::from)?
+                ),
+                ControlPlaneOutput::Yaml => {
+                    println!(
+                        "# {}\n{}",
+                        orchestration_policy_path()
+                            .map_err(JarvisError::from)?
+                            .display(),
+                        serde_yaml::to_string(&policy).map_err(anyhow::Error::from)?
+                    )
+                }
+                ControlPlaneOutput::Table => {
+                    println!("KEY\tVALUE");
+                    println!("default_role\t{}", policy.default_role);
+                    println!("retries\t{}", policy.retries);
+                    println!("timeout_seconds\t{}", policy.timeout_seconds);
+                    println!("fanout_max_concurrency\t{}", policy.fanout_max_concurrency);
+                    println!("cleanup_retention_days\t{}", policy.cleanup_retention_days);
+                    println!(
+                        "remote_index_timeout_seconds\t{}",
+                        policy.remote_index_timeout_seconds
+                    );
+                    if policy.default_labels.is_empty() {
+                        println!("default_labels\t-");
+                    } else {
+                        println!(
+                            "default_labels\t{}",
+                            policy
+                                .default_labels
+                                .iter()
+                                .map(|(key, value)| format!("{key}={value}"))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        NodeCommand::Reconcile {
+            max_age_days,
+            output,
+        } => {
+            let policy = load_or_create_orchestration_policy().map_err(JarvisError::from)?;
+            let result = reconcile_nodes(max_age_days.unwrap_or(policy.cleanup_retention_days))
+                .map_err(JarvisError::from)?;
+            match output {
+                ControlPlaneOutput::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).map_err(anyhow::Error::from)?
+                ),
+                ControlPlaneOutput::Yaml => {
+                    println!(
+                        "{}",
+                        serde_yaml::to_string(&result).map_err(anyhow::Error::from)?
+                    )
+                }
+                ControlPlaneOutput::Table => {
+                    println!("DOCTOR\tAVAILABLE\tSCHEDULABLE\tISSUES");
+                    for check in &result.doctors {
+                        println!(
+                            "{}\t{}\t{}\t{}",
+                            check.node,
+                            check.available,
+                            check.schedulable,
+                            if check.issues.is_empty() {
+                                "-".to_string()
+                            } else {
+                                check.issues.join(",")
+                            }
+                        );
+                    }
+                    println!("CLEANUP\tRESTORED\tSKIPPED\tREMOVED");
+                    for cleanup in &result.cleanups {
+                        println!(
+                            "{}\t{}\t{}\t{}",
+                            cleanup.node,
+                            cleanup.restored_leases.join(","),
+                            cleanup.skipped_active_leases.join(","),
+                            cleanup.removed_visit_artifacts
+                        );
+                    }
+                    for failure in &result.failures {
+                        eprintln!(
+                            "reconcile_failed node={} error={}",
+                            failure.node, failure.error
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        NodeCommand::RotateCapsuleKey { no_sync, output } => {
+            let result = rotate_capsule_key(!no_sync).map_err(JarvisError::from)?;
+            match output {
+                ControlPlaneOutput::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).map_err(anyhow::Error::from)?
+                ),
+                ControlPlaneOutput::Yaml => {
+                    println!(
+                        "{}",
+                        serde_yaml::to_string(&result).map_err(anyhow::Error::from)?
+                    )
+                }
+                ControlPlaneOutput::Table => {
+                    println!("KEY_PATH\tSYNCED_NODES\tFAILURES");
+                    println!(
+                        "{}\t{}\t{}",
+                        result.key_path,
+                        if result.synced_nodes.is_empty() {
+                            "-".to_string()
+                        } else {
+                            result.synced_nodes.join(",")
+                        },
+                        if result.failures.is_empty() {
+                            "-".to_string()
+                        } else {
+                            result
+                                .failures
+                                .iter()
+                                .map(|failure| format!("{}:{}", failure.node, failure.error))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        }
+                    );
+                }
+            }
+            Ok(())
+        }
         NodeCommand::Index { output } => {
             let result = cluster_index().map_err(JarvisError::from)?;
             match output {
@@ -1857,14 +2068,36 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
             let result = run_node_fanout(NodeFanoutOptions {
                 nodes,
                 role,
-                labels: parse_key_value_pairs(&labels)?,
+                labels: {
+                    let policy =
+                        load_or_create_orchestration_policy().map_err(JarvisError::from)?;
+                    let mut effective = policy.default_labels;
+                    effective.extend(parse_key_value_pairs(&labels)?);
+                    effective
+                },
                 prompt,
-                timeout_seconds,
+                timeout_seconds: {
+                    let policy =
+                        load_or_create_orchestration_policy().map_err(JarvisError::from)?;
+                    if timeout_seconds == 900 {
+                        policy.timeout_seconds
+                    } else {
+                        timeout_seconds
+                    }
+                },
                 sandbox_mode: Some(sandbox),
                 model,
                 reasoning_effort,
                 ephemeral,
-                max_concurrency,
+                max_concurrency: {
+                    let policy =
+                        load_or_create_orchestration_policy().map_err(JarvisError::from)?;
+                    if max_concurrency == 4 {
+                        policy.fanout_max_concurrency
+                    } else {
+                        max_concurrency
+                    }
+                },
             })
             .map_err(JarvisError::from)?;
             if full {
@@ -1928,13 +2161,39 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
             let result = run_node_visit(NodeVisitOptions {
                 node: "auto".to_string(),
                 from_node: None,
-                role,
-                labels: parse_key_value_pairs(&labels)?,
-                retries,
+                role: {
+                    let policy =
+                        load_or_create_orchestration_policy().map_err(JarvisError::from)?;
+                    role.or(Some(policy.default_role))
+                },
+                labels: {
+                    let policy =
+                        load_or_create_orchestration_policy().map_err(JarvisError::from)?;
+                    let mut effective = policy.default_labels;
+                    effective.extend(parse_key_value_pairs(&labels)?);
+                    effective
+                },
+                retries: {
+                    let policy =
+                        load_or_create_orchestration_policy().map_err(JarvisError::from)?;
+                    if retries == 1 {
+                        policy.retries
+                    } else {
+                        retries
+                    }
+                },
                 prompt,
                 working_directory: None,
                 namespace: Some(format!("task-{}", now_millis_for_namespace())),
-                timeout_seconds,
+                timeout_seconds: {
+                    let policy =
+                        load_or_create_orchestration_policy().map_err(JarvisError::from)?;
+                    if timeout_seconds == 900 {
+                        policy.timeout_seconds
+                    } else {
+                        timeout_seconds
+                    }
+                },
                 sandbox_mode: Some(sandbox),
                 model,
                 reasoning_effort,
@@ -1954,6 +2213,73 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                 );
             }
             Ok(())
+        }
+        NodeCommand::StartSession {
+            node,
+            role,
+            labels,
+            retries,
+            task_note,
+            namespace,
+            resume_session_id,
+            working_directory,
+            message,
+            startup_delay_ms,
+            full,
+            command,
+        } => {
+            let policy = load_or_create_orchestration_policy().map_err(JarvisError::from)?;
+            let mut effective_labels = policy.default_labels.clone();
+            effective_labels.extend(parse_key_value_pairs(&labels)?);
+            let result = start_node_session(NodeStartSessionOptions {
+                node,
+                role: role.or(Some(policy.default_role)),
+                labels: effective_labels,
+                retries: retries.unwrap_or(policy.retries),
+                task_note,
+                namespace,
+                resume_session_id,
+                working_directory,
+                message,
+                startup_delay_ms,
+                command,
+            })
+            .map_err(JarvisError::from)?;
+            if full {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).map_err(anyhow::Error::from)?
+                );
+            } else if result.exit_status == 0 {
+                println!(
+                    "remote_session={} node={} status=started",
+                    result.namespace, result.node
+                );
+                if !result.stdout.trim().is_empty() {
+                    println!("{}", result.stdout.trim());
+                }
+            } else {
+                println!(
+                    "remote_session={} node={} status=failed class={} retryable={}",
+                    result.namespace,
+                    result.node,
+                    result.failure_class.as_deref().unwrap_or("unknown"),
+                    result.retryable
+                );
+                if !result.stderr.trim().is_empty() {
+                    eprintln!("{}", result.stderr.trim());
+                }
+            }
+            if result.exit_status == 0 {
+                Ok(())
+            } else {
+                Err(JarvisError::Other(anyhow::anyhow!(
+                    "remote session '{}' on Node '{}' failed with exit status {}",
+                    result.namespace,
+                    result.node,
+                    result.exit_status
+                )))
+            }
         }
         NodeCommand::Migrate {
             session,

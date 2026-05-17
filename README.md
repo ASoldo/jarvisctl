@@ -245,15 +245,30 @@ Cluster orchestration helpers:
 ```bash
 jarvisctl node schedule
 jarvisctl node doctor
+jarvisctl node policy
+jarvisctl node reconcile
+jarvisctl node rotate-capsule-key
 jarvisctl node index
 jarvisctl node audit
 jarvisctl node task --role worker --retries 1 --text "Inspect yourself and report readiness."
+jarvisctl node start-session --task-note /home/rootster/codex/Tickets/name.md --node auto
 jarvisctl node fanout --role worker --max-concurrency 4 --text "Report local Codex readiness in one line."
 jarvisctl node migrate --session <namespace> --to-node auto
 jarvisctl node bootstrap archiebald --ssh-host archiebald --ssh-user rootster --role worker --workspace-root /home/rootster --max-sessions 6
 ```
 
-`node schedule` picks a reachable, uncordoned worker with Codex, Jarvis, auth, vault, and memory facts. `node doctor` checks all registered nodes for orchestration readiness. `node index` combines live local/remote runtime sessions with local and remote visit indexes. `node audit` prints auth lease create/restore events. `node task` is the one-shot scheduled AI work path with retry/failover semantics. `node fanout` sends one protected visit prompt to every selected remote node in bounded parallel batches and returns a per-node result table. `node migrate` sends a resume-style capsule for an existing session to another node so that node can reconstruct useful context in its own vault/memory. `node bootstrap` prepares stable non-interactive `jarvisctl` and `codex` wrappers and registers the node; it only copies the current binary when local and remote CPU architectures match, otherwise it requires an existing remote `jarvisctl`.
+`node schedule` picks a reachable, uncordoned worker with Codex, Jarvis, auth, vault, and memory facts. `node doctor` checks all registered nodes for orchestration readiness. `node policy` creates and prints `~/.jarvis/codex/orchestration.yaml`, which controls default role, labels, retry count, timeouts, fanout concurrency, cleanup retention, and remote index timeout. `node reconcile` runs doctor plus cleanup across available nodes. `node rotate-capsule-key` replaces the encrypted visit capsule key and syncs it to reachable remote nodes. `node index` combines live local/remote runtime sessions with local and remote visit indexes. `node audit` prints auth lease create/restore events. `node task` is the one-shot scheduled AI work path with retry/failover semantics. `node start-session` starts a durable remote Codex app-server session selected by the scheduler and records the node on runtime labels so `attach`, `tell`, `interrupt`, and `delete` can route back to it. `node fanout` sends one protected visit prompt to every selected remote node in bounded parallel batches and returns a per-node result table. `node migrate` sends a resume-style capsule for an existing session to another node so that node can reconstruct useful context in its own vault/memory. `node bootstrap` prepares stable non-interactive `jarvisctl` and `codex` wrappers and registers the node; it only copies the current binary when local and remote CPU architectures match, otherwise it requires an existing remote `jarvisctl`.
+
+Tickets can opt into remote scheduling with frontmatter:
+
+```yaml
+jarvis_remote: true
+jarvis_node: auto
+jarvis_node_role: worker
+jarvis_node_labels:
+  - network=tailscale
+jarvis_node_retries: 1
+```
 
 Auth lease events are appended to `~/.jarvis/codex/audit.jsonl` without recording token contents. The capsule key is stored at `~/.jarvis/codex/capsule.key` with mode `0600` and copied to nodes during visits/bootstrap so capsules are protected in transit and at rest in temporary files.
 
