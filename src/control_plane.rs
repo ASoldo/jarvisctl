@@ -3,7 +3,10 @@ use crate::codex::{
     CodexLaunchOptions, CodexRuntimeDriver, codex_app_manifest_from_prepared,
     enrich_native_sessions, launch_codex_ticket, prepare_codex_ticket_launch,
 };
-use crate::codex_app::{collect_codex_app_sessions, delete_codex_app_session};
+use crate::codex_app::{
+    CodexAppInputMode, collect_codex_app_sessions, delete_codex_app_session,
+    tell_codex_app_with_mode,
+};
 use crate::native::{
     NativeSessionMetadata, RuntimeContextMetadata, collect_native_sessions, delete_native_session,
 };
@@ -211,6 +214,21 @@ pub struct NodeStartSessionOptions {
     pub command: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct NodePairSessionOptions {
+    pub first_node: String,
+    pub second_node: String,
+    pub first_task_note: PathBuf,
+    pub second_task_note: PathBuf,
+    pub first_namespace: Option<String>,
+    pub second_namespace: Option<String>,
+    pub namespace_prefix: Option<String>,
+    pub message: Option<String>,
+    pub startup_delay_ms: u64,
+    pub retries: usize,
+    pub command: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct NodeScheduleOptions {
     pub role: Option<String>,
@@ -277,6 +295,25 @@ pub struct NodeStartSessionResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_class: Option<String>,
     pub retryable: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodePairMemberResult {
+    pub role: String,
+    pub node: String,
+    pub namespace: String,
+    pub task_note: String,
+    pub exit_status: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_class: Option<String>,
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodePairSessionResult {
+    pub coordination_id: String,
+    pub coordination_note: String,
+    pub members: Vec<NodePairMemberResult>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1926,11 +1963,9 @@ fn start_node_session_once(
     let ResourceManifest::Node(node) = manifest else {
         bail!("resource '{}' is not a Node", node_name);
     };
-    ensure!(
-        !node_is_local(&node),
-        "remote session start currently targets remote SSH nodes; '{}' is local",
-        node.metadata.name
-    );
+    if node_is_local(&node) {
+        return start_local_node_session_once(options, &node);
+    }
     let target = node_ssh_target(&node.spec)
         .ok_or_else(|| anyhow!("Node '{}' has no SSH target", node.metadata.name))?;
     let namespace = options.namespace.clone().unwrap_or_else(|| {
@@ -2035,6 +2070,271 @@ fn start_node_session_once(
         failure_class,
         retryable,
     })
+}
+
+fn start_local_node_session_once(
+    options: &NodeStartSessionOptions,
+    node: &ResourceEnvelope<NodeSpec>,
+) -> anyhow::Result<NodeStartSessionResult> {
+    let namespace = options.namespace.clone().unwrap_or_else(|| {
+        format!(
+            "codex-local-{}-{}",
+            slugify(&node.metadata.name),
+            now_epoch_ms()
+        )
+    });
+    let mut labels = BTreeMap::new();
+    labels.insert("jarvisctl.io/node".to_string(), node.metadata.name.clone());
+    labels.insert(
+        "jarvisctl.io/node-address".to_string(),
+        node.spec.address.clone().unwrap_or_default(),
+    );
+    labels.insert("jarvisctl.io/node-local".to_string(), "true".to_string());
+
+    let result = launch_codex_ticket(CodexLaunchOptions {
+        backend: SessionBackend::Native,
+        driver: CodexRuntimeDriver::AppServer,
+        task_note: options.task_note.clone(),
+        namespace: Some(namespace.clone()),
+        agents: 1,
+        agent: "agent0".to_string(),
+        fresh_session: options.resume_session_id.is_none(),
+        resume_session_id: options.resume_session_id.clone(),
+        working_directory: options.working_directory.clone(),
+        prompt_file: None,
+        operator_message: options.message.clone(),
+        images: Vec::new(),
+        environment: BTreeMap::new(),
+        context_overlay: RuntimeContextMetadata {
+            labels,
+            ..RuntimeContextMetadata::default()
+        },
+        extra_runtime_args: Vec::new(),
+        startup_delay_ms: options.startup_delay_ms,
+        command: options.command.clone(),
+    });
+
+    match result {
+        Ok(record) => Ok(NodeStartSessionResult {
+            node: node.metadata.name.clone(),
+            namespace,
+            exit_status: 0,
+            stdout: serde_json::to_string_pretty(&record).unwrap_or_default(),
+            stderr: String::new(),
+            failure_class: None,
+            retryable: false,
+        }),
+        Err(error) => Ok(NodeStartSessionResult {
+            node: node.metadata.name.clone(),
+            namespace,
+            exit_status: 1,
+            stdout: String::new(),
+            stderr: error.to_string(),
+            failure_class: Some(classify_failure(&error.to_string())),
+            retryable: false,
+        }),
+    }
+}
+
+pub fn start_node_pair_session(
+    options: NodePairSessionOptions,
+) -> anyhow::Result<NodePairSessionResult> {
+    ensure!(
+        options.first_node != options.second_node,
+        "paired node session requires two distinct nodes"
+    );
+    let coordination_id = options
+        .namespace_prefix
+        .clone()
+        .unwrap_or_else(|| format!("pair-{}", now_epoch_ms()));
+    let first_namespace = options.first_namespace.clone().unwrap_or_else(|| {
+        format!(
+            "{}-{}",
+            slugify(&coordination_id),
+            slugify(&options.first_node)
+        )
+    });
+    let second_namespace = options.second_namespace.clone().unwrap_or_else(|| {
+        format!(
+            "{}-{}",
+            slugify(&coordination_id),
+            slugify(&options.second_node)
+        )
+    });
+    let coordination_note = write_pair_coordination_note(
+        &coordination_id,
+        &options,
+        &first_namespace,
+        &second_namespace,
+    )?;
+
+    let shared_message = options.message.clone().unwrap_or_else(|| {
+        "Coordinate with the paired agent. Exchange concise findings through operator messages, keep node-specific work on your own machine, and ask for partner input when blocked.".to_string()
+    });
+    let first_intro = pair_intro_message(
+        &coordination_id,
+        &coordination_note,
+        &options.first_node,
+        &first_namespace,
+        &options.second_node,
+        &second_namespace,
+        &shared_message,
+    );
+    let second_intro = pair_intro_message(
+        &coordination_id,
+        &coordination_note,
+        &options.second_node,
+        &second_namespace,
+        &options.first_node,
+        &first_namespace,
+        &shared_message,
+    );
+
+    let first = start_node_session(NodeStartSessionOptions {
+        node: options.first_node.clone(),
+        role: Some(default_policy_role()),
+        labels: BTreeMap::new(),
+        retries: options.retries,
+        task_note: options.first_task_note.clone(),
+        namespace: Some(first_namespace.clone()),
+        resume_session_id: None,
+        working_directory: None,
+        message: Some(first_intro),
+        startup_delay_ms: options.startup_delay_ms,
+        command: options.command.clone(),
+    })?;
+    let second = start_node_session(NodeStartSessionOptions {
+        node: options.second_node.clone(),
+        role: Some(default_policy_role()),
+        labels: BTreeMap::new(),
+        retries: options.retries,
+        task_note: options.second_task_note.clone(),
+        namespace: Some(second_namespace.clone()),
+        resume_session_id: None,
+        working_directory: None,
+        message: Some(second_intro),
+        startup_delay_ms: options.startup_delay_ms,
+        command: options.command,
+    })?;
+
+    if first.exit_status == 0 && second.exit_status == 0 {
+        let first_node = load_node_manifest(&first.node)?;
+        let second_node = load_node_manifest(&second.node)?;
+        let _ = send_runtime_message_to_node_session(
+            &first_node,
+            &first.namespace,
+            &pair_partner_ready_message(&second.node, &second.namespace),
+        );
+        let _ = send_runtime_message_to_node_session(
+            &second_node,
+            &second.namespace,
+            &pair_partner_ready_message(&first.node, &first.namespace),
+        );
+    }
+
+    Ok(NodePairSessionResult {
+        coordination_id,
+        coordination_note: coordination_note.display().to_string(),
+        members: vec![
+            NodePairMemberResult {
+                role: "first".to_string(),
+                node: first.node,
+                namespace: first.namespace,
+                task_note: options.first_task_note.display().to_string(),
+                exit_status: first.exit_status,
+                failure_class: first.failure_class,
+                retryable: first.retryable,
+            },
+            NodePairMemberResult {
+                role: "second".to_string(),
+                node: second.node,
+                namespace: second.namespace,
+                task_note: options.second_task_note.display().to_string(),
+                exit_status: second.exit_status,
+                failure_class: second.failure_class,
+                retryable: second.retryable,
+            },
+        ],
+    })
+}
+
+fn load_node_manifest(name: &str) -> anyhow::Result<ResourceEnvelope<NodeSpec>> {
+    match load_manifest(ResourceKind::Node, name, None)? {
+        ResourceManifest::Node(node) => Ok(node),
+        _ => bail!("resource '{}' is not a Node", name),
+    }
+}
+
+fn write_pair_coordination_note(
+    coordination_id: &str,
+    options: &NodePairSessionOptions,
+    first_namespace: &str,
+    second_namespace: &str,
+) -> anyhow::Result<PathBuf> {
+    let dir = jarvis_codex_dir()?.join("pairs");
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.md", slugify(coordination_id)));
+    let body = format!(
+        "# {coordination_id}\n\n- first_node: {}\n- first_namespace: {first_namespace}\n- first_task_note: {}\n- second_node: {}\n- second_namespace: {second_namespace}\n- second_task_note: {}\n- created_at_epoch_ms: {}\n\n## Coordination\n\n{}\n",
+        options.first_node,
+        options.first_task_note.display(),
+        options.second_node,
+        options.second_task_note.display(),
+        now_epoch_ms(),
+        options
+            .message
+            .as_deref()
+            .unwrap_or("Paired session started.")
+    );
+    atomic_write_string(&path, &body)?;
+    Ok(path)
+}
+
+fn pair_intro_message(
+    coordination_id: &str,
+    coordination_note: &Path,
+    own_node: &str,
+    own_namespace: &str,
+    partner_node: &str,
+    partner_namespace: &str,
+    shared_message: &str,
+) -> String {
+    format!(
+        "Paired cluster workload '{coordination_id}' started.\n\nYour node: {own_node}\nYour namespace: {own_namespace}\nPartner node: {partner_node}\nPartner namespace: {partner_namespace}\nCoordination note on the control plane: {}\n\nProtocol:\n- Do your node-local part of the task in your own workspace.\n- Keep findings concise so they can be relayed to the partner namespace.\n- If you need the partner, state exactly what information or action you need.\n- Record final node-local outcome in your ticket.\n\nShared operator message:\n{shared_message}",
+        coordination_note.display()
+    )
+}
+
+fn pair_partner_ready_message(partner_node: &str, partner_namespace: &str) -> String {
+    format!(
+        "Partner runtime is online: node={partner_node} namespace={partner_namespace}. Begin coordination when your ticket needs partner input."
+    )
+}
+
+fn send_runtime_message_to_node_session(
+    node: &ResourceEnvelope<NodeSpec>,
+    namespace: &str,
+    message: &str,
+) -> anyhow::Result<()> {
+    if node_is_local(node) {
+        tell_codex_app_with_mode(namespace, message, CodexAppInputMode::Auto)
+    } else {
+        run_remote_runtime_command(
+            node,
+            vec![
+                "jarvisctl".to_string(),
+                "tell".to_string(),
+                "--namespace".to_string(),
+                namespace.to_string(),
+                "--agent".to_string(),
+                "agent0".to_string(),
+                "--text".to_string(),
+                message.to_string(),
+                "--mode".to_string(),
+                "auto".to_string(),
+            ],
+        )
+    }
 }
 
 pub fn reconcile_nodes(max_age_days: u64) -> anyhow::Result<NodeReconcileResult> {

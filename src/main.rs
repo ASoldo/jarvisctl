@@ -39,19 +39,19 @@ use codex_app::{
 };
 use control_plane::{
     ControlPlaneOutput, ControlPlaneResourceKindArg, KubernetesRenderOutput, NodeBootstrapOptions,
-    NodeFanoutOptions, NodeLinksOptions, NodeRegisterOptions, NodeScheduleOptions,
-    NodeStartSessionOptions, NodeVisitOptions, apply_kubernetes_resources, apply_kustomization,
-    apply_manifests, attach_cluster_runtime_session, authorize_runtime_message, bootstrap_node,
-    check_node_links, cleanup_node, cluster_index, delete_cluster_runtime_session, doctor_nodes,
-    inspect_node, interrupt_cluster_runtime_session, load_or_create_orchestration_policy,
-    migrate_session_to_node, open_visit_capsule, orchestration_policy_path,
-    pause_deployment_rollout, read_auth_audit_events, reconcile_nodes, register_node,
-    render_describe_output, render_get_output, render_kubernetes_resources,
+    NodeFanoutOptions, NodeLinksOptions, NodePairSessionOptions, NodeRegisterOptions,
+    NodeScheduleOptions, NodeStartSessionOptions, NodeVisitOptions, apply_kubernetes_resources,
+    apply_kustomization, apply_manifests, attach_cluster_runtime_session,
+    authorize_runtime_message, bootstrap_node, check_node_links, cleanup_node, cluster_index,
+    delete_cluster_runtime_session, doctor_nodes, inspect_node, interrupt_cluster_runtime_session,
+    load_or_create_orchestration_policy, migrate_session_to_node, open_visit_capsule,
+    orchestration_policy_path, pause_deployment_rollout, read_auth_audit_events, reconcile_nodes,
+    register_node, render_describe_output, render_get_output, render_kubernetes_resources,
     render_node_probe_output, render_rollout_history_output, render_rollout_status_output,
     resolve_service_target, resolve_service_target_for_message, restart_deployment_rollout,
     resume_deployment_rollout, rotate_capsule_key, run_node_fanout, run_node_visit, schedule_node,
-    set_node_cordoned, start_node_session, sync_codex_auth_to_node, tell_cluster_runtime_session,
-    undo_deployment_rollout, wait_for_rollout_status_output,
+    set_node_cordoned, start_node_pair_session, start_node_session, sync_codex_auth_to_node,
+    tell_cluster_runtime_session, undo_deployment_rollout, wait_for_rollout_status_output,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use native::{
@@ -407,7 +407,12 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
         backend: SessionBackend,
 
-        #[arg(long, alias = "ns", required_unless_present = "service", conflicts_with = "service")]
+        #[arg(
+            long,
+            alias = "ns",
+            required_unless_present = "service",
+            conflicts_with = "service"
+        )]
         namespace: Option<String>,
 
         #[arg(
@@ -417,7 +422,12 @@ enum Command {
         )]
         service: Option<String>,
 
-        #[arg(short = 'n', long = "resource-namespace", alias = "rns", requires = "service")]
+        #[arg(
+            short = 'n',
+            long = "resource-namespace",
+            alias = "rns",
+            requires = "service"
+        )]
         resource_namespace: Option<String>,
     },
 
@@ -447,7 +457,12 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
         backend: SessionBackend,
 
-        #[arg(long, alias = "ns", required_unless_present = "service", conflicts_with = "service")]
+        #[arg(
+            long,
+            alias = "ns",
+            required_unless_present = "service",
+            conflicts_with = "service"
+        )]
         namespace: Option<String>,
 
         #[arg(
@@ -457,7 +472,12 @@ enum Command {
         )]
         service: Option<String>,
 
-        #[arg(short = 'n', long = "resource-namespace", alias = "rns", requires = "service")]
+        #[arg(
+            short = 'n',
+            long = "resource-namespace",
+            alias = "rns",
+            requires = "service"
+        )]
         resource_namespace: Option<String>,
 
         #[arg(long, default_value_t = true)]
@@ -472,7 +492,12 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
         backend: SessionBackend,
 
-        #[arg(long, alias = "ns", required_unless_present = "service", conflicts_with = "service")]
+        #[arg(
+            long,
+            alias = "ns",
+            required_unless_present = "service",
+            conflicts_with = "service"
+        )]
         namespace: Option<String>,
 
         #[arg(
@@ -482,7 +507,12 @@ enum Command {
         )]
         service: Option<String>,
 
-        #[arg(short = 'n', long = "resource-namespace", alias = "rns", requires = "service")]
+        #[arg(
+            short = 'n',
+            long = "resource-namespace",
+            alias = "rns",
+            requires = "service"
+        )]
         resource_namespace: Option<String>,
 
         #[arg(long, default_value = "agent0")]
@@ -494,7 +524,12 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
         backend: SessionBackend,
 
-        #[arg(long, alias = "ns", required_unless_present = "service", conflicts_with = "service")]
+        #[arg(
+            long,
+            alias = "ns",
+            required_unless_present = "service",
+            conflicts_with = "service"
+        )]
         namespace: Option<String>,
         #[arg(
             long,
@@ -502,7 +537,12 @@ enum Command {
             conflicts_with = "namespace"
         )]
         service: Option<String>,
-        #[arg(short = 'n', long = "resource-namespace", alias = "rns", requires = "service")]
+        #[arg(
+            short = 'n',
+            long = "resource-namespace",
+            alias = "rns",
+            requires = "service"
+        )]
         resource_namespace: Option<String>,
         #[arg(long, default_value = "agent0")]
         agent: String,
@@ -521,7 +561,12 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
         backend: SessionBackend,
 
-        #[arg(long, alias = "ns", required_unless_present = "service", conflicts_with = "service")]
+        #[arg(
+            long,
+            alias = "ns",
+            required_unless_present = "service",
+            conflicts_with = "service"
+        )]
         namespace: Option<String>,
 
         #[arg(
@@ -531,7 +576,12 @@ enum Command {
         )]
         service: Option<String>,
 
-        #[arg(short = 'n', long = "resource-namespace", alias = "rns", requires = "service")]
+        #[arg(
+            short = 'n',
+            long = "resource-namespace",
+            alias = "rns",
+            requires = "service"
+        )]
         resource_namespace: Option<String>,
 
         #[arg(long, default_value = "agent0")]
@@ -788,6 +838,45 @@ enum NodeCommand {
         command: Vec<String>,
     },
 
+    /// Start a paired two-node Codex workload and inject partner context into both agents
+    PairSession {
+        #[arg(long = "first-node", alias = "n1")]
+        first_node: String,
+
+        #[arg(long = "second-node", alias = "n2")]
+        second_node: String,
+
+        #[arg(long = "first-task-note", alias = "t1", value_hint = ValueHint::FilePath)]
+        first_task_note: PathBuf,
+
+        #[arg(long = "second-task-note", alias = "t2", value_hint = ValueHint::FilePath)]
+        second_task_note: PathBuf,
+
+        #[arg(long = "first-namespace", alias = "ns1")]
+        first_namespace: Option<String>,
+
+        #[arg(long = "second-namespace", alias = "ns2")]
+        second_namespace: Option<String>,
+
+        #[arg(long = "namespace-prefix", alias = "ns")]
+        namespace_prefix: Option<String>,
+
+        #[arg(long)]
+        message: Option<String>,
+
+        #[arg(long, default_value_t = 1)]
+        retries: usize,
+
+        #[arg(long, alias = "delay-ms", default_value_t = 1500)]
+        startup_delay_ms: u64,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+
+        #[arg(last = true, value_hint = ValueHint::CommandString)]
+        command: Vec<String>,
+    },
+
     /// Send a resume-style migration capsule for an existing session to a node
     Migrate {
         #[arg(long)]
@@ -958,7 +1047,12 @@ enum KubeCommand {
 enum KubeRuntimeCommand {
     /// Experimental: fetch live metadata from a pod-hosted Codex runtime
     Metadata {
-        #[arg(long, alias = "deploy", required_unless_present = "service", conflicts_with = "service")]
+        #[arg(
+            long,
+            alias = "deploy",
+            required_unless_present = "service",
+            conflicts_with = "service"
+        )]
         deployment: Option<String>,
 
         #[arg(
@@ -980,7 +1074,12 @@ enum KubeRuntimeCommand {
 
     /// Experimental: attach to the live output stream of a pod-hosted Codex runtime
     Attach {
-        #[arg(long, alias = "deploy", required_unless_present = "service", conflicts_with = "service")]
+        #[arg(
+            long,
+            alias = "deploy",
+            required_unless_present = "service",
+            conflicts_with = "service"
+        )]
         deployment: Option<String>,
 
         #[arg(
@@ -999,7 +1098,12 @@ enum KubeRuntimeCommand {
 
     /// Experimental: send text into a pod-hosted Codex runtime
     Tell {
-        #[arg(long, alias = "deploy", required_unless_present = "service", conflicts_with = "service")]
+        #[arg(
+            long,
+            alias = "deploy",
+            required_unless_present = "service",
+            conflicts_with = "service"
+        )]
         deployment: Option<String>,
 
         #[arg(
@@ -1027,7 +1131,12 @@ enum KubeRuntimeCommand {
 
     /// Experimental: interrupt the active turn inside a pod-hosted Codex runtime
     Interrupt {
-        #[arg(long, alias = "deploy", required_unless_present = "service", conflicts_with = "service")]
+        #[arg(
+            long,
+            alias = "deploy",
+            required_unless_present = "service",
+            conflicts_with = "service"
+        )]
         deployment: Option<String>,
 
         #[arg(
@@ -2333,6 +2442,71 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                     result.exit_status
                 )))
             }
+        }
+        NodeCommand::PairSession {
+            first_node,
+            second_node,
+            first_task_note,
+            second_task_note,
+            first_namespace,
+            second_namespace,
+            namespace_prefix,
+            message,
+            retries,
+            startup_delay_ms,
+            output,
+            command,
+        } => {
+            let result = start_node_pair_session(NodePairSessionOptions {
+                first_node,
+                second_node,
+                first_task_note,
+                second_task_note,
+                first_namespace,
+                second_namespace,
+                namespace_prefix,
+                message,
+                startup_delay_ms,
+                retries,
+                command,
+            })
+            .map_err(JarvisError::from)?;
+            match output {
+                ControlPlaneOutput::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).map_err(anyhow::Error::from)?
+                ),
+                ControlPlaneOutput::Yaml => {
+                    println!(
+                        "{}",
+                        serde_yaml::to_string(&result).map_err(anyhow::Error::from)?
+                    )
+                }
+                ControlPlaneOutput::Table => {
+                    println!("COORDINATION\tNOTE\tROLE\tNODE\tNAMESPACE\tTASK_NOTE\tSTATUS");
+                    for member in result.members {
+                        let status = if member.exit_status == 0 {
+                            "started".to_string()
+                        } else {
+                            format!(
+                                "failed:{}",
+                                member.failure_class.as_deref().unwrap_or("unknown")
+                            )
+                        };
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                            result.coordination_id,
+                            result.coordination_note,
+                            member.role,
+                            member.node,
+                            member.namespace,
+                            member.task_note,
+                            status
+                        );
+                    }
+                }
+            }
+            Ok(())
         }
         NodeCommand::Migrate {
             session,
