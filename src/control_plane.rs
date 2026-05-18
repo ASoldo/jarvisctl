@@ -3806,7 +3806,41 @@ fn collect_remote_visit_index_entries(
 }
 
 fn run_node_inspect_command(target: Option<&str>) -> anyhow::Result<String> {
-    let script = "printf 'hostname='; (cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || true) | head -n 1; printf 'cwd='; pwd; printf 'home='; printf '%s\\n' \"$HOME\"; printf 'arch='; uname -m 2>/dev/null || true; printf 'codex_cli='; (codex --version 2>/dev/null || command -v codex 2>/dev/null || true) | head -n 1; printf 'jarvisctl='; (jarvisctl --version 2>/dev/null || command -v jarvisctl 2>/dev/null || true) | head -n 1; printf 'active_sessions='; jarvisctl list --json 2>/dev/null | sed -n 's/^[[:space:]]*\\[//p' | wc -l; printf 'vault_path=%s/codex\\n' \"$HOME\"; printf 'vault='; test -d \"$HOME/codex\" && echo present || echo missing; printf 'vault_entries='; if [ -d \"$HOME/codex\" ]; then find \"$HOME/codex\" -mindepth 1 -maxdepth 1 -printf '%f,' 2>/dev/null | sed 's/,$//'; fi; printf '\\n'; printf 'memory='; test -d \"$HOME/.codex/memories\" && echo present || echo missing; printf 'work_dir='; test -d \"$HOME/work\" && echo present || echo missing; printf 'work_entries='; if [ -d \"$HOME/work\" ]; then find \"$HOME/work\" -mindepth 1 -maxdepth 1 -printf '%f,' 2>/dev/null | sed 's/,$//'; fi; printf '\\n'; printf 'legacy_jarvisctl='; test -d \"$HOME/documents/jarvisctl\" && echo present || echo missing; printf 'auth_leases='; find \"$HOME/.jarvis/codex/auth-leases\" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l; printf 'visit_artifacts='; find \"$HOME/.jarvis/codex/visits\" -type f 2>/dev/null | wc -l; printf 'codex_auth='; test -s \"$HOME/.codex/auth.json\" && echo present || echo missing";
+    let script = r#"printf 'hostname='
+(cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || true) | head -n 1
+printf 'cwd='
+pwd
+printf 'home='
+printf '%s\n' "$HOME"
+printf 'arch='
+uname -m 2>/dev/null || true
+printf '\ncodex_cli='
+(codex --version 2>/dev/null || command -v codex 2>/dev/null || true) | head -n 1
+printf 'jarvisctl='
+(jarvisctl --version 2>/dev/null || command -v jarvisctl 2>/dev/null || true) | head -n 1
+printf 'active_sessions='
+jarvisctl list --json 2>/dev/null | grep -c '"namespace"' || true
+printf 'vault_path=%s/codex\n' "$HOME"
+printf 'vault='
+test -d "$HOME/codex" && echo present || echo missing
+printf 'vault_entries='
+if [ -d "$HOME/codex" ]; then find "$HOME/codex" -mindepth 1 -maxdepth 1 -printf '%f,' 2>/dev/null | sed 's/,$//'; fi
+printf '\n'
+printf 'memory='
+test -d "$HOME/.codex/memories" && echo present || echo missing
+printf 'work_dir='
+test -d "$HOME/work" && echo present || echo missing
+printf 'work_entries='
+if [ -d "$HOME/work" ]; then find "$HOME/work" -mindepth 1 -maxdepth 1 -printf '%f,' 2>/dev/null | sed 's/,$//'; fi
+printf '\n'
+printf 'legacy_jarvisctl='
+test -d "$HOME/documents/jarvisctl" && echo present || echo missing
+printf 'auth_leases='
+find "$HOME/.jarvis/codex/auth-leases" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l
+printf 'visit_artifacts='
+find "$HOME/.jarvis/codex/visits" -type f 2>/dev/null | wc -l
+printf 'codex_auth='
+test -s "$HOME/.codex/auth.json" && echo present || echo missing"#;
     run_shell_probe(target, script, "node inspect")
 }
 
