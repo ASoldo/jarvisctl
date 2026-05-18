@@ -1,6 +1,6 @@
 use crate::native::{
     NativeAgentMetadata, NativeSessionMetadata, RuntimeContextMetadata, RuntimeFeedEntry,
-    RuntimeSubagentAction, RuntimeSubagentMetadata,
+    RuntimeServerRequest, RuntimeSubagentAction, RuntimeSubagentMetadata,
 };
 use crate::tui::view_agent;
 use anyhow::{Context, anyhow, bail, ensure};
@@ -36,6 +36,8 @@ const LOG_LIMIT_BYTES: usize = 512 * 1024;
 const FEED_LIMIT: usize = 18;
 const SUBAGENT_LIMIT: usize = 24;
 const SUBAGENT_ACTION_LIMIT: usize = 6;
+const SERVER_REQUEST_LIMIT: usize = 16;
+const SERVER_REQUEST_TIMEOUT_SECONDS: u64 = 900;
 static CONTROL_QUEUE_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +133,11 @@ enum ClientMessage {
         text: String,
         mode: CodexAppInputMode,
     },
+    RespondServerRequest {
+        request_id: String,
+        response: Option<Value>,
+        error: Option<String>,
+    },
     Interrupt,
     KillSession,
 }
@@ -174,11 +181,18 @@ struct CodexAppSession {
     writer: Mutex<ChildStdin>,
     child: Mutex<Child>,
     pending: Mutex<HashMap<u64, mpsc::Sender<anyhow::Result<Value>>>>,
+    pending_server_requests: Mutex<HashMap<String, mpsc::Sender<ServerRequestResolution>>>,
     next_request_id: AtomicU64,
     log: Mutex<VecDeque<u8>>,
     log_file: Mutex<File>,
     subscribers: Mutex<Vec<mpsc::Sender<Vec<u8>>>>,
     shutdown_requested: AtomicBool,
+}
+
+#[derive(Debug)]
+struct ServerRequestResolution {
+    response: Option<Value>,
+    error: Option<String>,
 }
 
 impl CodexAppSession {
@@ -320,36 +334,176 @@ impl CodexAppSession {
 
     fn handle_server_request(&self, value: Value) -> anyhow::Result<()> {
         let id = value.get("id").cloned().unwrap_or(Value::Null);
+        let request_id = server_request_id_key(&id);
         let method = value
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
         let params = value.get("params").cloned().unwrap_or(Value::Null);
-        let message = format!(
-            "Codex app-server requested '{}', but jarvisctl does not yet have a headless response bridge for this request type",
-            method
-        );
-
-        self.upsert_runtime_event(
-            format!("server-request:{}:{}", method, now_epoch_ms()),
-            "server-request",
-            "Operator action required",
-            Some(format!(
-                "{}\n{}",
-                message,
-                truncate_block(&params.to_string(), 1800)
-            )),
-            Some("blocked".to_string()),
-            Some("codex".to_string()),
+        let (tx, rx) = mpsc::channel();
+        self.pending_server_requests
+            .lock()
+            .unwrap()
+            .insert(request_id.clone(), tx);
+        self.record_server_request(
+            &request_id,
+            method,
+            "pending",
+            Some("Waiting for operator response".to_string()),
+            Some(params.clone()),
+            None,
+            None,
         )?;
-        self.record_error(&message)?;
-        self.send_json(&json!({
-            "id": id,
-            "error": {
-                "code": -32001,
-                "message": message,
+
+        let resolution = rx.recv_timeout(Duration::from_secs(SERVER_REQUEST_TIMEOUT_SECONDS));
+        self.pending_server_requests
+            .lock()
+            .unwrap()
+            .remove(&request_id);
+        match resolution {
+            Ok(resolution) => {
+                if let Some(error) = resolution.error.filter(|value| !value.trim().is_empty()) {
+                    self.record_server_request(
+                        &request_id,
+                        method,
+                        "denied",
+                        Some(error.clone()),
+                        Some(params),
+                        resolution.response,
+                        Some(error.clone()),
+                    )?;
+                    return self.send_json(&json!({
+                        "id": id,
+                        "error": {
+                            "code": -32002,
+                            "message": error,
+                        }
+                    }));
+                }
+                let response = resolution.response.unwrap_or(Value::Null);
+                self.record_server_request(
+                    &request_id,
+                    method,
+                    "resolved",
+                    Some("Operator response sent".to_string()),
+                    Some(params),
+                    Some(response.clone()),
+                    None,
+                )?;
+                self.send_json(&json!({
+                    "id": id,
+                    "result": response,
+                }))
             }
-        }))
+            Err(_) => {
+                let message = format!(
+                    "Timed out waiting for operator response to app-server request '{}'",
+                    method
+                );
+                self.record_server_request(
+                    &request_id,
+                    method,
+                    "timed_out",
+                    Some(message.clone()),
+                    Some(params),
+                    None,
+                    Some(message.clone()),
+                )?;
+                self.send_json(&json!({
+                    "id": id,
+                    "error": {
+                        "code": -32003,
+                        "message": message,
+                    }
+                }))
+            }
+        }
+    }
+
+    fn record_server_request(
+        &self,
+        request_id: &str,
+        method: &str,
+        status: &str,
+        detail: Option<String>,
+        params: Option<Value>,
+        response: Option<Value>,
+        error: Option<String>,
+    ) -> anyhow::Result<()> {
+        let now = now_epoch_ms();
+        self.mutate_state(|state| {
+            let context = state.metadata.context.get_or_insert_with(Default::default);
+            if let Some(existing) = context
+                .server_requests
+                .iter_mut()
+                .find(|request| request.id == request_id)
+            {
+                existing.status = status.to_string();
+                existing.resolved_at_epoch_ms = if status == "pending" { None } else { Some(now) };
+                existing.detail = detail.clone();
+                if params.is_some() {
+                    existing.params = params.clone();
+                }
+                existing.response = response.clone();
+                existing.error = error.clone();
+            } else {
+                context.server_requests.push(RuntimeServerRequest {
+                    id: request_id.to_string(),
+                    method: method.to_string(),
+                    status: status.to_string(),
+                    created_at_epoch_ms: now,
+                    resolved_at_epoch_ms: if status == "pending" { None } else { Some(now) },
+                    detail: detail.clone(),
+                    params: params.clone(),
+                    response: response.clone(),
+                    error: error.clone(),
+                });
+            }
+            context
+                .server_requests
+                .sort_by_key(|request| request.created_at_epoch_ms);
+            if context.server_requests.len() > SERVER_REQUEST_LIMIT {
+                let overflow = context.server_requests.len() - SERVER_REQUEST_LIMIT;
+                context.server_requests.drain(0..overflow);
+            }
+            upsert_recent_event(
+                &mut context.recent_events,
+                RuntimeFeedEntry {
+                    id: format!("server-request:{request_id}"),
+                    kind: "server-request".to_string(),
+                    title: format!("App-server request: {method}"),
+                    timestamp_epoch_ms: now,
+                    actor: Some("codex".to_string()),
+                    detail,
+                    status: Some(status.to_string()),
+                },
+            );
+        })
+    }
+
+    fn respond_server_request(
+        &self,
+        request_id: &str,
+        response: Option<Value>,
+        error: Option<String>,
+    ) -> anyhow::Result<()> {
+        let Some(sender) = self
+            .pending_server_requests
+            .lock()
+            .unwrap()
+            .get(request_id)
+            .cloned()
+        else {
+            bail!("pending app-server request '{}' does not exist", request_id);
+        };
+        sender
+            .send(ServerRequestResolution { response, error })
+            .map_err(|_| {
+                anyhow!(
+                    "pending app-server request '{}' is no longer open",
+                    request_id
+                )
+            })
     }
 
     fn handle_notification(&self, method: &str, params: &Value) -> anyhow::Result<()> {
@@ -1487,6 +1641,7 @@ pub fn serve_codex_app_session(manifest_path: PathBuf) -> anyhow::Result<()> {
         protocol: manifest.protocol.clone(),
         child: Mutex::new(child),
         pending: Mutex::new(HashMap::new()),
+        pending_server_requests: Mutex::new(HashMap::new()),
         next_request_id: AtomicU64::new(1),
         log: Mutex::new(VecDeque::new()),
         log_file: Mutex::new(log_file),
@@ -1817,6 +1972,30 @@ pub fn interrupt_codex_app(namespace: &str) -> anyhow::Result<()> {
     }
 }
 
+pub fn respond_codex_app_server_request(
+    namespace: &str,
+    request_id: &str,
+    response: Option<Value>,
+    error: Option<String>,
+) -> anyhow::Result<()> {
+    match request(
+        namespace,
+        &ClientMessage::RespondServerRequest {
+            request_id: request_id.to_string(),
+            response,
+            error,
+        },
+    )? {
+        ServerMessage::Ok => Ok(()),
+        ServerMessage::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected request response from codex app session '{}': {:?}",
+            namespace,
+            other
+        )),
+    }
+}
+
 pub fn read_codex_app_thread(namespace: &str, include_turns: bool) -> anyhow::Result<Value> {
     match request(namespace, &ClientMessage::ReadThread { include_turns })? {
         ServerMessage::ThreadHistory(value) => Ok(value),
@@ -1975,6 +2154,14 @@ fn handle_client_message(
         }
         ClientMessage::SendText { text, mode } => {
             session.send_operator_message(&text, mode)?;
+            Ok(ServerMessage::Ok)
+        }
+        ClientMessage::RespondServerRequest {
+            request_id,
+            response,
+            error,
+        } => {
+            session.respond_server_request(&request_id, response, error)?;
             Ok(ServerMessage::Ok)
         }
         ClientMessage::Interrupt => {
@@ -3279,6 +3466,15 @@ fn extract_found_active_turn_id(message: &str) -> Option<String> {
     let remaining = &message[start..];
     let end = remaining.find('`')?;
     Some(remaining[..end].to_string())
+}
+
+fn server_request_id_key(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        Value::Number(value) => value.to_string(),
+        Value::Null => format!("unknown-{}", now_epoch_ms()),
+        other => other.to_string(),
+    }
 }
 
 fn sanitize_namespace(namespace: &str) -> String {

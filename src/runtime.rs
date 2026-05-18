@@ -2,7 +2,8 @@ use crate::codex::enrich_native_sessions;
 use crate::codex_app::{
     CodexAppInputMode, attach_codex_app, cleanup_stale_session, codex_app_session_dir_exists,
     codex_app_session_metadata, collect_codex_app_sessions, delete_codex_app_session,
-    interrupt_codex_app, tell_codex_app, tell_codex_app_with_mode,
+    interrupt_codex_app, respond_codex_app_server_request, tell_codex_app,
+    tell_codex_app_with_mode,
 };
 use crate::native::{
     NativeSessionMetadata, attach_native, collect_native_sessions, delete_native_session,
@@ -123,6 +124,23 @@ pub fn interrupt_runtime_session(namespace: &str, agent: &str) -> Result<()> {
         }
         _ => interrupt_native(namespace, agent),
     }
+}
+
+pub fn respond_runtime_server_request(
+    namespace: &str,
+    request_id: &str,
+    response: Option<serde_json::Value>,
+    error: Option<String>,
+) -> Result<()> {
+    let session = session_metadata_for_namespace(namespace)?;
+    if session.backend != "codex-app" {
+        return Err(anyhow!(
+            "server request responses are only supported for codex-app sessions; '{}' uses '{}'",
+            namespace,
+            session.backend
+        ));
+    }
+    respond_codex_app_server_request(namespace, request_id, response, error)
 }
 
 pub fn delete_runtime_session(namespace: &str) -> Result<()> {

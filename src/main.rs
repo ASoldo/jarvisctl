@@ -60,7 +60,7 @@ use native::{
 };
 use runtime::{
     attach_runtime_session, collect_runtime_sessions, delete_runtime_session,
-    interrupt_runtime_session, tell_runtime_session,
+    interrupt_runtime_session, respond_runtime_server_request, tell_runtime_session,
 };
 use ticket::slugify;
 use tui::{run_dashboard, view_agent};
@@ -555,6 +555,24 @@ enum Command {
         no_enter: bool,
         #[arg(long, value_enum, default_value_t = CodexAppInputMode::Auto)]
         mode: CodexAppInputMode,
+    },
+
+    /// Respond to a pending Codex app-server request
+    RespondRequest {
+        #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
+        backend: SessionBackend,
+
+        #[arg(long, visible_alias = "ns")]
+        namespace: String,
+
+        #[arg(long = "request-id", visible_alias = "id")]
+        request_id: String,
+
+        #[arg(long = "response-json", conflicts_with = "error")]
+        response_json: Option<String>,
+
+        #[arg(long, conflicts_with = "response_json")]
+        error: Option<String>,
     },
 
     /// Send Ctrl+C to a running agent
@@ -1446,6 +1464,19 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             )?;
             interrupt_agent(backend, &namespace, &agent)
         }
+        Command::RespondRequest {
+            backend,
+            namespace,
+            request_id,
+            response_json,
+            error,
+        } => respond_server_request_command(
+            backend,
+            &namespace,
+            &request_id,
+            response_json.as_deref(),
+            error.as_deref(),
+        ),
         Command::NativeSessionServe { manifest } => {
             serve_native_session(manifest).map_err(JarvisError::from)
         }
@@ -3724,6 +3755,43 @@ fn tell(
     } else {
         println!("✅ Sent text to '{}':'{}'", namespace, agent);
     }
+    Ok(())
+}
+
+#[instrument(err)]
+fn respond_server_request_command(
+    backend: SessionBackend,
+    namespace: &str,
+    request_id: &str,
+    response_json: Option<&str>,
+    error: Option<&str>,
+) -> Result<(), JarvisError> {
+    let _ = backend;
+    let response = match response_json {
+        Some(raw) => Some(serde_json::from_str::<serde_json::Value>(raw).map_err(
+            |parse_error| {
+                JarvisError::Other(anyhow::anyhow!(
+                    "--response-json must be valid JSON: {}",
+                    parse_error
+                ))
+            },
+        )?),
+        None => None,
+    };
+    let error = error
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if response.is_none() && error.is_none() {
+        return Err(JarvisError::Other(anyhow::anyhow!(
+            "provide either --response-json or --error"
+        )));
+    }
+    respond_runtime_server_request(namespace, request_id, response, error)?;
+    println!(
+        "✅ Responded to app-server request '{}' in '{}'",
+        request_id, namespace
+    );
     Ok(())
 }
 

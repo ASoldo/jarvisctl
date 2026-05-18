@@ -357,6 +357,7 @@ pub fn prepare_codex_ticket_launch(
             secrets: Vec::new(),
             volumes: Vec::new(),
             recent_events: Vec::new(),
+            server_requests: Vec::new(),
             subagents: Vec::new(),
         },
         options.context_overlay.clone(),

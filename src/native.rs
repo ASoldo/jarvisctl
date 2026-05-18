@@ -100,6 +100,24 @@ pub struct RuntimeFeedEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuntimeServerRequest {
+    pub id: String,
+    pub method: String,
+    pub status: String,
+    pub created_at_epoch_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at_epoch_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimeSubagentAction {
     pub id: String,
     pub kind: String,
@@ -199,6 +217,8 @@ pub struct RuntimeContextMetadata {
     pub volumes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_events: Vec<RuntimeFeedEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_requests: Vec<RuntimeServerRequest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subagents: Vec<RuntimeSubagentMetadata>,
 }
