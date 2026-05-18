@@ -277,6 +277,7 @@ jarvis_node_role: worker
 jarvis_node_labels:
   - network=tailscale
 jarvis_node_retries: 1
+jarvis_mission: cv-triage-1779146687504
 ```
 
 Auth lease events are appended to `~/.jarvis/codex/audit.jsonl` without recording token contents. The capsule key is stored at `~/.jarvis/codex/capsule.key` with mode `0600` and copied to nodes during visits/bootstrap so capsules are protected in transit and at rest in temporary files.
@@ -284,6 +285,8 @@ Auth lease events are appended to `~/.jarvis/codex/audit.jsonl` without recordin
 Mission ledger commands connect business objectives to the operational evidence produced by tickets, namespaces, nodes, visits, approvals, transcripts, and outcomes:
 
 ```bash
+jarvisctl mission templates
+jarvisctl mission create --template cv-triage --title "CV triage automation" --owner ops --ticket /home/rootster/codex/Tickets/cv-triage.md --node auto
 jarvisctl mission create --title "CV triage automation" --objective "Rank candidates for HR review" --priority high --owner ops --ticket /home/rootster/codex/Tickets/cv-triage.md --node auto
 jarvisctl mission event <mission-id> --stage task --status running --summary "Started remote review" --namespace cv-triage --node archiebald --evidence transcript:/tmp/cv.jsonl
 jarvisctl mission complete <mission-id> --outcome "Shortlist ready for HR review" --evidence report:/tmp/shortlist.md
@@ -291,7 +294,26 @@ jarvisctl mission list
 jarvisctl mission show <mission-id>
 ```
 
+Built-in mission templates currently cover CV triage, incident response, code review, report generation, bounded worker offload, gated external runtime evaluation, and cross-node relay handoff. Tickets can set `jarvis_mission` so dispatch automatically records launch and completion events against the mission. `node start-session`, `respond-request`, and `delete` also accept `--mission <id>` for direct lifecycle capture.
+
 Mission records live under `~/.jarvis/codex/missions/` with append-only event timelines under `~/.jarvis/codex/mission-events/`. They are intentionally separate from tickets: the ticket remains the execution contract, while the mission ledger is the cross-run decision and evidence object.
+
+Proposal commands let agents recommend operational changes before mutating systems:
+
+```bash
+jarvisctl proposal create --title "Approve worker offload" --mission <mission-id> --action "Run bounded worker probe" --rationale "Typed task with validator" --risk "Bad worker output" --proposed-by agent0 --evidence ticket:/path/to/ticket.md
+jarvisctl proposal decide <proposal-id> --status approved --decision "Approved for this mission." --decided-by rootster
+jarvisctl proposal list
+jarvisctl proposal show <proposal-id>
+```
+
+Use proposals for credentials, paid endpoint onboarding, production mutations, external runtime installs, broad file rewrites, and worker-lane promotion decisions.
+
+Protocol drift for the Codex app-server integration is checked with:
+
+```bash
+scripts/check_codex_app_server_schema.sh
+```
 
 Node inspection and cleanup support the visit lifecycle:
 

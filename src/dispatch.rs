@@ -8,6 +8,7 @@ use crate::control_plane::{
     NodeStartSessionOptions, NodeStartSessionResult, load_or_create_orchestration_policy,
     start_node_session,
 };
+use crate::mission::{MissionEventOptions, append_mission_event};
 use crate::native::RuntimeContextMetadata;
 use crate::runtime::{
     RuntimeSessionState, cancel_runtime_session, delete_runtime_session_if_exists,
@@ -363,6 +364,18 @@ fn handle_ready_transition(
             command: options.command.clone(),
         })?;
         ensure_remote_launch_succeeded(&remote)?;
+        append_ticket_mission_event(
+            &ticket,
+            "task",
+            "running",
+            &format!(
+                "Dispatched ticket '{}' to remote namespace '{}' on Node '{}'.",
+                ticket.title, remote.namespace, remote.node
+            ),
+            Some(&remote.namespace),
+            Some(&remote.node),
+            vec![format!("ticket:{}", ticket.path.display())],
+        );
         board.move_card(ticket_link, CODEX_WORKING)?;
         dirty_boards.insert(board.path.clone());
         update_ticket_status(&ticket_path, "active")?;
@@ -409,6 +422,22 @@ fn handle_ready_transition(
         startup_delay_ms: options.startup_delay_ms,
         command: options.command.clone(),
     })?;
+
+    append_ticket_mission_event(
+        &ticket,
+        "task",
+        "running",
+        &format!(
+            "Dispatched ticket '{}' to local namespace '{}'.",
+            ticket.title, launch.namespace
+        ),
+        Some(&launch.namespace),
+        None,
+        vec![
+            format!("ticket:{}", ticket.path.display()),
+            format!("record:{}", launch.record_file),
+        ],
+    );
 
     board.move_card(ticket_link, CODEX_WORKING)?;
     dirty_boards.insert(board.path.clone());
@@ -526,6 +555,43 @@ fn ensure_remote_launch_succeeded(result: &NodeStartSessionResult) -> anyhow::Re
         result.retryable,
         result.stderr.trim()
     ))
+}
+
+fn append_ticket_mission_event(
+    ticket: &TicketNote,
+    stage: &str,
+    status: &str,
+    summary: &str,
+    namespace: Option<&str>,
+    node: Option<&str>,
+    evidence: Vec<String>,
+) {
+    let Some(mission_id) = ticket
+        .frontmatter
+        .jarvis_mission
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    if let Err(error) = append_mission_event(MissionEventOptions {
+        mission_id: mission_id.to_string(),
+        stage: stage.to_string(),
+        status: status.to_string(),
+        summary: summary.to_string(),
+        ticket: Some(ticket.path.clone()),
+        namespace: namespace.map(ToOwned::to_owned),
+        node: node.map(ToOwned::to_owned),
+        visit: None,
+        approval: None,
+        evidence,
+    }) {
+        warn!(
+            "Failed to append mission event for ticket '{}': {error}",
+            ticket.path.display()
+        );
+    }
 }
 
 fn process_completed_runs(
@@ -671,6 +737,22 @@ fn finalize_run(
             delete_runtime_session_if_exists(&run.namespace)?;
         }
     }
+
+    append_ticket_mission_event(
+        ticket,
+        "verify",
+        &completion_status,
+        &format!(
+            "{} Runtime namespace '{}' reached '{}'.",
+            completion_reason, run.namespace, completion_status
+        ),
+        Some(&run.namespace),
+        None,
+        vec![
+            format!("ticket:{}", ticket.path.display()),
+            format!("record:{}", run.record_file),
+        ],
+    );
 
     remember_ticket_runtime(
         state,

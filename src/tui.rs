@@ -227,7 +227,7 @@ pub fn run_dashboard(backend: SessionBackend, refresh_ms: u64) -> anyhow::Result
                 KeyCode::Char('x') => {
                     if let Some(row) = app.selected_row().cloned() {
                         suspend_terminal(&mut terminal)?;
-                        let action = delete_session(app.backend, &row.namespace);
+                        let action = delete_session(app.backend, &row.namespace, None);
                         resume_terminal(&mut terminal)?;
                         action.map_err(anyhow::Error::from)?;
                         app.refresh()?;

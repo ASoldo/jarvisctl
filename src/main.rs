@@ -27,7 +27,10 @@ mod control_plane;
 mod dispatch;
 mod mission;
 mod native;
+mod proposal;
 mod runtime;
+#[cfg(test)]
+mod test_support;
 mod ticket;
 mod tui;
 
@@ -58,11 +61,15 @@ use control_plane::{
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use mission::{
     MissionCreateOptions, MissionEventOptions, append_mission_event, complete_mission,
-    create_mission, list_missions, render_mission_detail_output, render_missions_output,
-    show_mission,
+    create_mission, list_missions, render_mission_detail_output, render_mission_templates_output,
+    render_missions_output, show_mission,
 };
 use native::{
     NativeSessionMetadata, RuntimeContextMetadata, serve_native_session, spawn_native_session,
+};
+use proposal::{
+    ProposalCreateOptions, ProposalDecisionOptions, create_proposal, decide_proposal,
+    list_proposals, render_proposal_output, render_proposals_output, show_proposal,
 };
 use runtime::{
     attach_runtime_session, collect_runtime_sessions, delete_runtime_session,
@@ -394,6 +401,12 @@ enum Command {
         command: MissionCommand,
     },
 
+    /// Track proposed actions that require an operator decision before mutation
+    Proposal {
+        #[command(subcommand)]
+        command: ProposalCommand,
+    },
+
     /// Inspect or trigger Deployment rollouts
     Rollout {
         #[command(subcommand)]
@@ -451,6 +464,9 @@ enum Command {
 
         #[arg(long, alias = "ns")]
         namespace: String,
+
+        #[arg(long)]
+        mission: Option<String>,
     },
 
     /// List namespaces and agents
@@ -585,6 +601,9 @@ enum Command {
 
         #[arg(long, conflicts_with = "response_json")]
         error: Option<String>,
+
+        #[arg(long)]
+        mission: Option<String>,
     },
 
     /// Send Ctrl+C to a running agent
@@ -640,6 +659,9 @@ enum MissionCommand {
         title: String,
 
         #[arg(long)]
+        template: Option<String>,
+
+        #[arg(long)]
         objective: Option<String>,
 
         #[arg(long)]
@@ -666,6 +688,12 @@ enum MissionCommand {
 
     /// List mission ledger entries
     List {
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// List built-in mission templates
+    Templates {
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
@@ -725,6 +753,67 @@ enum MissionCommand {
 
         #[arg(long = "evidence", alias = "ev")]
         evidence: Vec<String>,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProposalCommand {
+    /// Create an operator decision proposal
+    Create {
+        #[arg(long)]
+        title: String,
+
+        #[arg(long)]
+        mission: Option<String>,
+
+        #[arg(long)]
+        action: String,
+
+        #[arg(long)]
+        rationale: String,
+
+        #[arg(long)]
+        risk: Option<String>,
+
+        #[arg(long = "proposed-by", alias = "by")]
+        proposed_by: Option<String>,
+
+        #[arg(long = "evidence", alias = "ev")]
+        evidence: Vec<String>,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// List proposals
+    List {
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Show one proposal
+    Show {
+        id: String,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Approve, reject, or mark a proposal superseded
+    Decide {
+        id: String,
+
+        #[arg(long)]
+        status: String,
+
+        #[arg(long)]
+        decision: String,
+
+        #[arg(long = "decided-by", alias = "by")]
+        decided_by: Option<String>,
 
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
@@ -966,6 +1055,9 @@ enum NodeCommand {
 
         #[arg(long, alias = "delay-ms", default_value_t = 1500)]
         startup_delay_ms: u64,
+
+        #[arg(long)]
+        mission: Option<String>,
 
         #[arg(long, default_value_t = false)]
         full: bool,
@@ -1480,6 +1572,7 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         } => describe_resource(kind, &name, resource_namespace.as_deref(), output),
         Command::Node { command } => node_command(command),
         Command::Mission { command } => mission_command(command),
+        Command::Proposal { command } => proposal_command(command),
         Command::Rollout { command } => rollout_command(command),
         Command::Kube { command } => kube_command(command),
         Command::Dashboard {
@@ -1501,7 +1594,11 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             )?
             .as_str(),
         ),
-        Command::Delete { backend, namespace } => delete_session(backend, &namespace),
+        Command::Delete {
+            backend,
+            namespace,
+            mission,
+        } => delete_session(backend, &namespace, mission.as_deref()),
         Command::List {
             backend,
             namespace,
@@ -1582,12 +1679,14 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             request_id,
             response_json,
             error,
+            mission,
         } => respond_server_request_command(
             backend,
             &namespace,
             &request_id,
             response_json.as_deref(),
             error.as_deref(),
+            mission.as_deref(),
         ),
         Command::NativeSessionServe { manifest } => {
             serve_native_session(manifest).map_err(JarvisError::from)
@@ -2602,12 +2701,14 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
             working_directory,
             message,
             startup_delay_ms,
+            mission,
             full,
             command,
         } => {
             let policy = load_or_create_orchestration_policy().map_err(JarvisError::from)?;
             let mut effective_labels = policy.default_labels.clone();
             effective_labels.extend(parse_key_value_pairs(&labels)?);
+            let task_note_for_event = task_note.clone();
             let result = start_node_session(NodeStartSessionOptions {
                 node,
                 role: role.or(Some(policy.default_role)),
@@ -2622,6 +2723,31 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                 command,
             })
             .map_err(JarvisError::from)?;
+            append_cli_mission_event(
+                mission.as_deref(),
+                "task",
+                if result.exit_status == 0 {
+                    "running"
+                } else {
+                    "failed"
+                },
+                format!(
+                    "Remote Codex session '{}' on Node '{}' {}.",
+                    result.namespace,
+                    result.node,
+                    if result.exit_status == 0 {
+                        "started"
+                    } else {
+                        "failed to start"
+                    }
+                ),
+                Some(task_note_for_event),
+                Some(result.namespace.clone()),
+                Some(result.node.clone()),
+                None,
+                None,
+                vec![format!("remote-session:{}", result.namespace)],
+            )?;
             if full {
                 println!(
                     "{}",
@@ -2871,6 +2997,7 @@ fn mission_command(command: MissionCommand) -> Result<(), JarvisError> {
     match command {
         MissionCommand::Create {
             title,
+            template,
             objective,
             priority,
             owner,
@@ -2882,6 +3009,7 @@ fn mission_command(command: MissionCommand) -> Result<(), JarvisError> {
         } => {
             let mission = create_mission(MissionCreateOptions {
                 title,
+                template,
                 objective,
                 priority,
                 owner,
@@ -2903,6 +3031,13 @@ fn mission_command(command: MissionCommand) -> Result<(), JarvisError> {
             println!(
                 "{}",
                 render_missions_output(&missions, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        MissionCommand::Templates { output } => {
+            println!(
+                "{}",
+                render_mission_templates_output(output).map_err(JarvisError::from)?
             );
             Ok(())
         }
@@ -2962,6 +3097,105 @@ fn mission_command(command: MissionCommand) -> Result<(), JarvisError> {
             Ok(())
         }
     }
+}
+
+fn proposal_command(command: ProposalCommand) -> Result<(), JarvisError> {
+    match command {
+        ProposalCommand::Create {
+            title,
+            mission,
+            action,
+            rationale,
+            risk,
+            proposed_by,
+            evidence,
+            output,
+        } => {
+            let proposal = create_proposal(ProposalCreateOptions {
+                title,
+                mission_id: mission,
+                action,
+                rationale,
+                risk,
+                proposed_by,
+                evidence,
+            })
+            .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_proposal_output(&proposal, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        ProposalCommand::List { output } => {
+            let proposals = list_proposals().map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_proposals_output(&proposals, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        ProposalCommand::Show { id, output } => {
+            let proposal = show_proposal(&id).map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_proposal_output(&proposal, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        ProposalCommand::Decide {
+            id,
+            status,
+            decision,
+            decided_by,
+            output,
+        } => {
+            let proposal = decide_proposal(ProposalDecisionOptions {
+                id,
+                status,
+                decision,
+                decided_by,
+            })
+            .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_proposal_output(&proposal, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_cli_mission_event(
+    mission_id: Option<&str>,
+    stage: &str,
+    status: &str,
+    summary: String,
+    ticket: Option<PathBuf>,
+    namespace: Option<String>,
+    node: Option<String>,
+    visit: Option<String>,
+    approval: Option<String>,
+    evidence: Vec<String>,
+) -> Result<(), JarvisError> {
+    let Some(mission_id) = mission_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    append_mission_event(MissionEventOptions {
+        mission_id: mission_id.to_string(),
+        stage: stage.to_string(),
+        status: status.to_string(),
+        summary,
+        ticket,
+        namespace,
+        node,
+        visit,
+        approval,
+        evidence,
+    })
+    .map(|_| ())
+    .map_err(JarvisError::from)
 }
 
 fn rollout_command(command: RolloutCommand) -> Result<(), JarvisError> {
@@ -3974,6 +4208,7 @@ fn respond_server_request_command(
     request_id: &str,
     response_json: Option<&str>,
     error: Option<&str>,
+    mission: Option<&str>,
 ) -> Result<(), JarvisError> {
     let _ = backend;
     let response = match response_json {
@@ -4014,6 +4249,25 @@ fn respond_server_request_command(
         "✅ Responded to app-server request '{}' in '{}'",
         request_id, namespace
     );
+    append_cli_mission_event(
+        mission,
+        "authorize",
+        if error.is_some() {
+            "denied"
+        } else {
+            "approved"
+        },
+        format!(
+            "Responded to app-server request '{}' in namespace '{}'.",
+            request_id, namespace
+        ),
+        None,
+        Some(namespace.to_string()),
+        None,
+        None,
+        Some(request_id.to_string()),
+        Vec::new(),
+    )?;
     Ok(())
 }
 
@@ -4060,13 +4314,29 @@ fn attach_session(backend: SessionBackend, namespace: &str) -> Result<(), Jarvis
 }
 
 #[instrument(err)]
-fn delete_session(backend: SessionBackend, namespace: &str) -> Result<(), JarvisError> {
+fn delete_session(
+    backend: SessionBackend,
+    namespace: &str,
+    mission: Option<&str>,
+) -> Result<(), JarvisError> {
     let _ = backend;
     if let Err(local_error) = delete_runtime_session(namespace) {
         if !delete_cluster_runtime_session(namespace).map_err(JarvisError::from)? {
             return Err(JarvisError::from(local_error));
         }
     }
+    append_cli_mission_event(
+        mission,
+        "verify",
+        "closed",
+        format!("Closed runtime namespace '{}'.", namespace),
+        None,
+        Some(namespace.to_string()),
+        None,
+        None,
+        None,
+        Vec::new(),
+    )?;
     Ok(())
 }
 

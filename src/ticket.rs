@@ -100,6 +100,8 @@ pub struct TicketFrontmatter {
     #[serde(default)]
     pub jarvis_node_retries: Option<usize>,
     #[serde(default)]
+    pub jarvis_mission: Option<String>,
+    #[serde(default)]
     pub created: Option<String>,
     #[serde(default)]
     pub updated: Option<String>,

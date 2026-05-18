@@ -1,0 +1,21 @@
+name: Codex app-server schema drift
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  schema-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Codex app-server schema
+        run: |
+          if ! command -v codex >/dev/null 2>&1; then
+            echo "::warning::Codex CLI is not installed in this runner; skipping schema drift check."
+            exit 0
+          fi
+          scripts/check_codex_app_server_schema.sh

@@ -70,6 +70,7 @@ pub struct MissionDetail {
 #[derive(Debug, Clone)]
 pub struct MissionCreateOptions {
     pub title: String,
+    pub template: Option<String>,
     pub objective: Option<String>,
     pub priority: Option<String>,
     pub owner: Option<String>,
@@ -93,20 +94,43 @@ pub struct MissionEventOptions {
     pub evidence: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionTemplate {
+    pub id: String,
+    pub title: String,
+    pub objective: String,
+    pub priority: String,
+    pub labels: BTreeMap<String, String>,
+    pub stages: Vec<String>,
+    pub evidence: Vec<String>,
+}
+
 pub fn create_mission(options: MissionCreateOptions) -> anyhow::Result<MissionRecord> {
+    let template = options
+        .template
+        .as_deref()
+        .map(find_mission_template)
+        .transpose()?;
     let title = options.title.trim();
     if title.is_empty() {
         bail!("mission title must not be empty");
     }
     let now = now_epoch_ms();
+    let mut labels = template
+        .as_ref()
+        .map(|template| template.labels.clone())
+        .unwrap_or_default();
+    labels.extend(options.labels);
     let mission = MissionRecord {
         id: format!("{}-{}", slugify(title), now),
         title: title.to_string(),
-        objective: clean_optional(options.objective),
+        objective: clean_optional(options.objective)
+            .or_else(|| template.as_ref().map(|template| template.objective.clone())),
         status: "planned".to_string(),
-        priority: clean_optional(options.priority),
+        priority: clean_optional(options.priority)
+            .or_else(|| template.as_ref().map(|template| template.priority.clone())),
         owner: clean_optional(options.owner),
-        labels: options.labels,
+        labels,
         tickets: normalize_paths(options.tickets),
         namespaces: normalize_values(options.namespaces),
         nodes: normalize_values(options.nodes),
@@ -119,6 +143,171 @@ pub fn create_mission(options: MissionCreateOptions) -> anyhow::Result<MissionRe
     };
     save_mission(&mission)?;
     Ok(mission)
+}
+
+pub fn mission_templates() -> Vec<MissionTemplate> {
+    vec![
+        MissionTemplate {
+            id: "cv-triage".to_string(),
+            title: "CV triage automation".to_string(),
+            objective: "Rank inbound CVs against a role profile and produce a human-review shortlist.".to_string(),
+            priority: "high".to_string(),
+            labels: BTreeMap::from([
+                ("domain".to_string(), "hr".to_string()),
+                ("workflow".to_string(), "triage".to_string()),
+            ]),
+            stages: vec![
+                "sense: collect job description and CV files".to_string(),
+                "triage: extract skills, experience, constraints, and fit signals".to_string(),
+                "verify: produce shortlist with reasons and uncertainty".to_string(),
+            ],
+            evidence: vec![
+                "job-description".to_string(),
+                "candidate-matrix".to_string(),
+                "shortlist-report".to_string(),
+            ],
+        },
+        MissionTemplate {
+            id: "incident-response".to_string(),
+            title: "Incident response".to_string(),
+            objective: "Coordinate detection, diagnosis, remediation, and post-incident evidence capture.".to_string(),
+            priority: "critical".to_string(),
+            labels: BTreeMap::from([
+                ("domain".to_string(), "ops".to_string()),
+                ("workflow".to_string(), "incident".to_string()),
+            ]),
+            stages: vec![
+                "sense: collect alerts, logs, metrics, and recent changes".to_string(),
+                "decide: isolate likely blast radius and rollback/remediation options".to_string(),
+                "verify: confirm service health and record postmortem evidence".to_string(),
+            ],
+            evidence: vec!["timeline".to_string(), "logs".to_string(), "postmortem".to_string()],
+        },
+        MissionTemplate {
+            id: "code-review".to_string(),
+            title: "Code review".to_string(),
+            objective: "Inspect a change for correctness, regression risk, security, and test coverage.".to_string(),
+            priority: "medium".to_string(),
+            labels: BTreeMap::from([
+                ("domain".to_string(), "engineering".to_string()),
+                ("workflow".to_string(), "review".to_string()),
+            ]),
+            stages: vec![
+                "sense: read diff, tests, and changed ownership boundaries".to_string(),
+                "triage: classify risks by severity and confidence".to_string(),
+                "verify: run focused checks and produce findings".to_string(),
+            ],
+            evidence: vec!["diff".to_string(), "test-output".to_string(), "review-findings".to_string()],
+        },
+        MissionTemplate {
+            id: "report-generation".to_string(),
+            title: "Report generation".to_string(),
+            objective: "Collect source material, synthesize findings, and produce a cited operator-ready report.".to_string(),
+            priority: "medium".to_string(),
+            labels: BTreeMap::from([
+                ("domain".to_string(), "analysis".to_string()),
+                ("workflow".to_string(), "report".to_string()),
+            ]),
+            stages: vec![
+                "sense: collect documents, data, and prior context".to_string(),
+                "execute: draft report with assumptions and evidence".to_string(),
+                "verify: check sources, consistency, and actionability".to_string(),
+            ],
+            evidence: vec!["source-list".to_string(), "draft".to_string(), "final-report".to_string()],
+        },
+        MissionTemplate {
+            id: "bounded-worker-offload".to_string(),
+            title: "Bounded worker offload".to_string(),
+            objective: "Route a narrow, typed, testable task to a worker lane and validate the returned artifact before promotion.".to_string(),
+            priority: "medium".to_string(),
+            labels: BTreeMap::from([
+                ("domain".to_string(), "worker-orchestration".to_string()),
+                ("workflow".to_string(), "offload".to_string()),
+                ("pattern".to_string(), "openclaw".to_string()),
+            ]),
+            stages: vec![
+                "sense: classify the task and select required capabilities".to_string(),
+                "execute: dispatch to the preferred service or worker with fallback policy".to_string(),
+                "verify: validate schema, tests, artifacts, and worker admission evidence".to_string(),
+            ],
+            evidence: vec![
+                "worker-admission".to_string(),
+                "service-route".to_string(),
+                "validated-artifact".to_string(),
+            ],
+        },
+        MissionTemplate {
+            id: "agent-runtime-evaluation".to_string(),
+            title: "Agent runtime evaluation".to_string(),
+            objective: "Evaluate an external agent runtime behind cost, credential, security, and reversibility gates before installing it.".to_string(),
+            priority: "medium".to_string(),
+            labels: BTreeMap::from([
+                ("domain".to_string(), "agent-platform".to_string()),
+                ("workflow".to_string(), "evaluation".to_string()),
+                ("pattern".to_string(), "nemoclaw".to_string()),
+            ]),
+            stages: vec![
+                "sense: inspect docs, installer, license, cost path, and hardware fit".to_string(),
+                "decide: create an operator proposal for credentials, paid endpoints, or durable install".to_string(),
+                "verify: record no-install, sandbox install, or production onboarding evidence".to_string(),
+            ],
+            evidence: vec![
+                "docs-review".to_string(),
+                "cost-gate".to_string(),
+                "install-decision".to_string(),
+            ],
+        },
+        MissionTemplate {
+            id: "agent-relay-handoff".to_string(),
+            title: "Agent relay handoff".to_string(),
+            objective: "Coordinate cross-node agents through explicit handoff messages, local memory, and return evidence without assuming shared vault state.".to_string(),
+            priority: "high".to_string(),
+            labels: BTreeMap::from([
+                ("domain".to_string(), "agent-ops".to_string()),
+                ("workflow".to_string(), "handoff".to_string()),
+                ("pattern".to_string(), "hermes".to_string()),
+            ]),
+            stages: vec![
+                "sense: package context capsule, target node, and expected evidence".to_string(),
+                "execute: deliver the handoff, collect remote findings, and keep local continuity".to_string(),
+                "verify: reconcile remote evidence into the originating mission ledger".to_string(),
+            ],
+            evidence: vec![
+                "handoff-message".to_string(),
+                "remote-transcript".to_string(),
+                "mission-event".to_string(),
+            ],
+        },
+    ]
+}
+
+pub fn render_mission_templates_output(output: ControlPlaneOutput) -> anyhow::Result<String> {
+    let templates = mission_templates();
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(&templates).context("failed to encode mission templates")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(&templates).context("failed to encode mission templates")
+        }
+        ControlPlaneOutput::Table => {
+            let mut lines = vec!["ID\tPRIORITY\tTITLE\tOBJECTIVE".to_string()];
+            for template in templates {
+                lines.push(format!(
+                    "{}\t{}\t{}\t{}",
+                    template.id, template.priority, template.title, template.objective
+                ));
+            }
+            Ok(lines.join("\n"))
+        }
+    }
+}
+
+fn find_mission_template(id: &str) -> anyhow::Result<MissionTemplate> {
+    mission_templates()
+        .into_iter()
+        .find(|template| template.id == id)
+        .ok_or_else(|| anyhow!("mission template '{}' does not exist", id))
 }
 
 pub fn list_missions() -> anyhow::Result<Vec<MissionRecord>> {
@@ -518,43 +707,14 @@ fn now_epoch_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct TempJarvisCodexGuard {
-        original_dir: Option<std::ffi::OsString>,
-        root: PathBuf,
-    }
-
-    impl TempJarvisCodexGuard {
-        fn new(prefix: &str) -> Self {
-            let root = env::temp_dir().join(format!("{}-{}", prefix, now_epoch_ms()));
-            fs::create_dir_all(&root).unwrap();
-            let original_dir = env::var_os("JARVIS_CODEX_DIR");
-            unsafe {
-                env::set_var("JARVIS_CODEX_DIR", &root);
-            }
-            Self { original_dir, root }
-        }
-    }
-
-    impl Drop for TempJarvisCodexGuard {
-        fn drop(&mut self) {
-            match &self.original_dir {
-                Some(path) => unsafe {
-                    env::set_var("JARVIS_CODEX_DIR", path);
-                },
-                None => unsafe {
-                    env::remove_var("JARVIS_CODEX_DIR");
-                },
-            }
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
+    use crate::test_support::TempJarvisCodexGuard;
 
     #[test]
     fn mission_lifecycle_records_links_and_events() {
         let _home = TempJarvisCodexGuard::new("jarvisctl-mission-ledger");
         let mission = create_mission(MissionCreateOptions {
             title: "CV triage automation".to_string(),
+            template: Some("cv-triage".to_string()),
             objective: Some("Rank candidates for HR review.".to_string()),
             priority: Some("high".to_string()),
             owner: Some("ops".to_string()),
@@ -593,5 +753,39 @@ mod tests {
         );
         assert_eq!(completed.events.len(), 2);
         assert_eq!(list_missions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn mission_template_supplies_defaults_and_labels() {
+        let _home = TempJarvisCodexGuard::new("jarvisctl-mission-template");
+        let mission = create_mission(MissionCreateOptions {
+            title: "Worker route probe".to_string(),
+            template: Some("bounded-worker-offload".to_string()),
+            objective: None,
+            priority: None,
+            owner: None,
+            labels: BTreeMap::from([("priority_override".to_string(), "manual".to_string())]),
+            tickets: Vec::new(),
+            namespaces: Vec::new(),
+            nodes: Vec::new(),
+        })
+        .unwrap();
+
+        assert_eq!(mission.priority.as_deref(), Some("medium"));
+        assert_eq!(
+            mission.labels.get("pattern").map(String::as_str),
+            Some("openclaw")
+        );
+        assert_eq!(
+            mission.labels.get("priority_override").map(String::as_str),
+            Some("manual")
+        );
+        assert!(
+            mission
+                .objective
+                .as_deref()
+                .unwrap_or_default()
+                .contains("worker lane")
+        );
     }
 }
