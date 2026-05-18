@@ -2788,6 +2788,17 @@ pub fn respond_cluster_runtime_server_request(
     let Some(node) = remote_node_for_runtime_session(namespace)? else {
         return Ok(false);
     };
+    let args = build_respond_request_args(namespace, request_id, response, error)?;
+    run_remote_runtime_command(&node, args)?;
+    Ok(true)
+}
+
+fn build_respond_request_args(
+    namespace: &str,
+    request_id: &str,
+    response: Option<&serde_json::Value>,
+    error: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
     let mut args = vec![
         "jarvisctl".to_string(),
         "respond-request".to_string(),
@@ -2805,8 +2816,7 @@ pub fn respond_cluster_runtime_server_request(
     } else {
         bail!("provide either a JSON response or an error");
     }
-    run_remote_runtime_command(&node, args)?;
-    Ok(true)
+    Ok(args)
 }
 
 pub fn delete_cluster_runtime_session(namespace: &str) -> anyhow::Result<bool> {
@@ -7530,5 +7540,37 @@ spec:
             Some("https://login.tailscale.com/a/l6c9487034871a")
         );
         assert!(extract_auth_url("plain ssh failure").is_none());
+    }
+
+    #[test]
+    fn builds_remote_app_server_request_response_command() {
+        let response = serde_json::json!({"approved": true, "mode": "headless"});
+        assert_eq!(
+            build_respond_request_args("codex-ns", "req-42", Some(&response), None).unwrap(),
+            vec![
+                "jarvisctl".to_string(),
+                "respond-request".to_string(),
+                "--namespace".to_string(),
+                "codex-ns".to_string(),
+                "--request-id".to_string(),
+                "req-42".to_string(),
+                "--response-json".to_string(),
+                "{\"approved\":true,\"mode\":\"headless\"}".to_string(),
+            ]
+        );
+
+        assert_eq!(
+            build_respond_request_args("codex-ns", "req-42", None, Some("denied")).unwrap(),
+            vec![
+                "jarvisctl".to_string(),
+                "respond-request".to_string(),
+                "--namespace".to_string(),
+                "codex-ns".to_string(),
+                "--request-id".to_string(),
+                "req-42".to_string(),
+                "--error".to_string(),
+                "denied".to_string(),
+            ]
+        );
     }
 }
