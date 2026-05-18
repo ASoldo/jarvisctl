@@ -2779,6 +2779,36 @@ pub fn interrupt_cluster_runtime_session(namespace: &str, agent: &str) -> anyhow
     Ok(true)
 }
 
+pub fn respond_cluster_runtime_server_request(
+    namespace: &str,
+    request_id: &str,
+    response: Option<&serde_json::Value>,
+    error: Option<&str>,
+) -> anyhow::Result<bool> {
+    let Some(node) = remote_node_for_runtime_session(namespace)? else {
+        return Ok(false);
+    };
+    let mut args = vec![
+        "jarvisctl".to_string(),
+        "respond-request".to_string(),
+        "--namespace".to_string(),
+        namespace.to_string(),
+        "--request-id".to_string(),
+        request_id.to_string(),
+    ];
+    if let Some(error) = error.map(str::trim).filter(|value| !value.is_empty()) {
+        args.push("--error".to_string());
+        args.push(error.to_string());
+    } else if let Some(response) = response {
+        args.push("--response-json".to_string());
+        args.push(response.to_string());
+    } else {
+        bail!("provide either a JSON response or an error");
+    }
+    run_remote_runtime_command(&node, args)?;
+    Ok(true)
+}
+
 pub fn delete_cluster_runtime_session(namespace: &str) -> anyhow::Result<bool> {
     let Some(node) = remote_node_for_runtime_session(namespace)? else {
         return Ok(false);

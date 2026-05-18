@@ -49,10 +49,10 @@ use control_plane::{
     reconcile_nodes, register_node, render_describe_output, render_get_output,
     render_kubernetes_resources, render_node_probe_output, render_rollout_history_output,
     render_rollout_status_output, resolve_service_target, resolve_service_target_for_message,
-    restart_deployment_rollout, resume_deployment_rollout, rotate_capsule_key, run_node_fanout,
-    run_node_visit, schedule_node, set_node_cordoned, start_node_pair_session, start_node_session,
-    sync_codex_auth_to_node, tell_cluster_runtime_session, undo_deployment_rollout,
-    wait_for_rollout_status_output,
+    respond_cluster_runtime_server_request, restart_deployment_rollout, resume_deployment_rollout,
+    rotate_capsule_key, run_node_fanout, run_node_visit, schedule_node, set_node_cordoned,
+    start_node_pair_session, start_node_session, sync_codex_auth_to_node,
+    tell_cluster_runtime_session, undo_deployment_rollout, wait_for_rollout_status_output,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use native::{
@@ -3787,7 +3787,20 @@ fn respond_server_request_command(
             "provide either --response-json or --error"
         )));
     }
-    respond_runtime_server_request(namespace, request_id, response, error)?;
+    if let Err(local_error) =
+        respond_runtime_server_request(namespace, request_id, response.clone(), error.clone())
+    {
+        if !respond_cluster_runtime_server_request(
+            namespace,
+            request_id,
+            response.as_ref(),
+            error.as_deref(),
+        )
+        .map_err(JarvisError::from)?
+        {
+            return Err(JarvisError::from(local_error));
+        }
+    }
     println!(
         "✅ Responded to app-server request '{}' in '{}'",
         request_id, namespace
