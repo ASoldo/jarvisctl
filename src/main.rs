@@ -45,13 +45,14 @@ use control_plane::{
     authorize_runtime_message, bootstrap_node, check_node_links, cleanup_node, cluster_index,
     delete_cluster_runtime_session, doctor_nodes, inspect_node, interrupt_cluster_runtime_session,
     load_or_create_orchestration_policy, migrate_session_to_node, open_visit_capsule,
-    orchestration_policy_path, pause_deployment_rollout, read_auth_audit_events, reconcile_nodes,
-    register_node, render_describe_output, render_get_output, render_kubernetes_resources,
-    render_node_probe_output, render_rollout_history_output, render_rollout_status_output,
-    resolve_service_target, resolve_service_target_for_message, restart_deployment_rollout,
-    resume_deployment_rollout, rotate_capsule_key, run_node_fanout, run_node_visit, schedule_node,
-    set_node_cordoned, start_node_pair_session, start_node_session, sync_codex_auth_to_node,
-    tell_cluster_runtime_session, undo_deployment_rollout, wait_for_rollout_status_output,
+    orchestration_policy_path, pause_deployment_rollout, preflight_nodes, read_auth_audit_events,
+    reconcile_nodes, register_node, render_describe_output, render_get_output,
+    render_kubernetes_resources, render_node_probe_output, render_rollout_history_output,
+    render_rollout_status_output, resolve_service_target, resolve_service_target_for_message,
+    restart_deployment_rollout, resume_deployment_rollout, rotate_capsule_key, run_node_fanout,
+    run_node_visit, schedule_node, set_node_cordoned, start_node_pair_session, start_node_session,
+    sync_codex_auth_to_node, tell_cluster_runtime_session, undo_deployment_rollout,
+    wait_for_rollout_status_output,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use native::{
@@ -669,6 +670,12 @@ enum NodeCommand {
 
     /// Check all registered nodes for orchestration readiness
     Doctor {
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Run cluster readiness checks before launching orchestration workloads
+    Preflight {
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
@@ -1923,6 +1930,70 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                             } else {
                                 check.issues.join(",")
                             }
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        NodeCommand::Preflight { output } => {
+            let result = preflight_nodes().map_err(JarvisError::from)?;
+            match output {
+                ControlPlaneOutput::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).map_err(anyhow::Error::from)?
+                ),
+                ControlPlaneOutput::Yaml => {
+                    println!(
+                        "{}",
+                        serde_yaml::to_string(&result).map_err(anyhow::Error::from)?
+                    )
+                }
+                ControlPlaneOutput::Table => {
+                    println!("OK\tISSUES");
+                    println!(
+                        "{}\t{}",
+                        result.ok,
+                        if result.issues.is_empty() {
+                            "-".to_string()
+                        } else {
+                            result.issues.join(",")
+                        }
+                    );
+                    println!();
+                    println!("NODE\tAVAILABLE\tSCHEDULABLE\tJARVISCTL\tCODEX\tISSUES");
+                    for check in result.doctors {
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}\t{}",
+                            check.node,
+                            check.available,
+                            check.schedulable,
+                            check
+                                .facts
+                                .get("jarvisctl")
+                                .map(String::as_str)
+                                .unwrap_or("-"),
+                            check
+                                .facts
+                                .get("codex_cli")
+                                .map(String::as_str)
+                                .unwrap_or("-"),
+                            if check.issues.is_empty() {
+                                "-".to_string()
+                            } else {
+                                check.issues.join(",")
+                            }
+                        );
+                    }
+                    println!();
+                    println!("FROM\tTO\tOK\tCLASS");
+                    for link in result.links {
+                        println!(
+                            "{}\t{}\t{}\t{}",
+                            link.from,
+                            link.to,
+                            link.ok,
+                            link.failure_class.unwrap_or_else(|| "-".to_string())
                         );
                     }
                 }

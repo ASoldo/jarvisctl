@@ -289,6 +289,9 @@ pub struct NodeVisitResult {
 pub struct NodeStartSessionResult {
     pub node: String,
     pub namespace: String,
+    pub task_note: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_task_note: Option<String>,
     pub exit_status: i32,
     pub stdout: String,
     pub stderr: String,
@@ -314,6 +317,15 @@ pub struct NodePairSessionResult {
     pub coordination_id: String,
     pub coordination_note: String,
     pub members: Vec<NodePairMemberResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodePreflightResult {
+    pub ok: bool,
+    pub generated_at_epoch_ms: u128,
+    pub issues: Vec<String>,
+    pub doctors: Vec<NodeDoctorCheck>,
+    pub links: Vec<NodeLinkCheck>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1617,6 +1629,85 @@ pub fn doctor_nodes() -> anyhow::Result<Vec<NodeDoctorCheck>> {
     Ok(checks)
 }
 
+pub fn preflight_nodes() -> anyhow::Result<NodePreflightResult> {
+    let doctors = doctor_nodes()?;
+    let links = check_node_links(NodeLinksOptions::default())?;
+    let mut issues = Vec::new();
+
+    for check in &doctors {
+        if !check.available {
+            issues.push(format!("node_unavailable={}", check.node));
+        }
+        if !check.schedulable {
+            issues.push(format!(
+                "node_unschedulable={}:{}",
+                check.node,
+                if check.issues.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    check.issues.join(",")
+                }
+            ));
+        }
+    }
+
+    for link in &links {
+        if !link.ok {
+            issues.push(format!(
+                "link_failed={}->{}:{}",
+                link.from,
+                link.to,
+                link.failure_class
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("unknown")
+            ));
+        }
+    }
+
+    append_version_consistency_issue(&doctors, "jarvisctl", &mut issues);
+    append_version_consistency_issue(&doctors, "codex_cli", &mut issues);
+
+    Ok(NodePreflightResult {
+        ok: issues.is_empty(),
+        generated_at_epoch_ms: now_epoch_ms(),
+        issues,
+        doctors,
+        links,
+    })
+}
+
+fn append_version_consistency_issue(
+    doctors: &[NodeDoctorCheck],
+    fact_key: &str,
+    issues: &mut Vec<String>,
+) {
+    let mut versions = BTreeMap::<String, Vec<String>>::new();
+    for check in doctors {
+        if !check.available {
+            continue;
+        }
+        let version = check
+            .facts
+            .get(fact_key)
+            .cloned()
+            .unwrap_or_else(|| "missing".to_string());
+        versions
+            .entry(version)
+            .or_default()
+            .push(check.node.clone());
+    }
+    if versions.len() <= 1 {
+        return;
+    }
+    let detail = versions
+        .into_iter()
+        .map(|(version, nodes)| format!("{}=[{}]", version, nodes.join(",")))
+        .collect::<Vec<_>>()
+        .join(";");
+    issues.push(format!("{fact_key}_version_mismatch={detail}"));
+}
+
 pub fn check_node_links(options: NodeLinksOptions) -> anyhow::Result<Vec<NodeLinkCheck>> {
     let nodes = load_manifests_by_kind(ResourceKind::Node, None)?
         .into_iter()
@@ -1991,6 +2082,8 @@ fn start_node_session_once(
         "ok",
         "remote_session",
     )?;
+    let (remote_task_note, staged_task_note) =
+        stage_task_note_for_remote_session(&node, &target, &namespace, &options.task_note)?;
 
     let mut remote_args = vec![
         "jarvisctl".to_string(),
@@ -1998,7 +2091,7 @@ fn start_node_session_once(
         "--driver".to_string(),
         "app-server".to_string(),
         "--task-note".to_string(),
-        options.task_note.display().to_string(),
+        remote_task_note.display().to_string(),
         "--namespace".to_string(),
         namespace.clone(),
         "--runtime-label".to_string(),
@@ -2064,6 +2157,8 @@ fn start_node_session_once(
     Ok(NodeStartSessionResult {
         node: node.metadata.name,
         namespace,
+        task_note: remote_task_note.display().to_string(),
+        staged_task_note: staged_task_note.map(|path| path.display().to_string()),
         exit_status,
         stdout,
         stderr,
@@ -2118,6 +2213,8 @@ fn start_local_node_session_once(
         Ok(record) => Ok(NodeStartSessionResult {
             node: node.metadata.name.clone(),
             namespace,
+            task_note: options.task_note.display().to_string(),
+            staged_task_note: None,
             exit_status: 0,
             stdout: serde_json::to_string_pretty(&record).unwrap_or_default(),
             stderr: String::new(),
@@ -2127,6 +2224,8 @@ fn start_local_node_session_once(
         Err(error) => Ok(NodeStartSessionResult {
             node: node.metadata.name.clone(),
             namespace,
+            task_note: options.task_note.display().to_string(),
+            staged_task_note: None,
             exit_status: 1,
             stdout: String::new(),
             stderr: error.to_string(),
@@ -2134,6 +2233,74 @@ fn start_local_node_session_once(
             retryable: false,
         }),
     }
+}
+
+fn stage_task_note_for_remote_session(
+    node: &ResourceEnvelope<NodeSpec>,
+    target: &str,
+    namespace: &str,
+    task_note: &Path,
+) -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
+    if !task_note.exists() {
+        return Ok((task_note.to_path_buf(), None));
+    }
+    ensure!(
+        task_note.is_file(),
+        "task note '{}' is not a file",
+        task_note.display()
+    );
+    let remote_home = run_shell_probe(Some(target), "printf '%s' \"$HOME\"", "remote home lookup")?;
+    let remote_home = remote_home.trim();
+    ensure!(
+        !remote_home.is_empty(),
+        "Node '{}' returned an empty HOME path",
+        node.metadata.name
+    );
+    let remote_dir = PathBuf::from(remote_home)
+        .join(".jarvis")
+        .join("codex")
+        .join("task-notes")
+        .join(slugify(namespace));
+    let remote_name = task_note
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(slugify)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "task-note-md".to_string());
+    let remote_path = remote_dir.join(format!("{remote_name}.md"));
+    let mkdir_script = format!(
+        "mkdir -p {}",
+        shell_words::quote(&remote_dir.display().to_string())
+    );
+    run_shell_probe(
+        Some(target),
+        &mkdir_script,
+        "remote task note staging prepare",
+    )?;
+    let destination = format!("{target}:{}", remote_path.display());
+    let status = ProcessCommand::new("scp")
+        .args([
+            "-q",
+            task_note
+                .to_str()
+                .ok_or_else(|| anyhow!("task note path is not valid UTF-8"))?,
+            &destination,
+        ])
+        .status()
+        .with_context(|| {
+            format!(
+                "failed to stage task note '{}' on Node '{}'",
+                task_note.display(),
+                node.metadata.name
+            )
+        })?;
+    ensure!(
+        status.success(),
+        "task note staging to Node '{}' failed with {status}",
+        node.metadata.name
+    );
+    let staged = remote_path;
+    Ok((staged.clone(), Some(staged)))
 }
 
 pub fn start_node_pair_session(
