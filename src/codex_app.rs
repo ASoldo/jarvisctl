@@ -318,6 +318,40 @@ impl CodexAppSession {
         Ok(())
     }
 
+    fn handle_server_request(&self, value: Value) -> anyhow::Result<()> {
+        let id = value.get("id").cloned().unwrap_or(Value::Null);
+        let method = value
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let params = value.get("params").cloned().unwrap_or(Value::Null);
+        let message = format!(
+            "Codex app-server requested '{}', but jarvisctl does not yet have a headless response bridge for this request type",
+            method
+        );
+
+        self.upsert_runtime_event(
+            format!("server-request:{}:{}", method, now_epoch_ms()),
+            "server-request",
+            "Operator action required",
+            Some(format!(
+                "{}\n{}",
+                message,
+                truncate_block(&params.to_string(), 1800)
+            )),
+            Some("blocked".to_string()),
+            Some("codex".to_string()),
+        )?;
+        self.record_error(&message)?;
+        self.send_json(&json!({
+            "id": id,
+            "error": {
+                "code": -32001,
+                "message": message,
+            }
+        }))
+    }
+
     fn handle_notification(&self, method: &str, params: &Value) -> anyhow::Result<()> {
         match method {
             "error" => {
@@ -977,6 +1011,40 @@ impl CodexAppSession {
         thread_id: &str,
         manifest: &CodexAppLaunchManifest,
     ) -> anyhow::Result<()> {
+        if let Some(memory_mode) = manifest.protocol.memory_mode.as_deref() {
+            match self.call(
+                "thread/memoryMode/set",
+                json!({
+                    "threadId": thread_id,
+                    "mode": memory_mode,
+                }),
+            ) {
+                Ok(_) => {
+                    self.upsert_runtime_event(
+                        format!("memory-mode:{thread_id}"),
+                        "memory",
+                        "Memory mode applied",
+                        Some(format!("thread memory mode set to {}", memory_mode)),
+                        Some(memory_mode.to_string()),
+                        Some("jarvisctl".to_string()),
+                    )?;
+                }
+                Err(error) => {
+                    self.upsert_runtime_event(
+                        format!("memory-mode:{thread_id}"),
+                        "memory",
+                        "Memory mode requested",
+                        Some(format!(
+                            "app-server did not accept thread/memoryMode/set: {}",
+                            truncate_line(&error.to_string(), 180)
+                        )),
+                        Some("requested".to_string()),
+                        Some("jarvisctl".to_string()),
+                    )?;
+                }
+            }
+        }
+
         if let Some(goal) = manifest.protocol.goal.as_deref() {
             let mut params = json!({
                 "threadId": thread_id,
@@ -1479,6 +1547,10 @@ pub fn serve_codex_app_session(manifest_path: PathBuf) -> anyhow::Result<()> {
                     continue;
                 }
             };
+            if value.get("id").is_some() && value.get("method").is_some() {
+                let _ = stdout_session.handle_server_request(value);
+                continue;
+            }
             if value.get("id").is_some() {
                 let _ = stdout_session.handle_response(value);
                 continue;
@@ -2303,7 +2375,7 @@ fn thread_id_from_value(thread: &Value) -> Option<String> {
 fn build_thread_start_params(manifest: &CodexAppLaunchManifest) -> Value {
     let mut params = serde_json::Map::new();
     insert_opt(&mut params, "cwd", manifest.working_directory.as_deref());
-    insert_thread_protocol_params(
+    insert_thread_start_protocol_params(
         &mut params,
         manifest.working_directory.as_deref(),
         &manifest.protocol,
@@ -2316,11 +2388,7 @@ fn build_thread_resume_params(thread_id: &str, manifest: &CodexAppLaunchManifest
     let mut params = serde_json::Map::new();
     params.insert("threadId".to_string(), json!(thread_id));
     insert_opt(&mut params, "cwd", manifest.working_directory.as_deref());
-    insert_thread_protocol_params(
-        &mut params,
-        manifest.working_directory.as_deref(),
-        &manifest.protocol,
-    );
+    insert_thread_resume_protocol_params(&mut params, &manifest.protocol);
     merge_object_fields(&mut params, &manifest.protocol.thread_config);
     Value::Object(params)
 }
@@ -2365,6 +2433,9 @@ fn build_turn_start_params(
     if let Some(permission_profile) = permission_profile_value(protocol) {
         params.insert("permissions".to_string(), permission_profile);
     }
+    if let Some(workspace_roots) = runtime_workspace_roots_value(protocol) {
+        params.insert("runtimeWorkspaceRoots".to_string(), workspace_roots);
+    }
     if let Some(environments) = environments_value(cwd, protocol) {
         params.insert("environments".to_string(), environments);
     }
@@ -2372,7 +2443,7 @@ fn build_turn_start_params(
     Value::Object(params)
 }
 
-fn insert_thread_protocol_params(
+fn insert_thread_start_protocol_params(
     params: &mut serde_json::Map<String, Value>,
     cwd: Option<&str>,
     protocol: &CodexAppProtocolConfig,
@@ -2420,8 +2491,53 @@ fn insert_thread_protocol_params(
     if let Some(permission_profile) = permission_profile_value(protocol) {
         params.insert("permissions".to_string(), permission_profile);
     }
+    if let Some(workspace_roots) = runtime_workspace_roots_value(protocol) {
+        params.insert("runtimeWorkspaceRoots".to_string(), workspace_roots);
+    }
     if let Some(environments) = environments_value(cwd, protocol) {
         params.insert("environments".to_string(), environments);
+    }
+}
+
+fn insert_thread_resume_protocol_params(
+    params: &mut serde_json::Map<String, Value>,
+    protocol: &CodexAppProtocolConfig,
+) {
+    insert_opt(params, "model", protocol.model.as_deref());
+    insert_opt(params, "modelProvider", protocol.model_provider.as_deref());
+    insert_opt(
+        params,
+        "approvalPolicy",
+        protocol.approval_policy.as_deref(),
+    );
+    insert_opt(
+        params,
+        "approvalsReviewer",
+        protocol.approvals_reviewer.as_deref(),
+    );
+    if protocol.permission_profile.is_none() {
+        insert_opt(params, "sandbox", protocol.sandbox_mode.as_deref());
+    }
+    insert_opt(params, "personality", protocol.personality.as_deref());
+    insert_opt(params, "serviceTier", protocol.service_tier.as_deref());
+    insert_opt(
+        params,
+        "developerInstructions",
+        protocol.developer_instructions.as_deref(),
+    );
+    insert_opt(
+        params,
+        "baseInstructions",
+        protocol.base_instructions.as_deref(),
+    );
+    if let Some(config) = config_value(protocol) {
+        params.insert("config".to_string(), config);
+    }
+    if let Some(permission_profile) = permission_profile_value(protocol) {
+        params.insert("permissions".to_string(), permission_profile);
+    }
+    if let Some(workspace_roots) = runtime_workspace_roots_value(protocol) {
+        params.insert("runtimeWorkspaceRoots".to_string(), workspace_roots);
     }
 }
 
@@ -2464,27 +2580,20 @@ fn sandbox_policy_value(sandbox_mode: &str, writable_roots: &[String]) -> Value 
 
 fn permission_profile_value(protocol: &CodexAppProtocolConfig) -> Option<Value> {
     let profile = protocol.permission_profile.as_deref()?;
-    let mut value = serde_json::Map::new();
-    value.insert("type".to_string(), json!("profile"));
-    value.insert("id".to_string(), json!(profile));
-    if !protocol.permission_additional_writable_roots.is_empty() {
-        value.insert(
-            "modifications".to_string(),
-            Value::Array(
-                protocol
-                    .permission_additional_writable_roots
-                    .iter()
-                    .map(|path| {
-                        json!({
-                            "type": "additionalWritableRoot",
-                            "path": path,
-                        })
-                    })
-                    .collect(),
-            ),
-        );
+    Some(json!(profile))
+}
+
+fn runtime_workspace_roots_value(protocol: &CodexAppProtocolConfig) -> Option<Value> {
+    if protocol.permission_additional_writable_roots.is_empty() {
+        return None;
     }
-    Some(Value::Object(value))
+    Some(Value::Array(
+        protocol
+            .permission_additional_writable_roots
+            .iter()
+            .map(|path| Value::String(path.clone()))
+            .collect(),
+    ))
 }
 
 fn environments_value(cwd: Option<&str>, protocol: &CodexAppProtocolConfig) -> Option<Value> {
@@ -3183,4 +3292,74 @@ fn sanitize_namespace(namespace: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest_with_protocol(protocol: CodexAppProtocolConfig) -> CodexAppLaunchManifest {
+        CodexAppLaunchManifest {
+            namespace: "demo".to_string(),
+            working_directory: Some("/tmp/demo".to_string()),
+            shell_command: "codex".to_string(),
+            startup_prompt: "run".to_string(),
+            images: Vec::new(),
+            protocol,
+            environment: BTreeMap::new(),
+            resume_session_id: None,
+            created_at_epoch_ms: 1,
+            context: RuntimeContextMetadata::default(),
+        }
+    }
+
+    #[test]
+    fn app_server_permissions_use_codex_0131_profile_string() {
+        let protocol = CodexAppProtocolConfig {
+            permission_profile: Some("trusted".to_string()),
+            sandbox_mode: Some("workspace-write".to_string()),
+            permission_additional_writable_roots: vec!["/tmp/shared".to_string()],
+            ..CodexAppProtocolConfig::default()
+        };
+        let manifest = manifest_with_protocol(protocol.clone());
+
+        let thread_params = build_thread_start_params(&manifest);
+        assert_eq!(thread_params["permissions"], json!("trusted"));
+        assert!(thread_params.get("sandbox").is_none());
+        assert_eq!(
+            thread_params["runtimeWorkspaceRoots"],
+            json!(["/tmp/shared"])
+        );
+
+        let turn_params =
+            build_turn_start_params("thread-1", Vec::new(), Some("/tmp/demo"), &protocol);
+        assert_eq!(turn_params["permissions"], json!("trusted"));
+        assert!(turn_params.get("sandboxPolicy").is_none());
+        assert_eq!(turn_params["runtimeWorkspaceRoots"], json!(["/tmp/shared"]));
+    }
+
+    #[test]
+    fn app_server_resume_params_omit_start_only_fields() {
+        let protocol = CodexAppProtocolConfig {
+            environments: vec!["env-1".to_string()],
+            service_name: Some("jarvis".to_string()),
+            thread_source: Some("app".to_string()),
+            session_start_source: Some("user".to_string()),
+            ephemeral: Some(true),
+            permission_profile: Some("trusted".to_string()),
+            permission_additional_writable_roots: vec!["/tmp/shared".to_string()],
+            ..CodexAppProtocolConfig::default()
+        };
+        let manifest = manifest_with_protocol(protocol);
+        let params = build_thread_resume_params("thread-1", &manifest);
+
+        assert_eq!(params["threadId"], json!("thread-1"));
+        assert_eq!(params["permissions"], json!("trusted"));
+        assert_eq!(params["runtimeWorkspaceRoots"], json!(["/tmp/shared"]));
+        assert!(params.get("environments").is_none());
+        assert!(params.get("serviceName").is_none());
+        assert!(params.get("threadSource").is_none());
+        assert!(params.get("sessionStartSource").is_none());
+        assert!(params.get("ephemeral").is_none());
+    }
 }

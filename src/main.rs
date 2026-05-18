@@ -1193,9 +1193,10 @@ fn main() -> ExitCode {
 }
 
 fn dispatch(cli: Cli) -> Result<(), JarvisError> {
-    match cli.command.unwrap_or(Command::Dashboard {
+    match cli.command.unwrap_or(Command::List {
         backend: SessionBackend::Native,
-        refresh_ms: 1000,
+        namespace: None,
+        json: false,
     }) {
         Command::Single { name, command } => {
             let agent = spawn_agent(&name, &command).map_err(|e| {

@@ -11,7 +11,7 @@ It is not a sandbox, a model marketplace, or a generic infrastructure control pl
 
 The local runtime is native-only now: each namespace is a background PTY session process with a Unix-socket control plane. Older scripts may still pass `--backend native`, but there is no tmux backend anymore.
 
-It is designed to sit underneath an Obsidian-driven Codex workflow: ticket notes stay in the vault, `jarvisctl dispatch` watches board transitions, and the operator uses the dashboard, attach flow, or Waybar counts to see what is live.
+It is designed to sit underneath an Obsidian-driven Codex workflow: ticket notes stay in the vault, `jarvisctl dispatch` watches board transitions, and the operator uses the Obsidian control surface, explicit dashboard, attach flow, or status-bar counts to see what is live.
 
 For the current product direction and pruning criteria, see [docs/NORTH_STAR.md](docs/NORTH_STAR.md).
 
@@ -46,13 +46,21 @@ There is no tmux runtime dependency anymore. A normal Rust toolchain is enough t
 
 ## Usage Examples
 
-### Open the session dashboard
+### Inspect live runtime state
 
 ```bash
 jarvisctl
 ```
 
-Bare `jarvisctl` opens the ratatui operator dashboard. Think of it as a compact `k9s`-style view for local Codex namespaces and agents: use `j`/`k` or arrow keys to move, `Enter` to attach, `i` to interrupt the selected agent, `x` to close the selected namespace, and `r` to refresh.
+Bare `jarvisctl` prints the current namespaces and agents without opening a terminal UI. Use `jarvisctl list --json` for automation and Obsidian integrations.
+
+### Open the optional terminal dashboard
+
+```bash
+jarvisctl dashboard
+```
+
+The ratatui dashboard is an explicit local operator tool for the native multiplexer: use `j`/`k` or arrow keys to move, `Enter` to attach, `i` to interrupt the selected agent, `x` to close the selected namespace, and `r` to refresh.
 
 ### Launch a new namespace with multiple agents
 

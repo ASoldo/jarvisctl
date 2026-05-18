@@ -2,13 +2,16 @@
 
 `jarvisctl` treats Codex app-server as the agent runtime contract. The Obsidian plugin should write durable ticket frontmatter; `jarvisctl` turns that frontmatter into app-server `thread/start`, `thread/resume`, `thread/goal/set`, and `turn/start` parameters.
 
-Checked against Codex CLI `0.130.0` and the generated app-server schema from `codex app-server generate-json-schema`.
+Checked against Codex CLI `0.131.0` and the generated experimental app-server schema from `codex app-server generate-json-schema --experimental --out <dir>`.
 
 ## Current release signals
 
 - `codex remote-control` is now the preferred headless remote entrypoint for remotely controlled app-server runtimes.
 - `thread/start`, `thread/resume`, and `turn/start` now expose richer per-thread and per-turn configuration: model, service tier, approvals reviewer, permission profiles, environments, personality, and instruction overrides.
 - Experimental app-server fields require `initialize.capabilities.experimentalApi = true`.
+- `permissions` is a named profile string in `thread/start`, `thread/resume`, and `turn/start`; extra writable roots map to `runtimeWorkspaceRoots`.
+- `codex_memory_mode` is applied after thread creation with `thread/memoryMode/set`.
+- Server-initiated request methods now include command/file/permission approvals, MCP elicitation, tool user input, dynamic tool calls, auth refresh, and attestation. `jarvisctl` records these as blocked operator events and returns a JSON-RPC error until the Obsidian approval bridge is implemented.
 - Historical thread data is read with `thread/read` and `includeTurns`; each returned turn carries `itemsView`.
 - `thread/goal/set`, `thread/goal/updated`, and `thread/goal/cleared` are first-class goal lifecycle events.
 - Live threads pick up config changes without a restart, so Jarvis should keep durable launch state in tickets and runtime metadata instead of restarting sessions to refresh every Codex config change.
@@ -83,5 +86,5 @@ The Obsidian plugin can read `jarvisctl list --json` and use:
 ## Not mapped yet
 
 - Historical thread reads are exposed through `jarvisctl history --namespace <name> --json`. The Obsidian plugin can use this for compact turn history without parsing transcript files.
-- Approval server requests are still not an interactive Jarvis approval UI. They remain driven by the underlying Codex session policy unless a future Obsidian view handles app-server server requests directly.
+- Approval and elicitation server requests are not yet an interactive Jarvis approval UI. They are surfaced as blocked runtime events instead of hanging the app-server reader.
 - App/plugin/skill mention inputs are passed through prompt text today. A richer Obsidian composer can add structured `skill`, `mention`, and `localImage` input items later.
