@@ -25,6 +25,7 @@ mod codex;
 mod codex_app;
 mod control_plane;
 mod dispatch;
+mod mission;
 mod native;
 mod runtime;
 mod ticket;
@@ -55,6 +56,11 @@ use control_plane::{
     tell_cluster_runtime_session, undo_deployment_rollout, wait_for_rollout_status_output,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
+use mission::{
+    MissionCreateOptions, MissionEventOptions, append_mission_event, complete_mission,
+    create_mission, list_missions, render_mission_detail_output, render_missions_output,
+    show_mission,
+};
 use native::{
     NativeSessionMetadata, RuntimeContextMetadata, serve_native_session, spawn_native_session,
 };
@@ -382,6 +388,12 @@ enum Command {
         command: NodeCommand,
     },
 
+    /// Track business objectives, decisions, evidence, and runtime links
+    Mission {
+        #[command(subcommand)]
+        command: MissionCommand,
+    },
+
     /// Inspect or trigger Deployment rollouts
     Rollout {
         #[command(subcommand)]
@@ -617,6 +629,105 @@ enum Command {
     CodexAppSessionServe {
         #[arg(long, value_hint = ValueHint::FilePath)]
         manifest: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MissionCommand {
+    /// Create an operational mission ledger entry
+    Create {
+        #[arg(long)]
+        title: String,
+
+        #[arg(long)]
+        objective: Option<String>,
+
+        #[arg(long)]
+        priority: Option<String>,
+
+        #[arg(long)]
+        owner: Option<String>,
+
+        #[arg(long = "label", alias = "lbl")]
+        labels: Vec<String>,
+
+        #[arg(long = "ticket", alias = "t", value_hint = ValueHint::FilePath)]
+        tickets: Vec<PathBuf>,
+
+        #[arg(long = "namespace", visible_alias = "ns")]
+        namespaces: Vec<String>,
+
+        #[arg(long = "node", alias = "n")]
+        nodes: Vec<String>,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// List mission ledger entries
+    List {
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Show one mission with its event timeline
+    Show {
+        id: String,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Append a stage event and optional runtime/evidence links
+    Event {
+        id: String,
+
+        #[arg(long)]
+        stage: String,
+
+        #[arg(long)]
+        status: String,
+
+        #[arg(long)]
+        summary: String,
+
+        #[arg(long = "ticket", alias = "t", value_hint = ValueHint::FilePath)]
+        ticket: Option<PathBuf>,
+
+        #[arg(long = "namespace", visible_alias = "ns")]
+        namespace: Option<String>,
+
+        #[arg(long = "node", alias = "n")]
+        node: Option<String>,
+
+        #[arg(long)]
+        visit: Option<String>,
+
+        #[arg(long)]
+        approval: Option<String>,
+
+        #[arg(long = "evidence", alias = "ev")]
+        evidence: Vec<String>,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Mark a mission complete, failed, or cancelled with an outcome
+    Complete {
+        id: String,
+
+        #[arg(long, default_value = "completed")]
+        status: String,
+
+        #[arg(long)]
+        outcome: String,
+
+        #[arg(long = "evidence", alias = "ev")]
+        evidence: Vec<String>,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
     },
 }
 
@@ -1368,6 +1479,7 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             output,
         } => describe_resource(kind, &name, resource_namespace.as_deref(), output),
         Command::Node { command } => node_command(command),
+        Command::Mission { command } => mission_command(command),
         Command::Rollout { command } => rollout_command(command),
         Command::Kube { command } => kube_command(command),
         Command::Dashboard {
@@ -2753,6 +2865,103 @@ fn parse_key_value_pairs(
         parsed.insert(key.to_string(), val.trim().to_string());
     }
     Ok(parsed)
+}
+
+fn mission_command(command: MissionCommand) -> Result<(), JarvisError> {
+    match command {
+        MissionCommand::Create {
+            title,
+            objective,
+            priority,
+            owner,
+            labels,
+            tickets,
+            namespaces,
+            nodes,
+            output,
+        } => {
+            let mission = create_mission(MissionCreateOptions {
+                title,
+                objective,
+                priority,
+                owner,
+                labels: parse_key_value_pairs(&labels)?,
+                tickets,
+                namespaces,
+                nodes,
+            })
+            .map_err(JarvisError::from)?;
+            let detail = show_mission(&mission.id).map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_mission_detail_output(&detail, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        MissionCommand::List { output } => {
+            let missions = list_missions().map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_missions_output(&missions, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        MissionCommand::Show { id, output } => {
+            let detail = show_mission(&id).map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_mission_detail_output(&detail, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        MissionCommand::Event {
+            id,
+            stage,
+            status,
+            summary,
+            ticket,
+            namespace,
+            node,
+            visit,
+            approval,
+            evidence,
+            output,
+        } => {
+            let detail = append_mission_event(MissionEventOptions {
+                mission_id: id,
+                stage,
+                status,
+                summary,
+                ticket,
+                namespace,
+                node,
+                visit,
+                approval,
+                evidence,
+            })
+            .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_mission_detail_output(&detail, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        MissionCommand::Complete {
+            id,
+            status,
+            outcome,
+            evidence,
+            output,
+        } => {
+            let detail =
+                complete_mission(&id, &status, &outcome, evidence).map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_mission_detail_output(&detail, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+    }
 }
 
 fn rollout_command(command: RolloutCommand) -> Result<(), JarvisError> {

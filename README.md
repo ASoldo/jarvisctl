@@ -281,6 +281,18 @@ jarvis_node_retries: 1
 
 Auth lease events are appended to `~/.jarvis/codex/audit.jsonl` without recording token contents. The capsule key is stored at `~/.jarvis/codex/capsule.key` with mode `0600` and copied to nodes during visits/bootstrap so capsules are protected in transit and at rest in temporary files.
 
+Mission ledger commands connect business objectives to the operational evidence produced by tickets, namespaces, nodes, visits, approvals, transcripts, and outcomes:
+
+```bash
+jarvisctl mission create --title "CV triage automation" --objective "Rank candidates for HR review" --priority high --owner ops --ticket /home/rootster/codex/Tickets/cv-triage.md --node auto
+jarvisctl mission event <mission-id> --stage task --status running --summary "Started remote review" --namespace cv-triage --node archiebald --evidence transcript:/tmp/cv.jsonl
+jarvisctl mission complete <mission-id> --outcome "Shortlist ready for HR review" --evidence report:/tmp/shortlist.md
+jarvisctl mission list
+jarvisctl mission show <mission-id>
+```
+
+Mission records live under `~/.jarvis/codex/missions/` with append-only event timelines under `~/.jarvis/codex/mission-events/`. They are intentionally separate from tickets: the ticket remains the execution contract, while the mission ledger is the cross-run decision and evidence object.
+
 Node inspection and cleanup support the visit lifecycle:
 
 ```bash
