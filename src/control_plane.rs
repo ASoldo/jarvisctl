@@ -2300,7 +2300,7 @@ fn pair_intro_message(
     shared_message: &str,
 ) -> String {
     format!(
-        "Paired cluster workload '{coordination_id}' started.\n\nYour node: {own_node}\nYour namespace: {own_namespace}\nPartner node: {partner_node}\nPartner namespace: {partner_namespace}\nCoordination note on the control plane: {}\n\nProtocol:\n- Do your node-local part of the task in your own workspace.\n- Keep findings concise so they can be relayed to the partner namespace.\n- If you need the partner, state exactly what information or action you need.\n- Record final node-local outcome in your ticket.\n\nShared operator message:\n{shared_message}",
+        "Paired cluster workload '{coordination_id}' started.\n\nYour node: {own_node}\nYour namespace: {own_namespace}\nPartner node: {partner_node}\nPartner namespace: {partner_namespace}\nCoordination note on the control plane: {}\n\nProtocol:\n- Do your node-local part of the task in your own workspace.\n- Send partner messages with: `jarvisctl tell --namespace {partner_namespace} --text '<message>' --mode auto`.\n- Keep partner messages concise and include what you need or what you learned.\n- If you spawn subagents, keep their outputs summarized in this namespace before relaying across nodes.\n- Record final node-local outcome in your ticket.\n\nShared operator message:\n{shared_message}",
         coordination_note.display()
     )
 }
