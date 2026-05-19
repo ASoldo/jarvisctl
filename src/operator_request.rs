@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -169,8 +169,7 @@ pub fn list_operator_requests() -> anyhow::Result<Vec<OperatorRequestRecord>> {
         }
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read '{}'", path.display()))?;
-        let record: OperatorRequestRecord = serde_json::from_str(&raw)
-            .with_context(|| format!("failed to parse '{}'", path.display()))?;
+        let record = parse_operator_request_record(&raw, &path)?;
         records.push(record);
     }
     records.sort_by(|left, right| right.created_at_epoch_ms.cmp(&left.created_at_epoch_ms));
@@ -181,7 +180,7 @@ pub fn show_operator_request(id: &str) -> anyhow::Result<OperatorRequestRecord> 
     let path = operator_request_path(id)?;
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("failed to read '{}'", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| format!("failed to parse '{}'", path.display()))
+    parse_operator_request_record(&raw, &path)
 }
 
 pub fn resolve_operator_request(
@@ -356,6 +355,26 @@ fn write_operator_request(record: &OperatorRequestRecord) -> anyhow::Result<()> 
         .with_context(|| format!("failed to move '{}' to '{}'", tmp.display(), path.display()))
 }
 
+fn parse_operator_request_record(
+    raw: &str,
+    path: &Path,
+) -> anyhow::Result<OperatorRequestRecord> {
+    match serde_json::from_str(raw) {
+        Ok(record) => Ok(record),
+        Err(strict_error) => {
+            let mut stream = serde_json::Deserializer::from_str(raw)
+                .into_iter::<OperatorRequestRecord>();
+            match stream.next() {
+                Some(Ok(record)) => Ok(record),
+                Some(Err(stream_error)) => Err(stream_error)
+                    .with_context(|| format!("failed to parse '{}'", path.display())),
+                None => Err(strict_error)
+                    .with_context(|| format!("failed to parse '{}'", path.display())),
+            }
+        }
+    }
+}
+
 fn operator_request_path(id: &str) -> anyhow::Result<PathBuf> {
     Ok(operator_requests_dir()?.join(format!("{id}.json")))
 }
@@ -426,10 +445,33 @@ fn slugify(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::slugify;
+    use super::{parse_operator_request_record, slugify};
+    use std::path::Path;
 
     #[test]
     fn slugify_operator_request_title() {
         assert_eq!(slugify("Sudo: install package"), "sudo-install-package");
+    }
+
+    #[test]
+    fn parse_operator_request_ignores_stale_trailing_json() {
+        let raw = r#"{
+  "id": "demo",
+  "title": "Demo",
+  "kind": "operator",
+  "status": "approved",
+  "severity": "medium",
+  "reason": "test",
+  "created_at_epoch_ms": 1,
+  "updated_at_epoch_ms": 2,
+  "expires_at_epoch_ms": 3
+}ms": 2,
+  "expires_at_epoch_ms": 3
+}"#;
+
+        let record = parse_operator_request_record(raw, Path::new("demo.json")).unwrap();
+
+        assert_eq!(record.id, "demo");
+        assert_eq!(record.status, "approved");
     }
 }
