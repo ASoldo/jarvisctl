@@ -237,7 +237,16 @@ pub fn validate_capability(id: &str) -> anyhow::Result<CapabilityValidationRepor
         .iter()
         .filter(|result| result.status == "skipped")
         .count();
-    let status = if failed == 0 { "passed" } else { "failed" }.to_string();
+    let status = if failed > 0 {
+        "failed"
+    } else if passed == 0 {
+        "skipped"
+    } else if skipped > 0 {
+        "partial"
+    } else {
+        "passed"
+    }
+    .to_string();
     Ok(CapabilityValidationReport {
         id: capability.id,
         status,
