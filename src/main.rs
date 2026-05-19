@@ -20,6 +20,7 @@ use tracing::{error, info, instrument};
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 mod agent;
+mod autonomy;
 mod board;
 mod capability;
 mod codex;
@@ -38,6 +39,11 @@ mod ticket;
 mod tui;
 
 use agent::spawn_agent;
+use autonomy::{
+    AutonomyDaemonOptions, AutonomyServiceInstallOptions, autonomy_service_status,
+    install_autonomy_user_service, reconcile_from_records, render_autonomy_service_install,
+    render_autonomy_service_status, run_autonomy_daemon, uninstall_autonomy_user_service,
+};
 use capability::{
     CapabilityRegisterOptions, list_capabilities, reconcile_autonomy, register_capability,
     render_autonomy_reconcile_output, render_capabilities_output, render_capability_output,
@@ -976,6 +982,51 @@ enum AutonomyCommand {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
 
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Run the autonomy reconciler continuously for supervised foreground use
+    Daemon {
+        #[arg(long = "interval-seconds", alias = "interval", default_value_t = 300)]
+        interval_seconds: u64,
+
+        #[arg(long, default_value_t = true)]
+        notify: bool,
+
+        #[arg(long, default_value_t = false)]
+        once: bool,
+    },
+
+    /// Install or update the user-systemd autonomy timer
+    InstallUserService {
+        #[arg(long = "interval-seconds", alias = "interval", default_value_t = 300)]
+        interval_seconds: u64,
+
+        #[arg(long, default_value_t = true, default_missing_value = "true", num_args = 0..=1, require_equals = true)]
+        notify: bool,
+
+        #[arg(long, default_value_t = true, default_missing_value = "true", num_args = 0..=1, require_equals = true)]
+        enable: bool,
+
+        #[arg(long, default_value_t = true, default_missing_value = "true", num_args = 0..=1, require_equals = true)]
+        start: bool,
+
+        #[arg(long = "request-linger", default_value_t = true, default_missing_value = "true", num_args = 0..=1, require_equals = true)]
+        request_linger: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Show the user-systemd autonomy timer state
+    ServiceStatus {
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Disable and remove the user-systemd autonomy timer
+    UninstallUserService {
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
@@ -3530,6 +3581,61 @@ fn autonomy_command(command: AutonomyCommand) -> Result<(), JarvisError> {
             println!(
                 "{}",
                 render_autonomy_reconcile_output(&report, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        AutonomyCommand::Daemon {
+            interval_seconds,
+            notify,
+            once,
+        } => run_autonomy_daemon(
+            AutonomyDaemonOptions {
+                interval_seconds,
+                notify,
+                once,
+            },
+            |notify, dry_run| {
+                let missions = list_missions()?;
+                let proposals = list_proposals()?;
+                reconcile_from_records(&missions, &proposals, notify, dry_run)
+            },
+        )
+        .map_err(JarvisError::from),
+        AutonomyCommand::InstallUserService {
+            interval_seconds,
+            notify,
+            enable,
+            start,
+            request_linger,
+            output,
+        } => {
+            let report = install_autonomy_user_service(AutonomyServiceInstallOptions {
+                interval_seconds,
+                notify,
+                enable,
+                start,
+                request_linger,
+            })
+            .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_autonomy_service_install(&report, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        AutonomyCommand::ServiceStatus { output } => {
+            let status = autonomy_service_status().map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_autonomy_service_status(&status, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        AutonomyCommand::UninstallUserService { output } => {
+            let status = uninstall_autonomy_user_service().map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_autonomy_service_status(&status, output).map_err(JarvisError::from)?
             );
             Ok(())
         }

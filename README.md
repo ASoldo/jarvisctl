@@ -336,9 +336,14 @@ jarvisctl capability validate
 jarvisctl capability register --id custom-worker --title "Custom worker" --lane typed-worker-lane --description "Bounded worker lane"
 jarvisctl autonomy reconcile --dry-run
 jarvisctl autonomy reconcile --notify
+jarvisctl autonomy daemon --once
+jarvisctl autonomy install-user-service --interval-seconds 300 --notify=true --enable=true --start=true
+jarvisctl autonomy service-status
 ```
 
 The built-in capability registry models remote Codex sessions, bounded worker offload, and operator proposal gating. Each capability carries validators, artifact contracts, evidence, and gaps. `autonomy reconcile` expires stale requests, sends optional persistent desktop notifications, validates capability lanes, and separates safe actions from decision-grade blockers.
+
+`autonomy daemon` runs the reconciler in the foreground for supervised testing. Production machines should use `autonomy install-user-service`, which writes a `jarvisctl-autonomy.service` and `jarvisctl-autonomy.timer` under `~/.config/systemd/user/`. If linger is disabled, the installer creates a durable sudo operator request for `loginctl enable-linger <user>` so the timer can keep running after the operator logs out without prompting for credentials inline.
 
 Protocol drift for the Codex app-server integration is checked with:
 
