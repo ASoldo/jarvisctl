@@ -11,7 +11,7 @@ Checked against Codex CLI `0.131.0` and the generated experimental app-server sc
 - Experimental app-server fields require `initialize.capabilities.experimentalApi = true`.
 - `permissions` is a named profile string in `thread/start`, `thread/resume`, and `turn/start`; extra writable roots map to `runtimeWorkspaceRoots`.
 - `codex_memory_mode` is applied after thread creation with `thread/memoryMode/set`.
-- Server-initiated request methods now include command/file/permission approvals, MCP elicitation, tool user input, dynamic tool calls, auth refresh, and attestation. `jarvisctl` records these as blocked operator events and returns a JSON-RPC error until the Obsidian approval bridge is implemented.
+- Server-initiated request methods now include command/file/permission approvals, MCP elicitation, tool user input, dynamic tool calls, auth refresh, and attestation. `jarvisctl` records these as blocked operator events, mirrors them into the durable operator-request queue, and waits up to 12 hours for an Obsidian or CLI response before returning a JSON-RPC timeout.
 - Historical thread data is read with `thread/read` and `includeTurns`; each returned turn carries `itemsView`.
 - `thread/goal/set`, `thread/goal/updated`, and `thread/goal/cleared` are first-class goal lifecycle events.
 - Live threads pick up config changes without a restart, so Jarvis should keep durable launch state in tickets and runtime metadata instead of restarting sessions to refresh every Codex config change.
@@ -86,5 +86,5 @@ The Obsidian plugin can read `jarvisctl list --json` and use:
 ## Not mapped yet
 
 - Historical thread reads are exposed through `jarvisctl history --namespace <name> --json`. The Obsidian plugin can use this for compact turn history without parsing transcript files.
-- Approval and elicitation server requests are not yet an interactive Jarvis approval UI. They are surfaced as blocked runtime events instead of hanging the app-server reader.
+- Approval and elicitation server requests are also surfaced through `jarvisctl operator-request list` and the Obsidian Mission Chain operator-request card. A linked request can be resolved from the dashboard or with `jarvisctl operator-request resolve`, which also responds to the waiting app-server request when the namespace/request id is still live.
 - App/plugin/skill mention inputs are passed through prompt text today. A richer Obsidian composer can add structured `skill`, `mention`, and `localImage` input items later.

@@ -2,6 +2,10 @@ use crate::native::{
     NativeAgentMetadata, NativeSessionMetadata, RuntimeContextMetadata, RuntimeFeedEntry,
     RuntimeServerRequest, RuntimeSubagentAction, RuntimeSubagentMetadata,
 };
+use crate::operator_request::{
+    OperatorRequestResolveOptions, expire_operator_request, resolve_operator_request,
+    upsert_server_operator_request,
+};
 use crate::tui::view_agent;
 use anyhow::{Context, anyhow, bail, ensure};
 use base64::Engine;
@@ -37,7 +41,7 @@ const FEED_LIMIT: usize = 18;
 const SUBAGENT_LIMIT: usize = 24;
 const SUBAGENT_ACTION_LIMIT: usize = 6;
 const SERVER_REQUEST_LIMIT: usize = 16;
-const SERVER_REQUEST_TIMEOUT_SECONDS: u64 = 900;
+const SERVER_REQUEST_TIMEOUT_SECONDS: u64 = 12 * 60 * 60;
 static CONTROL_QUEUE_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,6 +358,9 @@ impl CodexAppSession {
             None,
             None,
         )?;
+        let operator_request =
+            upsert_server_operator_request(&self.namespace, &request_id, method, params.clone())
+                .ok();
 
         let resolution = rx.recv_timeout(Duration::from_secs(SERVER_REQUEST_TIMEOUT_SECONDS));
         self.pending_server_requests
@@ -363,15 +370,28 @@ impl CodexAppSession {
         match resolution {
             Ok(resolution) => {
                 if let Some(error) = resolution.error.filter(|value| !value.trim().is_empty()) {
+                    let response = resolution.response.clone();
                     self.record_server_request(
                         &request_id,
                         method,
                         "denied",
                         Some(error.clone()),
                         Some(params),
-                        resolution.response,
+                        response.clone(),
                         Some(error.clone()),
                     )?;
+                    if let Some(operator_request) = &operator_request {
+                        let _ = resolve_operator_request(
+                            &operator_request.id,
+                            OperatorRequestResolveOptions {
+                                status: "denied".to_string(),
+                                response,
+                                error: Some(error.clone()),
+                                decided_by: Some("operator".to_string()),
+                                decision: Some(error.clone()),
+                            },
+                        );
+                    }
                     return self.send_json(&json!({
                         "id": id,
                         "error": {
@@ -390,6 +410,20 @@ impl CodexAppSession {
                     Some(response.clone()),
                     None,
                 )?;
+                if let Some(operator_request) = &operator_request {
+                    let _ = resolve_operator_request(
+                        &operator_request.id,
+                        OperatorRequestResolveOptions {
+                            status: "approved".to_string(),
+                            response: Some(response.clone()),
+                            error: None,
+                            decided_by: Some("operator".to_string()),
+                            decision: Some(
+                                "Operator response sent to app-server request.".to_string(),
+                            ),
+                        },
+                    );
+                }
                 self.send_json(&json!({
                     "id": id,
                     "result": response,
@@ -409,6 +443,9 @@ impl CodexAppSession {
                     None,
                     Some(message.clone()),
                 )?;
+                if let Some(operator_request) = &operator_request {
+                    let _ = expire_operator_request(&operator_request.id, &message);
+                }
                 self.send_json(&json!({
                     "id": id,
                     "error": {

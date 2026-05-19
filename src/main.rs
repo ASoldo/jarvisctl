@@ -27,6 +27,7 @@ mod control_plane;
 mod dispatch;
 mod mission;
 mod native;
+mod operator_request;
 mod orchestration;
 mod proposal;
 mod runtime;
@@ -67,6 +68,11 @@ use mission::{
 };
 use native::{
     NativeSessionMetadata, RuntimeContextMetadata, serve_native_session, spawn_native_session,
+};
+use operator_request::{
+    OperatorRequestCreateOptions, OperatorRequestResolveOptions, create_operator_request,
+    list_operator_requests, render_operator_request_output, render_operator_requests_output,
+    resolve_operator_request, show_operator_request,
 };
 use orchestration::{
     default_autonomy_policy, plan_missions, render_autonomy_policy_output,
@@ -410,6 +416,13 @@ enum Command {
     Proposal {
         #[command(subcommand)]
         command: ProposalCommand,
+    },
+
+    /// Manage durable operator/admin requests and notifications
+    #[command(alias = "notify", alias = "operator-requests")]
+    OperatorRequest {
+        #[command(subcommand)]
+        command: OperatorRequestCommand,
     },
 
     /// Inspect or trigger Deployment rollouts
@@ -839,6 +852,124 @@ enum ProposalCommand {
 
         #[arg(long = "decided-by", alias = "by")]
         decided_by: Option<String>,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum OperatorRequestCommand {
+    /// Create a durable operator/admin request
+    Create {
+        #[arg(long)]
+        title: String,
+
+        #[arg(long, default_value = "operator")]
+        kind: String,
+
+        #[arg(long, default_value = "medium")]
+        severity: String,
+
+        #[arg(long)]
+        reason: String,
+
+        #[arg(long)]
+        risk: Option<String>,
+
+        #[arg(long = "requested-by", alias = "by")]
+        requested_by: Option<String>,
+
+        #[arg(long = "namespace", visible_alias = "ns")]
+        namespace: Option<String>,
+
+        #[arg(long = "request-id", visible_alias = "id")]
+        request_id: Option<String>,
+
+        #[arg(long)]
+        method: Option<String>,
+
+        #[arg(long)]
+        command: Option<String>,
+
+        #[arg(long = "params-json")]
+        params_json: Option<String>,
+
+        #[arg(long = "ttl-seconds", default_value_t = 12 * 60 * 60)]
+        ttl_seconds: u64,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Create a privileged-action request with command and reasoning
+    Sudo {
+        #[arg(long)]
+        title: String,
+
+        #[arg(long)]
+        reason: String,
+
+        #[arg(long)]
+        command: String,
+
+        #[arg(long)]
+        risk: Option<String>,
+
+        #[arg(long = "requested-by", alias = "by", default_value = "agent")]
+        requested_by: String,
+
+        #[arg(long = "namespace", visible_alias = "ns")]
+        namespace: Option<String>,
+
+        #[arg(long = "ttl-seconds", default_value_t = 12 * 60 * 60)]
+        ttl_seconds: u64,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// List operator/admin requests
+    List {
+        #[arg(long)]
+        status: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        all: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Show one operator/admin request
+    Show {
+        id: String,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Resolve a request, optionally responding to a linked app-server request
+    Resolve {
+        id: String,
+
+        #[arg(long, default_value = "approved")]
+        status: String,
+
+        #[arg(long = "response-json", conflicts_with = "error")]
+        response_json: Option<String>,
+
+        #[arg(long, conflicts_with = "response_json")]
+        error: Option<String>,
+
+        #[arg(long = "decided-by", alias = "by")]
+        decided_by: Option<String>,
+
+        #[arg(long)]
+        decision: Option<String>,
+
+        #[arg(long)]
+        mission: Option<String>,
 
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
@@ -1598,6 +1729,7 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         Command::Node { command } => node_command(command),
         Command::Mission { command } => mission_command(command),
         Command::Proposal { command } => proposal_command(command),
+        Command::OperatorRequest { command } => operator_request_command(command),
         Command::Rollout { command } => rollout_command(command),
         Command::Kube { command } => kube_command(command),
         Command::Dashboard {
@@ -3218,6 +3350,207 @@ fn proposal_command(command: ProposalCommand) -> Result<(), JarvisError> {
             Ok(())
         }
     }
+}
+
+fn operator_request_command(command: OperatorRequestCommand) -> Result<(), JarvisError> {
+    match command {
+        OperatorRequestCommand::Create {
+            title,
+            kind,
+            severity,
+            reason,
+            risk,
+            requested_by,
+            namespace,
+            request_id,
+            method,
+            command,
+            params_json,
+            ttl_seconds,
+            output,
+        } => {
+            let params = parse_optional_json(params_json.as_deref(), "--params-json")?;
+            let record = create_operator_request(OperatorRequestCreateOptions {
+                title,
+                kind,
+                severity,
+                reason,
+                risk,
+                requested_by,
+                namespace,
+                request_id,
+                method,
+                command,
+                params,
+                ttl_seconds: Some(ttl_seconds),
+            })
+            .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_operator_request_output(&record, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        OperatorRequestCommand::Sudo {
+            title,
+            reason,
+            command,
+            risk,
+            requested_by,
+            namespace,
+            ttl_seconds,
+            output,
+        } => {
+            let record = create_operator_request(OperatorRequestCreateOptions {
+                title,
+                kind: "sudo".to_string(),
+                severity: "high".to_string(),
+                reason,
+                risk: risk.or_else(|| {
+                    Some(
+                        "This requires administrator privileges and may mutate the host."
+                            .to_string(),
+                    )
+                }),
+                requested_by: Some(requested_by),
+                namespace,
+                request_id: None,
+                method: Some("sudo".to_string()),
+                command: Some(command),
+                params: None,
+                ttl_seconds: Some(ttl_seconds),
+            })
+            .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_operator_request_output(&record, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        OperatorRequestCommand::List {
+            status,
+            all,
+            output,
+        } => {
+            let mut records = list_operator_requests().map_err(JarvisError::from)?;
+            if !all {
+                let wanted = status.unwrap_or_else(|| "pending".to_string());
+                records.retain(|record| record.status == wanted);
+            } else if let Some(wanted) = status {
+                records.retain(|record| record.status == wanted);
+            }
+            println!(
+                "{}",
+                render_operator_requests_output(&records, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        OperatorRequestCommand::Show { id, output } => {
+            let record = show_operator_request(&id).map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_operator_request_output(&record, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        OperatorRequestCommand::Resolve {
+            id,
+            status,
+            response_json,
+            error,
+            decided_by,
+            decision,
+            mission,
+            output,
+        } => {
+            let response = parse_optional_json(response_json.as_deref(), "--response-json")?;
+            let existing = show_operator_request(&id).map_err(JarvisError::from)?;
+            if let (Some(namespace), Some(request_id)) = (
+                existing.namespace.as_deref(),
+                existing.request_id.as_deref(),
+            ) {
+                if status == "approved" || status == "resolved" || status == "denied" {
+                    let response_for_request = if status == "denied" {
+                        None
+                    } else {
+                        response.clone().or(Some(serde_json::Value::Null))
+                    };
+                    let error_for_request = if status == "denied" {
+                        error
+                            .as_deref()
+                            .or(decision.as_deref())
+                            .or(Some("Denied by operator"))
+                    } else {
+                        error.as_deref()
+                    };
+                    if let Err(local_error) = respond_runtime_server_request(
+                        namespace,
+                        request_id,
+                        response_for_request.clone(),
+                        error_for_request.map(ToOwned::to_owned),
+                    ) {
+                        if !respond_cluster_runtime_server_request(
+                            namespace,
+                            request_id,
+                            response_for_request.as_ref(),
+                            error_for_request,
+                        )
+                        .map_err(JarvisError::from)?
+                        {
+                            return Err(JarvisError::from(local_error));
+                        }
+                    }
+                    append_cli_mission_event(
+                        mission.as_deref(),
+                        "authorize",
+                        if status == "denied" {
+                            "denied"
+                        } else {
+                            "approved"
+                        },
+                        format!(
+                            "Resolved operator request '{}' for namespace '{}'.",
+                            id, namespace
+                        ),
+                        None,
+                        Some(namespace.to_string()),
+                        None,
+                        None,
+                        Some(id.clone()),
+                        Vec::new(),
+                    )?;
+                }
+            }
+            let record = resolve_operator_request(
+                &id,
+                OperatorRequestResolveOptions {
+                    status,
+                    response,
+                    error,
+                    decided_by,
+                    decision,
+                },
+            )
+            .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_operator_request_output(&record, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+    }
+}
+
+fn parse_optional_json(
+    raw: Option<&str>,
+    flag: &str,
+) -> Result<Option<serde_json::Value>, JarvisError> {
+    raw.map(|value| {
+        serde_json::from_str::<serde_json::Value>(value).map_err(|parse_error| {
+            JarvisError::Other(anyhow::anyhow!("{flag} must be valid JSON: {parse_error}"))
+        })
+    })
+    .transpose()
 }
 
 #[allow(clippy::too_many_arguments)]

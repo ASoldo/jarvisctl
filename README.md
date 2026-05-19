@@ -314,6 +314,17 @@ jarvisctl proposal show <proposal-id>
 
 Use proposals for credentials, paid endpoint onboarding, production mutations, external runtime installs, broad file rewrites, and worker-lane promotion decisions.
 
+Operator requests are durable admin/operator notifications that survive dashboard reloads and normal login churn. They are stored under `~/.jarvis/codex/operator-requests/` and default to a 12-hour response window. Codex app-server approval/input requests are mirrored into this queue, and explicit privileged work can create a sudo request without storing credentials:
+
+```bash
+jarvisctl operator-request sudo --title "Install package" --reason "Needed for validator smoke" --command "sudo pacman -S package"
+jarvisctl operator-request list
+jarvisctl operator-request resolve <request-id> --status approved --decision "Approved for this maintenance window."
+jarvisctl notify list --output json
+```
+
+The request record stores title, reason, risk, command/context, namespace/request links, and decision metadata. It does not store passwords, tokens, or other secrets.
+
 Protocol drift for the Codex app-server integration is checked with:
 
 ```bash
