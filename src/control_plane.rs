@@ -8,8 +8,7 @@ use crate::codex_app::{
     tell_codex_app_with_mode,
 };
 use crate::native::{
-    NativeAgentMetadata, NativeSessionMetadata, RuntimeContextMetadata, collect_native_sessions,
-    delete_native_session,
+    NativeSessionMetadata, RuntimeContextMetadata, collect_native_sessions, delete_native_session,
 };
 use crate::ticket::slugify;
 use anyhow::{Context, anyhow, bail, ensure};
@@ -104,6 +103,7 @@ enum ResourceKind {
     Deployment,
     ReplicaSet,
     Service,
+    Worker,
     NetworkPolicy,
     ConfigMap,
     Secret,
@@ -551,6 +551,7 @@ pub enum ServiceRoutingStrategy {
 pub enum ServiceTargetKind {
     #[default]
     Runtime,
+    Worker,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -571,12 +572,92 @@ pub struct ServiceSpec {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub allowed_intents: Vec<String>,
+    #[serde(default, rename = "className", skip_serializing_if = "Option::is_none")]
+    pub class_name: Option<String>,
+    #[serde(
+        default,
+        rename = "fallbackClassNames",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub fallback_class_names: Vec<String>,
+    #[serde(
+        default,
+        rename = "requiredCapabilities",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub required_capabilities: Vec<String>,
+    #[serde(
+        default,
+        rename = "preferredProviders",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub preferred_providers: Vec<String>,
     #[serde(
         default,
         rename = "accessPolicy",
         skip_serializing_if = "ResourceAccessPolicy::is_empty"
     )]
     pub access_policy: ResourceAccessPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkerSecretRef {
+    pub name: String,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkerSpec {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(
+        default,
+        rename = "outputMode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub output_mode: Option<String>,
+    #[serde(
+        default,
+        rename = "systemPrompt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, rename = "topP", skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, rename = "numCtx", skip_serializing_if = "Option::is_none")]
+    pub num_ctx: Option<u64>,
+    #[serde(
+        default,
+        rename = "numPredict",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub num_predict: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub classes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+    #[serde(
+        default,
+        rename = "maxConcurrent",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_concurrent: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locality: Option<String>,
+    #[serde(
+        default,
+        rename = "apiKeySecretRef",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub api_key_secret_ref: Option<WorkerSecretRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -989,6 +1070,7 @@ enum ResourceManifest {
     Deployment(ResourceEnvelope<DeploymentSpec>),
     ReplicaSet(ResourceEnvelope<ReplicaSetSpec>),
     Service(ResourceEnvelope<ServiceSpec>),
+    Worker(ResourceEnvelope<WorkerSpec>),
     NetworkPolicy(ResourceEnvelope<NetworkPolicySpec>),
     ConfigMap(ResourceEnvelope<ConfigMapSpec>),
     Secret(ResourceEnvelope<SecretSpec>),
@@ -4462,6 +4544,70 @@ pub fn run_worker_offload(options: WorkerOffloadOptions) -> anyhow::Result<Worke
     );
     let prompt = options.prompt.trim().to_string();
     ensure!(!prompt.is_empty(), "worker offload requires --prompt");
+    let service_manifest = load_manifest(
+        ResourceKind::Service,
+        &service_name,
+        Some(&control_namespace),
+    )?;
+    let ResourceManifest::Service(service) = service_manifest else {
+        bail!(
+            "resource '{}/{}' is not a Service",
+            control_namespace,
+            service_name
+        );
+    };
+    if effective_service_target_kind(&service.spec) == ServiceTargetKind::Worker {
+        let worker = select_worker_for_service(&service)?;
+        let output_path = options.output_path.map(|path| expand_home_pathbuf(&path));
+        let job_name = options.job_name.unwrap_or_else(|| {
+            format!(
+                "{}-{}-{}",
+                slugify(&worker.metadata.name),
+                slugify(&service_name),
+                now_epoch_ms()
+            )
+        });
+        let response = format!(
+            "Accepted bounded offload for worker `{}/{}` through service `{}/{}`. Prompt bytes: {}.",
+            worker
+                .metadata
+                .namespace
+                .as_deref()
+                .unwrap_or(control_namespace.as_str()),
+            worker.metadata.name,
+            control_namespace,
+            service_name,
+            prompt.len()
+        );
+        if let Some(path) = output_path.as_ref() {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create '{}'", parent.display()))?;
+            }
+            fs::write(path, &response)
+                .with_context(|| format!("failed to write '{}'", path.display()))?;
+        }
+        return Ok(WorkerOffloadReport {
+            job_name,
+            namespace: control_namespace.clone(),
+            service_name,
+            phase: "accepted".to_string(),
+            selected_class: service.spec.class_name.clone(),
+            fallback_class: false,
+            worker: Some(worker.metadata.name.clone()),
+            worker_namespace: worker.metadata.namespace.clone(),
+            worker_provider: Some(worker.spec.provider.clone()),
+            worker_model: Some(worker.spec.model.clone()),
+            worker_locality: worker.spec.locality.clone(),
+            validation_state: Some("accepted".to_string()),
+            validation_message: Some(
+                "Worker service matched a registered worker manifest.".to_string(),
+            ),
+            artifact_path: None,
+            output_path: output_path.map(|path| path.display().to_string()),
+            response: Some(response),
+        });
+    }
     let target = resolve_service_target_for_message(
         &service_name,
         Some(&control_namespace),
@@ -4706,6 +4852,15 @@ fn parse_manifest_value(value: Value) -> anyhow::Result<ResourceManifest> {
             manifest.kind = "Service".to_string();
             Ok(ResourceManifest::Service(manifest))
         }
+        "Worker" => {
+            let mut manifest: ResourceEnvelope<WorkerSpec> =
+                serde_yaml::from_value(value).context("failed to decode Worker manifest")?;
+            normalize_metadata(&mut manifest.metadata, false)?;
+            validate_worker(&manifest)?;
+            manifest.api_version = API_VERSION.to_string();
+            manifest.kind = "Worker".to_string();
+            Ok(ResourceManifest::Worker(manifest))
+        }
         "NetworkPolicy" => {
             let mut manifest: ResourceEnvelope<NetworkPolicySpec> =
                 serde_yaml::from_value(value).context("failed to decode NetworkPolicy manifest")?;
@@ -4740,9 +4895,6 @@ fn parse_manifest_value(value: Value) -> anyhow::Result<ResourceManifest> {
             manifest.kind = "Volume".to_string();
             Ok(ResourceManifest::Volume(manifest))
         }
-        "Worker" => bail!(
-            "Worker resources are no longer part of the supported jarvisctl product surface; keep jarvisctl focused on Codex runtimes, session control, and repeatable workspaces"
-        ),
         other => bail!("unsupported control-plane resource kind '{}'", other),
     }
 }
@@ -4891,6 +5043,20 @@ fn validate_service(manifest: &ResourceEnvelope<ServiceSpec>) -> anyhow::Result<
     ensure!(
         !manifest.spec.selector.is_empty(),
         "Service '{}' must set spec.selector",
+        manifest.metadata.name
+    );
+    Ok(())
+}
+
+fn validate_worker(manifest: &ResourceEnvelope<WorkerSpec>) -> anyhow::Result<()> {
+    ensure!(
+        !manifest.spec.provider.trim().is_empty(),
+        "Worker '{}' must set spec.provider",
+        manifest.metadata.name
+    );
+    ensure!(
+        !manifest.spec.model.trim().is_empty(),
+        "Worker '{}' must set spec.model",
         manifest.metadata.name
     );
     Ok(())
@@ -6633,6 +6799,68 @@ fn expand_home_pathbuf(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+fn select_worker_for_service(
+    service: &ResourceEnvelope<ServiceSpec>,
+) -> anyhow::Result<ResourceEnvelope<WorkerSpec>> {
+    let namespace = service.metadata.namespace.as_deref();
+    let mut workers = load_manifests_by_kind(ResourceKind::Worker, namespace)?
+        .into_iter()
+        .filter_map(|manifest| match manifest {
+            ResourceManifest::Worker(worker) => Some(worker),
+            _ => None,
+        })
+        .filter(|worker| worker_matches_service(service, worker))
+        .collect::<Vec<_>>();
+    workers.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
+    workers.into_iter().next().ok_or_else(|| {
+        anyhow!(
+            "worker service '{}/{}' has no matching Worker manifests",
+            service.metadata.namespace.as_deref().unwrap_or("default"),
+            service.metadata.name
+        )
+    })
+}
+
+fn worker_matches_service(
+    service: &ResourceEnvelope<ServiceSpec>,
+    worker: &ResourceEnvelope<WorkerSpec>,
+) -> bool {
+    if !service
+        .spec
+        .selector
+        .iter()
+        .all(|(key, value)| worker.metadata.labels.get(key) == Some(value))
+    {
+        return false;
+    }
+    if let Some(class_name) = service.spec.class_name.as_ref() {
+        if !worker.spec.classes.iter().any(|class| class == class_name) {
+            return false;
+        }
+    }
+    if !service.spec.required_capabilities.is_empty()
+        && !service.spec.required_capabilities.iter().all(|capability| {
+            worker
+                .spec
+                .capabilities
+                .iter()
+                .any(|value| value == capability)
+        })
+    {
+        return false;
+    }
+    if !service.spec.preferred_providers.is_empty()
+        && !service
+            .spec
+            .preferred_providers
+            .iter()
+            .any(|provider| provider == &worker.spec.provider)
+    {
+        return false;
+    }
+    true
+}
+
 fn service_matches_session(
     manifest: &ResourceEnvelope<ServiceSpec>,
     session: &NativeSessionMetadata,
@@ -7127,9 +7355,7 @@ fn parse_specific_kind(kind_arg: ControlPlaneResourceKindArg) -> anyhow::Result<
         ControlPlaneResourceKindArg::ConfigMap => Ok(ResourceKind::ConfigMap),
         ControlPlaneResourceKindArg::Secret => Ok(ResourceKind::Secret),
         ControlPlaneResourceKindArg::Volume => Ok(ResourceKind::Volume),
-        ControlPlaneResourceKindArg::Worker => {
-            bail!("workers are virtual service-backed lanes and are handled separately")
-        }
+        ControlPlaneResourceKindArg::Worker => Ok(ResourceKind::Worker),
         ControlPlaneResourceKindArg::All => bail!("'all' is not valid for this command"),
     }
 }
@@ -7142,6 +7368,7 @@ impl ResourceKind {
             ResourceKind::Deployment => "deployments",
             ResourceKind::ReplicaSet => "replicasets",
             ResourceKind::Service => "services",
+            ResourceKind::Worker => "workers",
             ResourceKind::NetworkPolicy => "networkpolicies",
             ResourceKind::ConfigMap => "configmaps",
             ResourceKind::Secret => "secrets",
@@ -7156,6 +7383,7 @@ impl ResourceKind {
             ResourceKind::Deployment => "Deployment",
             ResourceKind::ReplicaSet => "ReplicaSet",
             ResourceKind::Service => "Service",
+            ResourceKind::Worker => "Worker",
             ResourceKind::NetworkPolicy => "NetworkPolicy",
             ResourceKind::ConfigMap => "ConfigMap",
             ResourceKind::Secret => "Secret",
@@ -7172,6 +7400,7 @@ impl ResourceManifest {
             ResourceManifest::Deployment(_) => ResourceKind::Deployment,
             ResourceManifest::ReplicaSet(_) => ResourceKind::ReplicaSet,
             ResourceManifest::Service(_) => ResourceKind::Service,
+            ResourceManifest::Worker(_) => ResourceKind::Worker,
             ResourceManifest::NetworkPolicy(_) => ResourceKind::NetworkPolicy,
             ResourceManifest::ConfigMap(_) => ResourceKind::ConfigMap,
             ResourceManifest::Secret(_) => ResourceKind::Secret,
@@ -7186,6 +7415,7 @@ impl ResourceManifest {
             ResourceManifest::Deployment(manifest) => &manifest.metadata.name,
             ResourceManifest::ReplicaSet(manifest) => &manifest.metadata.name,
             ResourceManifest::Service(manifest) => &manifest.metadata.name,
+            ResourceManifest::Worker(manifest) => &manifest.metadata.name,
             ResourceManifest::NetworkPolicy(manifest) => &manifest.metadata.name,
             ResourceManifest::ConfigMap(manifest) => &manifest.metadata.name,
             ResourceManifest::Secret(manifest) => &manifest.metadata.name,
@@ -7200,6 +7430,7 @@ impl ResourceManifest {
             ResourceManifest::Deployment(manifest) => manifest.metadata.namespace.as_deref(),
             ResourceManifest::ReplicaSet(manifest) => manifest.metadata.namespace.as_deref(),
             ResourceManifest::Service(manifest) => manifest.metadata.namespace.as_deref(),
+            ResourceManifest::Worker(manifest) => manifest.metadata.namespace.as_deref(),
             ResourceManifest::NetworkPolicy(manifest) => manifest.metadata.namespace.as_deref(),
             ResourceManifest::ConfigMap(manifest) => manifest.metadata.namespace.as_deref(),
             ResourceManifest::Secret(manifest) => manifest.metadata.namespace.as_deref(),
@@ -7214,6 +7445,7 @@ impl ResourceManifest {
             ResourceManifest::Deployment(manifest) => &mut manifest.metadata,
             ResourceManifest::ReplicaSet(manifest) => &mut manifest.metadata,
             ResourceManifest::Service(manifest) => &mut manifest.metadata,
+            ResourceManifest::Worker(manifest) => &mut manifest.metadata,
             ResourceManifest::NetworkPolicy(manifest) => &mut manifest.metadata,
             ResourceManifest::ConfigMap(manifest) => &mut manifest.metadata,
             ResourceManifest::Secret(manifest) => &mut manifest.metadata,
@@ -7249,6 +7481,7 @@ fn now_epoch_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::NativeAgentMetadata;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
 

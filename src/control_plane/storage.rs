@@ -80,6 +80,7 @@ pub(crate) fn load_all_manifests(namespace: Option<&str>) -> anyhow::Result<Vec<
         ResourceKind::Deployment,
         ResourceKind::ReplicaSet,
         ResourceKind::Service,
+        ResourceKind::Worker,
         ResourceKind::NetworkPolicy,
         ResourceKind::ConfigMap,
         ResourceKind::Secret,

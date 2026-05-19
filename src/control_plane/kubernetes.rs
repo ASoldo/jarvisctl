@@ -158,6 +158,11 @@ pub(crate) fn compile_kubernetes_manifests(
                 replica_set.namespace_key(),
                 replica_set.metadata.name
             )),
+            ResourceManifest::Worker(worker) => warnings.push(format!(
+                "skipped Worker '{}/{}' because service-backed worker lanes are jarvisctl runtime resources, not Kubernetes objects",
+                worker.namespace_key(),
+                worker.metadata.name
+            )),
             ResourceManifest::Volume(volume) => warnings.push(format!(
                 "skipped Volume '{}/{}' because jarvisctl Volume resources do not yet declare a Kubernetes storage class or claim template",
                 volume.namespace_key(),

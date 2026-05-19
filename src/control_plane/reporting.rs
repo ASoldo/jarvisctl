@@ -208,6 +208,9 @@ pub(crate) fn list_worker_summaries(
     namespace: Option<&str>,
 ) -> anyhow::Result<Vec<ResourceSummary>> {
     let mut summaries = Vec::new();
+    for manifest in load_manifests_by_kind(ResourceKind::Worker, namespace)? {
+        summaries.push(resource_summary(&manifest)?);
+    }
     for manifest in load_manifests_by_kind(ResourceKind::Service, namespace)? {
         let ResourceManifest::Service(service) = manifest else {
             continue;
@@ -245,6 +248,14 @@ pub(crate) fn worker_describe_envelope(
     namespace: Option<&str>,
 ) -> anyhow::Result<WorkerDescribeEnvelope> {
     let namespace = normalize_namespaced_resource_namespace(namespace);
+    if let Ok(ResourceManifest::Worker(worker)) =
+        load_manifest(ResourceKind::Worker, name, Some(&namespace))
+    {
+        return Ok(WorkerDescribeEnvelope {
+            manifest: serde_json::to_value(&worker).context("failed to encode Worker manifest")?,
+            status: worker_status(&worker),
+        });
+    }
     let manifest = load_manifest(ResourceKind::Service, name, Some(&namespace))?;
     let ResourceManifest::Service(service) = manifest else {
         bail!(
@@ -399,6 +410,34 @@ pub(crate) fn resource_summary(manifest: &ResourceManifest) -> anyhow::Result<Re
                     "no resolved endpoints".to_string()
                 } else {
                     status.endpoints.join(", ")
+                },
+            })
+        }
+        ResourceManifest::Worker(worker) => {
+            let loaded =
+                !worker.spec.provider.trim().is_empty() && !worker.spec.model.trim().is_empty();
+            Ok(ResourceSummary {
+                kind: "Worker".to_string(),
+                namespace: worker.metadata.namespace.clone(),
+                name: worker.metadata.name.clone(),
+                status: format!(
+                    "{} ({})",
+                    worker.spec.model,
+                    if worker.spec.role.trim().is_empty() {
+                        "worker"
+                    } else {
+                        worker.spec.role.as_str()
+                    }
+                ),
+                detail: if loaded {
+                    format!(
+                        "{} · {} · pool {}",
+                        worker.spec.provider,
+                        worker.spec.locality.as_deref().unwrap_or("local"),
+                        worker.spec.pool.as_deref().unwrap_or("default")
+                    )
+                } else {
+                    "worker missing provider or model".to_string()
                 },
             })
         }
@@ -943,12 +982,80 @@ pub(crate) fn service_status(
         .collect::<Vec<_>>();
     endpoints.sort();
     Ok(ServiceStatus {
-        target_kind: "runtime".to_string(),
+        target_kind: match effective_service_target_kind(&manifest.spec) {
+            ServiceTargetKind::Runtime => "runtime",
+            ServiceTargetKind::Worker => "worker",
+        }
+        .to_string(),
         endpoints,
         strategy: manifest.spec.strategy.clone(),
         allowed_intents: manifest.spec.allowed_intents.clone(),
         access_policy: resource_access_policy_status(&manifest.spec.access_policy),
     })
+}
+
+pub(crate) fn worker_status(manifest: &ResourceEnvelope<WorkerSpec>) -> WorkerStatus {
+    let provider = manifest.spec.provider.trim().to_string();
+    let model = manifest.spec.model.trim().to_string();
+    let loaded = !provider.is_empty() && !model.is_empty();
+    let admission_code = if loaded { "ready" } else { "invalid" }.to_string();
+    let admission = if loaded { "ready" } else { "blocked" }.to_string();
+    let admission_reason = if loaded {
+        "worker manifest has provider and model".to_string()
+    } else {
+        "worker manifest must define provider and model".to_string()
+    };
+    WorkerStatus {
+        endpoint: format!(
+            "worker://{}/{}",
+            manifest.metadata.namespace.as_deref().unwrap_or("default"),
+            manifest.metadata.name
+        ),
+        loaded,
+        locality: manifest
+            .spec
+            .locality
+            .clone()
+            .unwrap_or_else(|| "local".to_string()),
+        model: if model.is_empty() {
+            "unknown".to_string()
+        } else {
+            model
+        },
+        output_mode: manifest
+            .spec
+            .output_mode
+            .clone()
+            .unwrap_or_else(|| "text".to_string()),
+        provider: if provider.is_empty() {
+            "unknown".to_string()
+        } else {
+            provider
+        },
+        role: if manifest.spec.role.trim().is_empty() {
+            "worker".to_string()
+        } else {
+            manifest.spec.role.clone()
+        },
+        capabilities: manifest.spec.capabilities.clone(),
+        classes: manifest.spec.classes.clone(),
+        pool: manifest.spec.pool.clone(),
+        max_concurrent: manifest.spec.max_concurrent.unwrap_or(1),
+        active_runs: 0,
+        pending_runs: 0,
+        available_slots: manifest.spec.max_concurrent.unwrap_or(1),
+        admission,
+        admission_code,
+        admission_reason,
+        service_name: String::new(),
+        service_namespace: manifest
+            .metadata
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "default".to_string()),
+        endpoints: vec![manifest.metadata.name.clone()],
+        allowed_intents: Vec::new(),
+    }
 }
 
 pub(crate) fn network_policy_status(
@@ -979,6 +1086,7 @@ pub(crate) fn describe_status(manifest: &ResourceManifest) -> anyhow::Result<ser
             Ok(serde_json::to_value(replica_set_status(replica_set)?)?)
         }
         ResourceManifest::Service(service) => Ok(serde_json::to_value(service_status(service)?)?),
+        ResourceManifest::Worker(worker) => Ok(serde_json::to_value(worker_status(worker))?),
         ResourceManifest::NetworkPolicy(network_policy) => Ok(serde_json::to_value(
             network_policy_status(network_policy)?,
         )?),
