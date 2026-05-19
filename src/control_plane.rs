@@ -2640,6 +2640,8 @@ pub fn start_node_pair_session(
         &first_namespace,
         &second_namespace,
     )?;
+    stage_pair_coordination_note(&options.first_node, &coordination_note)?;
+    stage_pair_coordination_note(&options.second_node, &coordination_note)?;
 
     let shared_message = options.message.clone().unwrap_or_else(|| {
         "Coordinate with the paired agent. Exchange concise findings through operator messages, keep node-specific work on your own machine, and ask for partner input when blocked.".to_string()
@@ -2761,6 +2763,46 @@ fn write_pair_coordination_note(
     );
     atomic_write_string(&path, &body)?;
     Ok(path)
+}
+
+fn stage_pair_coordination_note(node_name: &str, coordination_note: &Path) -> anyhow::Result<()> {
+    let node = load_node_manifest(node_name)?;
+    if node_is_local(&node) {
+        return Ok(());
+    }
+    let target = node_ssh_target(&node.spec)
+        .ok_or_else(|| anyhow!("Node '{}' has no SSH target", node.metadata.name))?;
+    let parent = coordination_note
+        .parent()
+        .ok_or_else(|| anyhow!("coordination note has no parent path"))?;
+    let mkdir_script = format!(
+        "mkdir -p {}",
+        shell_words::quote(&parent.display().to_string())
+    );
+    run_shell_probe(Some(&target), &mkdir_script, "remote pair note prepare")?;
+    let destination = format!("{target}:{}", coordination_note.display());
+    let status = ProcessCommand::new("scp")
+        .args([
+            "-q",
+            coordination_note
+                .to_str()
+                .ok_or_else(|| anyhow!("coordination note path is not valid UTF-8"))?,
+            &destination,
+        ])
+        .status()
+        .with_context(|| {
+            format!(
+                "failed to stage coordination note '{}' on Node '{}'",
+                coordination_note.display(),
+                node.metadata.name
+            )
+        })?;
+    ensure!(
+        status.success(),
+        "coordination note staging to Node '{}' failed with {status}",
+        node.metadata.name
+    );
+    Ok(())
 }
 
 fn pair_intro_message(

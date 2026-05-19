@@ -1124,7 +1124,7 @@ fn ensure_smoke_ticket(
             .with_context(|| format!("failed to create '{}'", parent.display()))?;
     }
     let body = format!(
-        "---\ntype: ticket\nstatus: ready_for_codex\npriority: medium\nowner: jarvisctl\nlabels:\n  - smoke\n  - two-node\n---\n\n# Two-node smoke: {node}\n\n## Objective\n{objective}\n\n## Protocol\n- Work only from node `{node}`.\n- Coordinate with partner node `{partner}` using the paired session protocol.\n- Report local Jarvis/Codex readiness, timer state, and one concise partner message.\n- Record final evidence in the mission ledger or ticket outcome.\n"
+        "---\ntype: ticket\nstatus: ready_for_codex\npriority: medium\nowner: codex\nrepo_path: /home/rootster\nlabels:\n  - smoke\n  - two-node\n---\n\n# Two-node smoke: {node}\n\n## Objective\n{objective}\n\n## Protocol\n- Work only from node `{node}`.\n- Coordinate with partner node `{partner}` using the paired session protocol.\n- Report local Jarvis/Codex readiness, timer state, and one concise partner message.\n- Record final evidence in the mission ledger or ticket outcome.\n"
     );
     fs::write(path, body).with_context(|| format!("failed to write '{}'", path.display()))
 }
