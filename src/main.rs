@@ -27,6 +27,7 @@ mod control_plane;
 mod dispatch;
 mod mission;
 mod native;
+mod orchestration;
 mod proposal;
 mod runtime;
 #[cfg(test)]
@@ -66,6 +67,10 @@ use mission::{
 };
 use native::{
     NativeSessionMetadata, RuntimeContextMetadata, serve_native_session, spawn_native_session,
+};
+use orchestration::{
+    default_autonomy_policy, plan_missions, render_autonomy_policy_output,
+    render_mission_plans_output, render_worker_lane_scorecards_output, worker_lane_scorecards,
 };
 use proposal::{
     ProposalCreateOptions, ProposalDecisionOptions, create_proposal, decide_proposal,
@@ -694,6 +699,26 @@ enum MissionCommand {
 
     /// List built-in mission templates
     Templates {
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Render autonomous next-step recommendations for mission control
+    Plan {
+        id: Option<String>,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Show autonomy guardrails for what agents may do without approval
+    Policy {
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Score orchestration lanes so autonomy only expands where evidence supports it
+    Scorecards {
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
@@ -3038,6 +3063,35 @@ fn mission_command(command: MissionCommand) -> Result<(), JarvisError> {
             println!(
                 "{}",
                 render_mission_templates_output(output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        MissionCommand::Plan { id, output } => {
+            let missions = list_missions().map_err(JarvisError::from)?;
+            let proposals = list_proposals().map_err(JarvisError::from)?;
+            let plans = plan_missions(&missions, &proposals, id.as_deref());
+            println!(
+                "{}",
+                render_mission_plans_output(&plans, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        MissionCommand::Policy { output } => {
+            let rules = default_autonomy_policy();
+            println!(
+                "{}",
+                render_autonomy_policy_output(&rules, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        MissionCommand::Scorecards { output } => {
+            let missions = list_missions().map_err(JarvisError::from)?;
+            let proposals = list_proposals().map_err(JarvisError::from)?;
+            let scorecards = worker_lane_scorecards(&missions, &proposals);
+            println!(
+                "{}",
+                render_worker_lane_scorecards_output(&scorecards, output)
+                    .map_err(JarvisError::from)?
             );
             Ok(())
         }

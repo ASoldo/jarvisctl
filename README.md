@@ -290,11 +290,16 @@ jarvisctl mission create --template cv-triage --title "CV triage automation" --o
 jarvisctl mission create --title "CV triage automation" --objective "Rank candidates for HR review" --priority high --owner ops --ticket /home/rootster/codex/Tickets/cv-triage.md --node auto
 jarvisctl mission event <mission-id> --stage task --status running --summary "Started remote review" --namespace cv-triage --node archiebald --evidence transcript:/tmp/cv.jsonl
 jarvisctl mission complete <mission-id> --outcome "Shortlist ready for HR review" --evidence report:/tmp/shortlist.md
+jarvisctl mission plan <mission-id>
+jarvisctl mission policy
+jarvisctl mission scorecards
 jarvisctl mission list
 jarvisctl mission show <mission-id>
 ```
 
 Built-in mission templates currently cover CV triage, incident response, code review, report generation, bounded worker offload, gated external runtime evaluation, and cross-node relay handoff. Tickets can set `jarvis_mission` so dispatch automatically records launch and completion events against the mission. `node start-session`, `respond-request`, and `delete` also accept `--mission <id>` for direct lifecycle capture.
+
+`mission plan` is the read-only controller view: it evaluates each mission against the current proposal queue and recommends the next bounded action. `mission policy` exposes the default autonomy gates for credentials, production mutation, bounded worker offload, and cross-node handoff. `mission scorecards` gives lane readiness for remote Codex sessions, bounded worker offload, and proposal gating so the Obsidian dashboard can show where autonomy is safe to expand and where evidence is still missing.
 
 Mission records live under `~/.jarvis/codex/missions/` with append-only event timelines under `~/.jarvis/codex/mission-events/`. They are intentionally separate from tickets: the ticket remains the execution contract, while the mission ledger is the cross-run decision and evidence object.
 
