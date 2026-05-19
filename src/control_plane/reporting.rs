@@ -240,6 +240,65 @@ pub(crate) fn list_worker_summaries(
             .cmp(&right.namespace)
             .then_with(|| left.name.cmp(&right.name))
     });
+    if env::var_os("JARVIS_WORKER_INDEX_LOCAL_ONLY").is_none() {
+        let timeout_seconds = load_or_create_orchestration_policy()
+            .map(|policy| policy.remote_index_timeout_seconds)
+            .unwrap_or(5);
+        summaries.extend(collect_remote_worker_summaries(timeout_seconds)?);
+        summaries.sort_by(|left, right| {
+            left.namespace
+                .cmp(&right.namespace)
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.detail.cmp(&right.detail))
+        });
+    }
+    Ok(summaries)
+}
+
+fn collect_remote_worker_summaries(timeout_seconds: u64) -> anyhow::Result<Vec<ResourceSummary>> {
+    let mut summaries = Vec::new();
+    let nodes = load_manifests_by_kind(ResourceKind::Node, None)?
+        .into_iter()
+        .filter_map(|manifest| match manifest {
+            ResourceManifest::Node(node) if !node_is_local(&node) => Some(node),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for node in nodes {
+        let Some(target) = node_ssh_target(&node.spec) else {
+            continue;
+        };
+        let output = ProcessCommand::new("timeout")
+            .args([
+                "--kill-after=5s",
+                &format!("{}s", timeout_seconds.max(1)),
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                &target,
+                "JARVIS_WORKER_INDEX_LOCAL_ONLY=1 jarvisctl get workers --output json",
+            ])
+            .output();
+        let Ok(output) = output else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let Ok(mut remote) = serde_json::from_slice::<Vec<ResourceSummary>>(&output.stdout) else {
+            continue;
+        };
+        for summary in &mut remote {
+            summary.detail = if summary.detail.trim().is_empty() {
+                format!("node {}", node.metadata.name)
+            } else {
+                format!("{} · node {}", summary.detail, node.metadata.name)
+            };
+        }
+        summaries.extend(remote);
+    }
     Ok(summaries)
 }
 

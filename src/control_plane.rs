@@ -1077,7 +1077,7 @@ enum ResourceManifest {
     Volume(ResourceEnvelope<VolumeSpec>),
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ResourceSummary {
     kind: String,
     namespace: Option<String>,
