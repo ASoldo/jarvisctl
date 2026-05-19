@@ -8,7 +8,8 @@ use crate::codex_app::{
     tell_codex_app_with_mode,
 };
 use crate::native::{
-    NativeSessionMetadata, RuntimeContextMetadata, collect_native_sessions, delete_native_session,
+    NativeAgentMetadata, NativeSessionMetadata, RuntimeContextMetadata, collect_native_sessions,
+    delete_native_session,
 };
 use crate::ticket::slugify;
 use anyhow::{Context, anyhow, bail, ensure};
@@ -39,7 +40,7 @@ pub use kubernetes::{apply_kubernetes_resources, render_kubernetes_resources};
 use reporting::*;
 pub use reporting::{
     render_describe_output, render_get_output, render_rollout_history_output,
-    render_rollout_status_output, wait_for_rollout_status_output,
+    render_rollout_status_output, render_worker_validation_output, wait_for_rollout_status_output,
 };
 use storage::*;
 
@@ -90,6 +91,8 @@ pub enum ControlPlaneResourceKindArg {
     Secret,
     #[value(alias = "volume", alias = "volumes")]
     Volume,
+    #[value(alias = "worker", alias = "workers")]
+    Worker,
     #[value(alias = "resources")]
     All,
 }
@@ -1101,6 +1104,76 @@ struct ServiceStatus {
     strategy: ServiceRoutingStrategy,
     allowed_intents: Vec<String>,
     access_policy: ResourceAccessPolicyStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WorkerDescribeEnvelope {
+    manifest: serde_json::Value,
+    status: WorkerStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WorkerStatus {
+    endpoint: String,
+    loaded: bool,
+    locality: String,
+    model: String,
+    output_mode: String,
+    provider: String,
+    role: String,
+    capabilities: Vec<String>,
+    classes: Vec<String>,
+    pool: Option<String>,
+    max_concurrent: usize,
+    active_runs: usize,
+    pending_runs: usize,
+    available_slots: usize,
+    admission: String,
+    admission_code: String,
+    admission_reason: String,
+    service_name: String,
+    service_namespace: String,
+    endpoints: Vec<String>,
+    allowed_intents: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerValidationReport {
+    pub status: String,
+    pub workers: usize,
+    pub ready_workers: usize,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerOffloadReport {
+    pub job_name: String,
+    pub namespace: String,
+    pub service_name: String,
+    pub phase: String,
+    pub selected_class: Option<String>,
+    pub fallback_class: bool,
+    pub worker: Option<String>,
+    pub worker_namespace: Option<String>,
+    pub worker_provider: Option<String>,
+    pub worker_model: Option<String>,
+    pub worker_locality: Option<String>,
+    pub validation_state: Option<String>,
+    pub validation_message: Option<String>,
+    pub artifact_path: Option<String>,
+    pub output_path: Option<String>,
+    pub response: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerOffloadOptions {
+    pub service_name: String,
+    pub control_namespace: Option<String>,
+    pub via_runtime_namespace: Option<String>,
+    pub prompt: String,
+    pub intent: Option<String>,
+    pub output_path: Option<PathBuf>,
+    pub job_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4345,6 +4418,110 @@ pub fn resolve_service_target(
     resolve_service_target_for_source(service_name, control_namespace, None, None)
 }
 
+pub fn validate_worker_lanes() -> anyhow::Result<WorkerValidationReport> {
+    let workers = list_worker_summaries(None)?;
+    let ready_workers = workers
+        .iter()
+        .filter(|worker| !worker.detail.contains("no resolved endpoints"))
+        .count();
+    let status = if ready_workers > 0 {
+        "passed"
+    } else {
+        "skipped"
+    }
+    .to_string();
+    let detail = if ready_workers > 0 {
+        format!(
+            "{ready_workers}/{} worker lane(s) have ready endpoints",
+            workers.len()
+        )
+    } else if workers.is_empty() {
+        "no service-backed worker lanes are registered".to_string()
+    } else {
+        format!(
+            "{} worker lane(s) registered but none have ready endpoints",
+            workers.len()
+        )
+    };
+    ensure!(ready_workers > 0, "{detail}");
+    Ok(WorkerValidationReport {
+        status,
+        workers: workers.len(),
+        ready_workers,
+        detail,
+    })
+}
+
+pub fn run_worker_offload(options: WorkerOffloadOptions) -> anyhow::Result<WorkerOffloadReport> {
+    let control_namespace =
+        normalize_namespaced_resource_namespace(options.control_namespace.as_deref());
+    let service_name = options.service_name.trim().to_string();
+    ensure!(
+        !service_name.is_empty(),
+        "worker offload requires --service"
+    );
+    let prompt = options.prompt.trim().to_string();
+    ensure!(!prompt.is_empty(), "worker offload requires --prompt");
+    let target = resolve_service_target_for_message(
+        &service_name,
+        Some(&control_namespace),
+        options.via_runtime_namespace.as_deref(),
+    )?;
+    let intent_prefix = options
+        .intent
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|intent| format!("Intent: {intent}\n\n"))
+        .unwrap_or_default();
+    let message = format!(
+        "{intent_prefix}Bounded worker offload request via service `{}/{}`.\n\n{}\n\nReturn a concise result and mention any artifact path you create.",
+        control_namespace, service_name, prompt
+    );
+    if !tell_cluster_runtime_session(&target.runtime_namespace, "agent0", &message, "auto")? {
+        tell_codex_app_with_mode(&target.runtime_namespace, &message, CodexAppInputMode::Auto)?;
+    }
+    let output_path = options.output_path.map(|path| expand_home_pathbuf(&path));
+    let job_name = options.job_name.unwrap_or_else(|| {
+        format!(
+            "{}-{}-{}",
+            slugify(&target.runtime_namespace),
+            slugify(&service_name),
+            now_epoch_ms()
+        )
+    });
+    let response = format!(
+        "Dispatched bounded offload to runtime `{}` through service `{}/{}`.",
+        target.runtime_namespace, control_namespace, service_name
+    );
+    if let Some(path) = output_path.as_ref() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create '{}'", parent.display()))?;
+        }
+        fs::write(path, &response)
+            .with_context(|| format!("failed to write '{}'", path.display()))?;
+    }
+    Ok(WorkerOffloadReport {
+        job_name,
+        namespace: control_namespace.clone(),
+        service_name,
+        phase: "dispatched".to_string(),
+        selected_class: Some("runtime".to_string()),
+        fallback_class: false,
+        worker: Some(target.runtime_namespace),
+        worker_namespace: Some(control_namespace),
+        worker_provider: Some("codex".to_string()),
+        worker_model: Some("codex".to_string()),
+        worker_locality: Some("cluster".to_string()),
+        validation_state: Some("accepted".to_string()),
+        validation_message: Some("Service endpoint resolved and prompt was delivered.".to_string()),
+        artifact_path: None,
+        output_path: output_path.map(|path| path.display().to_string()),
+        response: Some(response),
+    })
+}
+
 pub fn resolve_service_target_for_message(
     service_name: &str,
     control_namespace: Option<&str>,
@@ -6441,6 +6618,21 @@ fn service_env_key(name: &str) -> String {
     value.trim_matches('_').to_string()
 }
 
+fn expand_home_pathbuf(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if raw == "~" {
+        return env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| path.to_path_buf());
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
 fn service_matches_session(
     manifest: &ResourceEnvelope<ServiceSpec>,
     session: &NativeSessionMetadata,
@@ -6935,6 +7127,9 @@ fn parse_specific_kind(kind_arg: ControlPlaneResourceKindArg) -> anyhow::Result<
         ControlPlaneResourceKindArg::ConfigMap => Ok(ResourceKind::ConfigMap),
         ControlPlaneResourceKindArg::Secret => Ok(ResourceKind::Secret),
         ControlPlaneResourceKindArg::Volume => Ok(ResourceKind::Volume),
+        ControlPlaneResourceKindArg::Worker => {
+            bail!("workers are virtual service-backed lanes and are handled separately")
+        }
         ControlPlaneResourceKindArg::All => bail!("'all' is not valid for this command"),
     }
 }
@@ -7101,6 +7296,78 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, contents).unwrap();
+    }
+
+    fn write_codex_app_metadata(home: &Path, metadata: &NativeSessionMetadata) {
+        let session_dir = home
+            .join(".jarvis")
+            .join("codex-app")
+            .join("sessions")
+            .join(&metadata.namespace);
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("metadata.json"),
+            serde_json::to_string_pretty(metadata).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn service_backed_worker_lanes_are_listed_and_validated() {
+        let _lock = home_env_lock().lock().unwrap();
+        let home = TempHomeGuard::new("jarvisctl-service-worker-lane");
+        write_codex_app_metadata(
+            &home.root,
+            &NativeSessionMetadata {
+                namespace: "worker-runtime".to_string(),
+                backend: "codex-app".to_string(),
+                created_at_epoch_ms: now_epoch_ms(),
+                working_directory: None,
+                shell_command: "codex".to_string(),
+                context: Some(RuntimeContextMetadata {
+                    control_namespace: Some("team-alpha".to_string()),
+                    labels: BTreeMap::from([("app".to_string(), "worker-runtime".to_string())]),
+                    ..RuntimeContextMetadata::default()
+                }),
+                agents: vec![NativeAgentMetadata {
+                    name: "agent0".to_string(),
+                    pid: 42,
+                    running: true,
+                    exit_code: None,
+                }],
+            },
+        );
+        save_manifest(&ResourceManifest::Service(ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Service".to_string(),
+            metadata: ResourceMetadata {
+                name: "worker-lane".to_string(),
+                namespace: Some("team-alpha".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: ServiceSpec {
+                selector: BTreeMap::from([("app".to_string(), "worker-runtime".to_string())]),
+                allowed_intents: vec!["summarize".to_string()],
+                ..ServiceSpec::default()
+            },
+        }))
+        .unwrap();
+
+        let workers = list_worker_summaries(Some("team-alpha")).unwrap();
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].kind, "Worker");
+        assert_eq!(workers[0].name, "worker-lane");
+        assert!(workers[0].detail.contains("worker-runtime"));
+
+        let detail = worker_describe_envelope("worker-lane", Some("team-alpha")).unwrap();
+        assert!(detail.status.loaded);
+        assert_eq!(detail.status.available_slots, 1);
+        assert_eq!(detail.status.allowed_intents, vec!["summarize"]);
+
+        let validation = validate_worker_lanes().unwrap();
+        assert_eq!(validation.status, "passed");
+        assert_eq!(validation.ready_workers, 1);
     }
 
     #[test]

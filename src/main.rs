@@ -62,18 +62,19 @@ use codex_app::{
 use control_plane::{
     ControlPlaneOutput, ControlPlaneResourceKindArg, KubernetesRenderOutput, NodeBootstrapOptions,
     NodeFanoutOptions, NodeLinksOptions, NodePairSessionOptions, NodeRegisterOptions,
-    NodeScheduleOptions, NodeStartSessionOptions, NodeVisitOptions, apply_kubernetes_resources,
-    apply_kustomization, apply_manifests, attach_cluster_runtime_session,
-    authorize_runtime_message, bootstrap_node, check_node_links, cleanup_node, cluster_index,
-    delete_cluster_runtime_session, doctor_nodes, inspect_node, interrupt_cluster_runtime_session,
-    load_or_create_orchestration_policy, migrate_session_to_node, open_visit_capsule,
-    orchestration_policy_path, pause_deployment_rollout, preflight_nodes, read_auth_audit_events,
-    reconcile_nodes, register_node, render_describe_output, render_get_output,
-    render_kubernetes_resources, render_node_probe_output, render_rollout_history_output,
-    render_rollout_status_output, resolve_service_target, resolve_service_target_for_message,
+    NodeScheduleOptions, NodeStartSessionOptions, NodeVisitOptions, WorkerOffloadOptions,
+    apply_kubernetes_resources, apply_kustomization, apply_manifests,
+    attach_cluster_runtime_session, authorize_runtime_message, bootstrap_node, check_node_links,
+    cleanup_node, cluster_index, delete_cluster_runtime_session, doctor_nodes, inspect_node,
+    interrupt_cluster_runtime_session, load_or_create_orchestration_policy,
+    migrate_session_to_node, open_visit_capsule, orchestration_policy_path,
+    pause_deployment_rollout, preflight_nodes, read_auth_audit_events, reconcile_nodes,
+    register_node, render_describe_output, render_get_output, render_kubernetes_resources,
+    render_node_probe_output, render_rollout_history_output, render_rollout_status_output,
+    render_worker_validation_output, resolve_service_target, resolve_service_target_for_message,
     respond_cluster_runtime_server_request, restart_deployment_rollout, resume_deployment_rollout,
-    rotate_capsule_key, run_node_fanout, run_node_visit, schedule_node, set_node_cordoned,
-    start_node_pair_session, start_node_session, sync_codex_auth_to_node,
+    rotate_capsule_key, run_node_fanout, run_node_visit, run_worker_offload, schedule_node,
+    set_node_cordoned, start_node_pair_session, start_node_session, sync_codex_auth_to_node,
     tell_cluster_runtime_session, undo_deployment_rollout, wait_for_rollout_status_output,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
@@ -421,6 +422,12 @@ enum Command {
     Node {
         #[command(subcommand)]
         command: NodeCommand,
+    },
+
+    /// Inspect and run service-backed bounded worker lanes
+    Worker {
+        #[command(subcommand)]
+        command: WorkerCommand,
     },
 
     /// Track business objectives, decisions, evidence, and runtime links
@@ -1075,6 +1082,42 @@ enum AutonomyCommand {
 
     /// Disable and remove the user-systemd autonomy timer
     UninstallUserService {
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkerCommand {
+    /// Validate that at least one service-backed worker lane has a ready runtime endpoint
+    Validate {
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Send a bounded prompt to a runtime service lane and record a dispatch artifact
+    Offload {
+        #[arg(long, alias = "svc")]
+        service: String,
+
+        #[arg(short = 'n', long = "resource-namespace", alias = "ns", alias = "rns")]
+        resource_namespace: Option<String>,
+
+        #[arg(long = "via-runtime-namespace", alias = "via-ns")]
+        via_runtime_namespace: Option<String>,
+
+        #[arg(long)]
+        intent: Option<String>,
+
+        #[arg(long)]
+        prompt: String,
+
+        #[arg(long = "output-path", alias = "artifact", value_hint = ValueHint::FilePath)]
+        output_path: Option<PathBuf>,
+
+        #[arg(long = "job-name", alias = "job")]
+        job_name: Option<String>,
+
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
@@ -1964,6 +2007,7 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             output,
         } => describe_resource(kind, &name, resource_namespace.as_deref(), output),
         Command::Node { command } => node_command(command),
+        Command::Worker { command } => worker_command(command),
         Command::Mission { command } => mission_command(command),
         Command::Proposal { command } => proposal_command(command),
         Command::Capability { command } => capability_command(command),
@@ -2445,6 +2489,67 @@ fn describe_resource(
             .map_err(JarvisError::from)?
     );
     Ok(())
+}
+
+fn worker_command(command: WorkerCommand) -> Result<(), JarvisError> {
+    match command {
+        WorkerCommand::Validate { output } => {
+            println!(
+                "{}",
+                render_worker_validation_output(output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        WorkerCommand::Offload {
+            service,
+            resource_namespace,
+            via_runtime_namespace,
+            intent,
+            prompt,
+            output_path,
+            job_name,
+            output,
+        } => {
+            let report = run_worker_offload(WorkerOffloadOptions {
+                service_name: service,
+                control_namespace: resource_namespace,
+                via_runtime_namespace,
+                prompt,
+                intent,
+                output_path,
+                job_name,
+            })
+            .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_worker_offload_output(&report, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+    }
+}
+
+fn render_worker_offload_output(
+    report: &control_plane::WorkerOffloadReport,
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(report).context("failed to encode worker offload")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(report).context("failed to encode worker offload")
+        }
+        ControlPlaneOutput::Table => Ok(format!(
+            "JOB\tNAMESPACE\tSERVICE\tPHASE\tWORKER\tOUTPUT\n{}\t{}\t{}\t{}\t{}\t{}",
+            report.job_name,
+            report.namespace,
+            report.service_name,
+            report.phase,
+            report.worker.as_deref().unwrap_or("-"),
+            report.output_path.as_deref().unwrap_or("-")
+        )),
+    }
 }
 
 fn node_command(command: NodeCommand) -> Result<(), JarvisError> {

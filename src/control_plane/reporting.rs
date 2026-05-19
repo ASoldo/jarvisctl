@@ -6,6 +6,17 @@ pub fn render_get_output(
     output: ControlPlaneOutput,
 ) -> anyhow::Result<String> {
     let _ = reconcile_control_plane()?;
+    if kind_arg == ControlPlaneResourceKindArg::Worker {
+        let summaries = list_worker_summaries(namespace)?;
+        return match output {
+            ControlPlaneOutput::Json => serde_json::to_string_pretty(&summaries)
+                .context("failed to encode worker summaries"),
+            ControlPlaneOutput::Yaml => {
+                serde_yaml::to_string(&summaries).context("failed to encode worker summaries")
+            }
+            ControlPlaneOutput::Table => Ok(render_summary_table(&summaries)),
+        };
+    }
     let summaries = list_resource_summaries(kind_arg, namespace)?;
     match output {
         ControlPlaneOutput::Json => serde_json::to_string_pretty(&summaries)
@@ -24,6 +35,17 @@ pub fn render_describe_output(
     output: ControlPlaneOutput,
 ) -> anyhow::Result<String> {
     let _ = reconcile_control_plane()?;
+    if kind_arg == ControlPlaneResourceKindArg::Worker {
+        let envelope = worker_describe_envelope(name, namespace)?;
+        return match output {
+            ControlPlaneOutput::Json => {
+                serde_json::to_string_pretty(&envelope).context("failed to encode worker payload")
+            }
+            ControlPlaneOutput::Yaml | ControlPlaneOutput::Table => {
+                serde_yaml::to_string(&envelope).context("failed to encode worker payload")
+            }
+        };
+    }
     let kind = parse_specific_kind(kind_arg)?;
     let manifest = load_manifest(kind, name, namespace)?;
     let status = describe_status(&manifest)?;
@@ -180,6 +202,129 @@ pub(crate) fn list_resource_summaries(
             .then_with(|| left.name.cmp(&right.name))
     });
     Ok(summaries)
+}
+
+pub(crate) fn list_worker_summaries(
+    namespace: Option<&str>,
+) -> anyhow::Result<Vec<ResourceSummary>> {
+    let mut summaries = Vec::new();
+    for manifest in load_manifests_by_kind(ResourceKind::Service, namespace)? {
+        let ResourceManifest::Service(service) = manifest else {
+            continue;
+        };
+        if effective_service_target_kind(&service.spec) != ServiceTargetKind::Runtime {
+            continue;
+        }
+        let status = service_status(&service)?;
+        summaries.push(ResourceSummary {
+            kind: "Worker".to_string(),
+            namespace: service.metadata.namespace.clone(),
+            name: service.metadata.name.clone(),
+            status: "codex (runtime-offload)".to_string(),
+            detail: if status.endpoints.is_empty() {
+                "no resolved endpoints".to_string()
+            } else {
+                format!(
+                    "{} endpoint(s): {}",
+                    status.endpoints.len(),
+                    status.endpoints.join(", ")
+                )
+            },
+        });
+    }
+    summaries.sort_by(|left, right| {
+        left.namespace
+            .cmp(&right.namespace)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(summaries)
+}
+
+pub(crate) fn worker_describe_envelope(
+    name: &str,
+    namespace: Option<&str>,
+) -> anyhow::Result<WorkerDescribeEnvelope> {
+    let namespace = normalize_namespaced_resource_namespace(namespace);
+    let manifest = load_manifest(ResourceKind::Service, name, Some(&namespace))?;
+    let ResourceManifest::Service(service) = manifest else {
+        bail!(
+            "resource '{}/{}' is not a Service-backed worker lane",
+            namespace,
+            name
+        );
+    };
+    ensure!(
+        effective_service_target_kind(&service.spec) == ServiceTargetKind::Runtime,
+        "service '{}/{}' is not a runtime worker lane",
+        namespace,
+        name
+    );
+    let status = service_status(&service)?;
+    let loaded = !status.endpoints.is_empty();
+    let admission_code = if loaded { "ready" } else { "no_endpoints" }.to_string();
+    let admission = if loaded { "ready" } else { "blocked" }.to_string();
+    let admission_reason = if loaded {
+        format!("{} resolved runtime endpoint(s)", status.endpoints.len())
+    } else {
+        "service has no ready runtime endpoints".to_string()
+    };
+    Ok(WorkerDescribeEnvelope {
+        manifest: json!({
+            "apiVersion": API_VERSION,
+            "kind": "Worker",
+            "metadata": {
+                "name": service.metadata.name,
+                "namespace": service.metadata.namespace,
+                "labels": service.metadata.labels,
+                "annotations": service.metadata.annotations,
+            },
+            "spec": {
+                "provider": "codex",
+                "model": "codex",
+                "role": "runtime-offload",
+                "outputMode": "text",
+            },
+        }),
+        status: WorkerStatus {
+            endpoint: format!("service://{}/{}", namespace, name),
+            loaded,
+            locality: "cluster".to_string(),
+            model: "codex".to_string(),
+            output_mode: "text".to_string(),
+            provider: "codex".to_string(),
+            role: "runtime-offload".to_string(),
+            capabilities: vec!["conversation".to_string(), "offload".to_string()],
+            classes: vec!["runtime".to_string(), "codex".to_string()],
+            pool: Some(namespace.clone()),
+            max_concurrent: status.endpoints.len().max(1),
+            active_runs: 0,
+            pending_runs: 0,
+            available_slots: status.endpoints.len(),
+            admission,
+            admission_code,
+            admission_reason,
+            service_name: name.to_string(),
+            service_namespace: namespace,
+            endpoints: status.endpoints,
+            allowed_intents: status.allowed_intents,
+        },
+    })
+}
+
+pub fn render_worker_validation_output(output: ControlPlaneOutput) -> anyhow::Result<String> {
+    let report = validate_worker_lanes()?;
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(&report).context("failed to encode worker validation")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(&report).context("failed to encode worker validation")
+        }
+        ControlPlaneOutput::Table => Ok(format!(
+            "STATUS\tWORKERS\tREADY\tDETAIL\n{}\t{}\t{}\t{}",
+            report.status, report.workers, report.ready_workers, report.detail
+        )),
+    }
 }
 
 pub(crate) fn resource_summary(manifest: &ResourceManifest) -> anyhow::Result<ResourceSummary> {
