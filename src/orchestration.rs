@@ -4,6 +4,7 @@ use crate::mission::MissionRecord;
 use crate::proposal::ProposalRecord;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutonomyPolicyRule {
@@ -190,18 +191,19 @@ pub fn worker_lane_scorecards(
         .filter(|proposal| proposal.status == "pending")
         .count();
     let worker_runs = list_worker_run_records(Some(100), true).unwrap_or_default();
-    let completed_worker_runs = worker_runs
-        .iter()
+    let latest_worker_runs = latest_worker_runs_by_lane(&worker_runs);
+    let completed_worker_runs = latest_worker_runs
+        .values()
         .filter(|run| {
             run.phase == "completed" || run.phase == "accepted" || run.phase == "dispatched"
         })
         .count();
-    let failed_worker_runs = worker_runs
-        .iter()
+    let failed_worker_runs = latest_worker_runs
+        .values()
         .filter(|run| run.phase == "failed")
         .count();
-    let executed_worker_runs = worker_runs
-        .iter()
+    let executed_worker_runs = latest_worker_runs
+        .values()
         .filter(|run| run.execution_mode == "provider")
         .count();
     let worker_confidence = if completed_worker_runs > 0 && failed_worker_runs == 0 {
@@ -279,6 +281,31 @@ pub fn worker_lane_scorecards(
             ],
         },
     ]
+}
+
+fn latest_worker_runs_by_lane(
+    worker_runs: &[crate::control_plane::WorkerRunRecord],
+) -> BTreeMap<String, &crate::control_plane::WorkerRunRecord> {
+    let mut latest = BTreeMap::new();
+    for run in worker_runs {
+        let worker_namespace = run.worker_namespace.as_deref().unwrap_or(&run.namespace);
+        let worker = run.worker.as_deref().unwrap_or(&run.service_name);
+        let provider = run
+            .worker_provider
+            .as_deref()
+            .unwrap_or(&run.execution_mode);
+        let key = format!("{worker_namespace}/{worker}/{provider}");
+        if latest
+            .get(&key)
+            .map(|existing: &&crate::control_plane::WorkerRunRecord| {
+                run.completed_at_epoch_ms > existing.completed_at_epoch_ms
+            })
+            .unwrap_or(true)
+        {
+            latest.insert(key, run);
+        }
+    }
+    latest
 }
 
 pub fn render_autonomy_policy_output(

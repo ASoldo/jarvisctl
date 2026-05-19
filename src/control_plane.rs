@@ -3147,15 +3147,20 @@ fn node_ssh_target(spec: &NodeSpec) -> Option<String> {
 fn run_probe_command(target: Option<&str>) -> anyhow::Result<String> {
     let script = "printf 'arch='; uname -m 2>/dev/null || true; printf '\\nos='; uname -s 2>/dev/null || true; printf '\\ncodex='; (codex --version 2>/dev/null || command -v codex 2>/dev/null || true) | head -n 1; printf '\\njarvisctl='; (jarvisctl --version 2>/dev/null || command -v jarvisctl 2>/dev/null || true) | head -n 1; printf '\\ncodex_auth='; test -s \"$HOME/.codex/auth.json\" && echo present || echo missing; printf '\\n'";
     let output = if let Some(target) = target {
+        let timeout_seconds = node_probe_timeout_seconds();
+        let command_timeout = format!("{}s", timeout_seconds.saturating_mul(2));
+        let connect_timeout = timeout_seconds.to_string();
         ProcessCommand::new("timeout")
             .args([
                 "--kill-after=5s",
-                "20s",
+                &command_timeout,
                 "ssh",
                 "-o",
                 "BatchMode=yes",
                 "-o",
-                "ConnectTimeout=5",
+                "ConnectionAttempts=1",
+                "-o",
+                &format!("ConnectTimeout={connect_timeout}"),
                 target,
                 script,
             ])
@@ -4107,15 +4112,20 @@ fn run_shell_probe(target: Option<&str>, script: &str, label: &str) -> anyhow::R
     let output = if let Some(target) = target {
         let remote_command =
             shell_words::join(["sh".to_string(), "-lc".to_string(), script.to_string()]);
+        let timeout_seconds = node_probe_timeout_seconds();
+        let command_timeout = format!("{}s", timeout_seconds.saturating_mul(3));
+        let connect_timeout = timeout_seconds.to_string();
         ProcessCommand::new("timeout")
             .args([
                 "--kill-after=5s",
-                "30s",
+                &command_timeout,
                 "ssh",
                 "-o",
                 "BatchMode=yes",
                 "-o",
-                "ConnectTimeout=10",
+                "ConnectionAttempts=1",
+                "-o",
+                &format!("ConnectTimeout={connect_timeout}"),
                 target,
                 &remote_command,
             ])
@@ -4134,6 +4144,14 @@ fn run_shell_probe(target: Option<&str>, script: &str, label: &str) -> anyhow::R
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn node_probe_timeout_seconds() -> u64 {
+    env::var("JARVIS_NODE_PROBE_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.clamp(1, 120))
+        .unwrap_or(10)
 }
 
 fn run_node_cleanup_command(
@@ -4655,6 +4673,8 @@ pub fn run_worker_offload(options: WorkerOffloadOptions) -> anyhow::Result<Worke
             if options.execute {
                 match execute_provider_worker(&worker, &prompt) {
                     Ok(response) => {
+                        let (response, normalization_message) =
+                            normalize_worker_response(&worker, &response);
                         let (state, message) = validate_worker_response(&worker, &response);
                         (
                             if state == "passed" {
@@ -4665,7 +4685,7 @@ pub fn run_worker_offload(options: WorkerOffloadOptions) -> anyhow::Result<Worke
                             .to_string(),
                             response,
                             Some(state),
-                            Some(message),
+                            Some(normalization_message.unwrap_or(message)),
                             None,
                             "provider".to_string(),
                         )
@@ -5498,6 +5518,67 @@ fn validate_worker_response(
             "worker response captured without schema validation".to_string(),
         )
     }
+}
+
+fn normalize_worker_response(
+    worker: &ResourceEnvelope<WorkerSpec>,
+    response: &str,
+) -> (String, Option<String>) {
+    if !worker
+        .spec
+        .output_mode
+        .as_deref()
+        .map(|value| value.eq_ignore_ascii_case("json"))
+        .unwrap_or(false)
+    {
+        return (response.to_string(), None);
+    }
+    if serde_json::from_str::<serde_json::Value>(response).is_ok() {
+        return (response.trim().to_string(), None);
+    }
+    let Some(value) = recover_embedded_json_value(response) else {
+        return (response.to_string(), None);
+    };
+    let normalized = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+    (
+        normalized,
+        Some("worker response recovered embedded JSON for outputMode=json".to_string()),
+    )
+}
+
+fn recover_embedded_json_value(response: &str) -> Option<serde_json::Value> {
+    let trimmed = response.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return Some(value);
+    }
+    for block in trimmed.split("```").skip(1).step_by(2) {
+        let candidate = block.trim();
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) {
+            return Some(value);
+        }
+        if let Some((language, rest)) = candidate.split_once('\n') {
+            let language = language.trim().to_lowercase();
+            if language == "json" || language.starts_with("json ") {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(rest.trim()) {
+                    return Some(value);
+                }
+            }
+        }
+    }
+    for (index, byte) in trimmed.bytes().enumerate() {
+        if byte != b'{' && byte != b'[' {
+            continue;
+        }
+        let mut stream =
+            serde_json::Deserializer::from_str(&trimmed[index..]).into_iter::<serde_json::Value>();
+        if let Some(Ok(value)) = stream.next() {
+            return Some(value);
+        }
+    }
+    None
 }
 
 fn default_worker_artifact_path(run_id: &str) -> anyhow::Result<PathBuf> {
@@ -8812,6 +8893,34 @@ mod tests {
         assert_eq!(report.worker.as_deref(), Some("mid-code"));
         assert_eq!(report.selected_class.as_deref(), Some("mid-code"));
         assert!(report.fallback_class);
+    }
+
+    #[test]
+    fn json_worker_response_recovers_fenced_payload() {
+        let worker = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Worker".to_string(),
+            metadata: ResourceMetadata {
+                name: "json-worker".to_string(),
+                namespace: Some("openclaw".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: WorkerSpec {
+                provider: "mock".to_string(),
+                model: "mock-json".to_string(),
+                output_mode: Some("json".to_string()),
+                ..WorkerSpec::default()
+            },
+        };
+        let response = "Here is the result:\n\n```json\n{\"status\":\"ok\",\"note\":\"done\"}\n```";
+        let (normalized, message) = normalize_worker_response(&worker, response);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&normalized).unwrap()["status"],
+            "ok"
+        );
+        assert!(message.unwrap().contains("recovered embedded JSON"));
+        assert_eq!(validate_worker_response(&worker, &normalized).0, "passed");
     }
 
     #[test]
