@@ -275,9 +275,13 @@ fn systemctl_user_value(args: &[&str]) -> String {
             String::from_utf8_lossy(&output.stdout).trim().to_string()
         }
         Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !stdout.is_empty() {
+                return stdout;
+            }
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if stderr.is_empty() {
-                format!("inactive:{}", output.status)
+                format!("unknown:{}", output.status)
             } else {
                 stderr
             }
