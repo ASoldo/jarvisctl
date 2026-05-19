@@ -63,24 +63,26 @@ use control_plane::{
     ControlPlaneOutput, ControlPlaneResourceKindArg, KubernetesRenderOutput, NodeBootstrapOptions,
     NodeFanoutOptions, NodeLinksOptions, NodePairSessionOptions, NodeRegisterOptions,
     NodeScheduleOptions, NodeStartSessionOptions, NodeVisitOptions, WorkerDriftSmokeOptions,
-    WorkerOffloadOptions, apply_kubernetes_resources, apply_kustomization, apply_manifests,
-    attach_cluster_runtime_session, authorize_runtime_message, bootstrap_node, check_node_links,
-    cleanup_node, cluster_index, delete_cluster_runtime_session, doctor_nodes, inspect_node,
-    interrupt_cluster_runtime_session, list_worker_run_records,
+    WorkerDriftSmokeScheduleOptions, WorkerOffloadOptions, apply_kubernetes_resources,
+    apply_kustomization, apply_manifests, attach_cluster_runtime_session,
+    authorize_runtime_message, bootstrap_node, check_node_links, cleanup_node, cluster_index,
+    configure_worker_drift_smoke_schedule, delete_cluster_runtime_session, doctor_nodes,
+    inspect_node, interrupt_cluster_runtime_session, list_worker_run_records,
     load_or_create_orchestration_policy, load_worker_run_record, mark_worker_run,
     migrate_session_to_node, open_visit_capsule, orchestration_policy_path,
     pause_deployment_rollout, preflight_nodes, prune_worker_runs, read_auth_audit_events,
     read_worker_run_artifact, reconcile_nodes, register_node, render_describe_output,
     render_get_output, render_kubernetes_resources, render_node_probe_output,
     render_rollout_history_output, render_rollout_status_output, render_worker_drift_smoke_output,
-    render_worker_model_validation_output, render_worker_run_artifact_output,
-    render_worker_run_prune_output, render_worker_runs_output, render_worker_validation_output,
-    resolve_service_target, resolve_service_target_for_message,
+    render_worker_drift_smoke_schedule_status, render_worker_model_validation_output,
+    render_worker_run_artifact_output, render_worker_run_prune_output, render_worker_runs_output,
+    render_worker_validation_output, resolve_service_target, resolve_service_target_for_message,
     respond_cluster_runtime_server_request, restart_deployment_rollout, resume_deployment_rollout,
-    rotate_capsule_key, run_node_fanout, run_node_visit, run_worker_drift_smoke,
-    run_worker_offload, schedule_node, set_node_cordoned, start_node_pair_session,
-    start_node_session, sync_codex_auth_to_node, tell_cluster_runtime_session,
-    undo_deployment_rollout, validate_worker_models, wait_for_rollout_status_output,
+    rotate_capsule_key, run_node_fanout, run_node_visit, run_recurring_worker_drift_smoke,
+    run_worker_drift_smoke, run_worker_offload, schedule_node, set_node_cordoned,
+    start_node_pair_session, start_node_session, sync_codex_auth_to_node,
+    tell_cluster_runtime_session, undo_deployment_rollout, validate_worker_models,
+    wait_for_rollout_status_output, worker_drift_smoke_schedule_status,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use mission::{
@@ -1206,6 +1208,42 @@ enum WorkerCommand {
 
         #[arg(long)]
         all: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Json)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Configure recurring worker drift smoke that autonomy can run when due
+    DriftSchedule {
+        #[arg(long, alias = "svc")]
+        service: String,
+
+        #[arg(short = 'n', long = "resource-namespace", alias = "ns", alias = "rns")]
+        resource_namespace: Option<String>,
+
+        #[arg(long = "interval-seconds", alias = "interval", default_value_t = 6 * 60 * 60)]
+        interval_seconds: u64,
+
+        #[arg(long, default_value_t = true, default_missing_value = "true", num_args = 0..=1, require_equals = true)]
+        enabled: bool,
+
+        #[arg(long)]
+        all: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Show recurring worker drift smoke schedule and last-run state
+    DriftStatus {
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Run the configured recurring worker drift smoke now
+    DriftRun {
+        #[arg(long, default_value_t = false)]
+        force: bool,
 
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Json)]
         output: ControlPlaneOutput,
@@ -2720,6 +2758,55 @@ fn worker_command(command: WorkerCommand) -> Result<(), JarvisError> {
                 return Err(JarvisError::from(anyhow::anyhow!(
                     "worker drift smoke failed"
                 )));
+            }
+            Ok(())
+        }
+        WorkerCommand::DriftSchedule {
+            service,
+            resource_namespace,
+            interval_seconds,
+            enabled,
+            all,
+            output,
+        } => {
+            let status = configure_worker_drift_smoke_schedule(WorkerDriftSmokeScheduleOptions {
+                service_name: service,
+                namespace: resource_namespace,
+                interval_seconds,
+                enabled,
+                all,
+            })
+            .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_worker_drift_smoke_schedule_status(&status, output)
+                    .map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        WorkerCommand::DriftStatus { output } => {
+            let status = worker_drift_smoke_schedule_status().map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_worker_drift_smoke_schedule_status(&status, output)
+                    .map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        WorkerCommand::DriftRun { force, output } => {
+            let report = run_recurring_worker_drift_smoke(force).map_err(JarvisError::from)?;
+            if let Some(report) = report {
+                println!(
+                    "{}",
+                    render_worker_drift_smoke_output(&report, output).map_err(JarvisError::from)?
+                );
+            } else {
+                let status = worker_drift_smoke_schedule_status().map_err(JarvisError::from)?;
+                println!(
+                    "{}",
+                    render_worker_drift_smoke_schedule_status(&status, output)
+                        .map_err(JarvisError::from)?
+                );
             }
             Ok(())
         }

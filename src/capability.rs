@@ -1,4 +1,6 @@
-use crate::control_plane::{ControlPlaneOutput, NodePairSessionOptions, start_node_pair_session};
+use crate::control_plane::{
+    ControlPlaneOutput, NodePairSessionOptions, run_due_worker_drift_smoke, start_node_pair_session,
+};
 use crate::mission::{
     MissionCreateOptions, MissionEventOptions, MissionRecord, append_mission_event,
     complete_mission, create_mission,
@@ -730,6 +732,25 @@ pub fn reconcile_autonomy(
             command: Some("jarvisctl mission smoke-run --force".to_string()),
         });
         smoke_reports.push(report);
+    }
+    if let Some(report) = run_due_worker_drift_smoke(dry_run)? {
+        let run_id = report
+            .offload
+            .as_ref()
+            .map(|offload| offload.run_id.as_str())
+            .unwrap_or("-");
+        safe_actions.push(AutonomyReconcileAction {
+            kind: "worker-drift-smoke".to_string(),
+            status: report.status.clone(),
+            summary: format!(
+                "Worker drift smoke {} with {}/{} provider models available; run {}.",
+                report.status,
+                report.model_validation.available,
+                report.model_validation.checked,
+                run_id
+            ),
+            command: Some("jarvisctl worker drift-run --force".to_string()),
+        });
     }
     let pending_proposals = proposals
         .iter()

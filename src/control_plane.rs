@@ -1348,6 +1348,48 @@ pub struct WorkerDriftSmokeOptions {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerDriftSmokeScheduleConfig {
+    pub enabled: bool,
+    pub service_name: String,
+    pub namespace: Option<String>,
+    pub interval_seconds: u64,
+    pub all: bool,
+    pub updated_at_epoch_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkerDriftSmokeScheduleState {
+    #[serde(default)]
+    pub last_run_epoch_ms: Option<u128>,
+    #[serde(default)]
+    pub last_status: Option<String>,
+    #[serde(default)]
+    pub last_run_id: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub run_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerDriftSmokeScheduleStatus {
+    pub configured: bool,
+    pub due: bool,
+    pub next_run_epoch_ms: Option<u128>,
+    pub config: Option<WorkerDriftSmokeScheduleConfig>,
+    pub state: WorkerDriftSmokeScheduleState,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerDriftSmokeScheduleOptions {
+    pub service_name: String,
+    pub namespace: Option<String>,
+    pub interval_seconds: u64,
+    pub enabled: bool,
+    pub all: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerRunArtifactReport {
     pub id: String,
     pub node: Option<String>,
@@ -5139,6 +5181,151 @@ pub fn render_worker_drift_smoke_output(
     }
 }
 
+pub fn configure_worker_drift_smoke_schedule(
+    options: WorkerDriftSmokeScheduleOptions,
+) -> anyhow::Result<WorkerDriftSmokeScheduleStatus> {
+    let service_name = clean_required_string(&options.service_name, "worker drift service")?;
+    let config = WorkerDriftSmokeScheduleConfig {
+        enabled: options.enabled,
+        service_name,
+        namespace: options.namespace.as_deref().and_then(clean_optional_string),
+        interval_seconds: options.interval_seconds.max(900),
+        all: options.all,
+        updated_at_epoch_ms: now_epoch_ms(),
+    };
+    write_worker_drift_smoke_schedule_config(&config)?;
+    worker_drift_smoke_schedule_status()
+}
+
+pub fn worker_drift_smoke_schedule_status() -> anyhow::Result<WorkerDriftSmokeScheduleStatus> {
+    let config = load_worker_drift_smoke_schedule_config()?;
+    let state = load_worker_drift_smoke_schedule_state()?;
+    let now = now_epoch_ms();
+    let (due, next_run_epoch_ms) =
+        if let Some(config) = config.as_ref().filter(|config| config.enabled) {
+            let interval_ms = u128::from(config.interval_seconds) * 1000;
+            let next = state
+                .last_run_epoch_ms
+                .map(|last| last.saturating_add(interval_ms))
+                .unwrap_or(now);
+            (next <= now, Some(next))
+        } else {
+            (false, None)
+        };
+    Ok(WorkerDriftSmokeScheduleStatus {
+        configured: config.is_some(),
+        due,
+        next_run_epoch_ms,
+        config,
+        state,
+    })
+}
+
+pub fn run_recurring_worker_drift_smoke(
+    force: bool,
+) -> anyhow::Result<Option<WorkerDriftSmokeReport>> {
+    let status = worker_drift_smoke_schedule_status()?;
+    let Some(config) = status.config else {
+        return Ok(None);
+    };
+    if !config.enabled || (!status.due && !force) {
+        return Ok(None);
+    }
+    let mut state = status.state;
+    match run_worker_drift_smoke(WorkerDriftSmokeOptions {
+        service_name: config.service_name.clone(),
+        control_namespace: config.namespace.clone(),
+        prompt: None,
+        output_path: None,
+        job_name: Some(format!(
+            "recurring-worker-drift-{}-{}",
+            slugify(&config.service_name),
+            now_epoch_ms()
+        )),
+        all: config.all,
+    }) {
+        Ok(report) => {
+            state.last_run_epoch_ms = Some(now_epoch_ms());
+            state.last_status = Some(report.status.clone());
+            state.last_run_id = report
+                .offload
+                .as_ref()
+                .map(|offload| offload.run_id.clone());
+            state.last_error = None;
+            state.run_count = state.run_count.saturating_add(1);
+            write_worker_drift_smoke_schedule_state(&state)?;
+            Ok(Some(report))
+        }
+        Err(error) => {
+            state.last_run_epoch_ms = Some(now_epoch_ms());
+            state.last_status = Some("failed".to_string());
+            state.last_error = Some(error.to_string());
+            state.run_count = state.run_count.saturating_add(1);
+            write_worker_drift_smoke_schedule_state(&state)?;
+            Err(error)
+        }
+    }
+}
+
+pub fn run_due_worker_drift_smoke(dry_run: bool) -> anyhow::Result<Option<WorkerDriftSmokeReport>> {
+    let status = worker_drift_smoke_schedule_status()?;
+    let Some(config) = status.config.as_ref() else {
+        return Ok(None);
+    };
+    if !config.enabled || !status.due {
+        return Ok(None);
+    }
+    if dry_run {
+        return Ok(Some(WorkerDriftSmokeReport {
+            status: "planned".to_string(),
+            model_validation: validate_worker_models(config.all)?,
+            offload: None,
+        }));
+    }
+    run_recurring_worker_drift_smoke(false)
+}
+
+pub fn render_worker_drift_smoke_schedule_status(
+    status: &WorkerDriftSmokeScheduleStatus,
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(status).context("failed to encode worker drift schedule")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(status).context("failed to encode worker drift schedule")
+        }
+        ControlPlaneOutput::Table => Ok(format!(
+            "CONFIGURED\tENABLED\tDUE\tSERVICE\tNAMESPACE\tNEXT_RUN\tLAST_STATUS\tLAST_RUN\tRUNS\n{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            status.configured,
+            status
+                .config
+                .as_ref()
+                .map(|config| config.enabled)
+                .unwrap_or(false),
+            status.due,
+            status
+                .config
+                .as_ref()
+                .map(|config| config.service_name.as_str())
+                .unwrap_or("-"),
+            status
+                .config
+                .as_ref()
+                .and_then(|config| config.namespace.as_deref())
+                .unwrap_or("-"),
+            status
+                .next_run_epoch_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            status.state.last_status.as_deref().unwrap_or("-"),
+            status.state.last_run_id.as_deref().unwrap_or("-"),
+            status.state.run_count
+        )),
+    }
+}
+
 pub fn read_worker_run_artifact(
     id: &str,
     include_remote: bool,
@@ -6108,10 +6295,77 @@ fn worker_run_artifacts_dir() -> anyhow::Result<PathBuf> {
     Ok(jarvis_codex_dir()?.join("worker-artifacts"))
 }
 
+fn load_worker_drift_smoke_schedule_config()
+-> anyhow::Result<Option<WorkerDriftSmokeScheduleConfig>> {
+    let path = worker_drift_smoke_schedule_config_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read '{}'", path.display()))?;
+    let config = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse '{}'", path.display()))?;
+    Ok(Some(config))
+}
+
+fn write_worker_drift_smoke_schedule_config(
+    config: &WorkerDriftSmokeScheduleConfig,
+) -> anyhow::Result<()> {
+    let path = worker_drift_smoke_schedule_config_path()?;
+    write_json_atomic(&path, config)
+}
+
+fn load_worker_drift_smoke_schedule_state() -> anyhow::Result<WorkerDriftSmokeScheduleState> {
+    let path = worker_drift_smoke_schedule_state_path()?;
+    if !path.exists() {
+        return Ok(WorkerDriftSmokeScheduleState::default());
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read '{}'", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("failed to parse '{}'", path.display()))
+}
+
+fn write_worker_drift_smoke_schedule_state(
+    state: &WorkerDriftSmokeScheduleState,
+) -> anyhow::Result<()> {
+    let path = worker_drift_smoke_schedule_state_path()?;
+    write_json_atomic(&path, state)
+}
+
+fn worker_drift_smoke_schedule_config_path() -> anyhow::Result<PathBuf> {
+    Ok(jarvis_codex_dir()?
+        .join("worker-drift-smoke")
+        .join("config.json"))
+}
+
+fn worker_drift_smoke_schedule_state_path() -> anyhow::Result<PathBuf> {
+    Ok(jarvis_codex_dir()?
+        .join("worker-drift-smoke")
+        .join("state.json"))
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create '{}'", parent.display()))?;
+    }
+    let raw = serde_json::to_string_pretty(value).context("failed to encode json")?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, raw).with_context(|| format!("failed to write '{}'", tmp.display()))?;
+    fs::rename(&tmp, path)
+        .with_context(|| format!("failed to move '{}' to '{}'", tmp.display(), path.display()))
+}
+
 fn sanitize_file_id(id: &str) -> anyhow::Result<String> {
     let sanitized = slugify(id);
     ensure!(!sanitized.is_empty(), "invalid empty identifier");
     Ok(sanitized)
+}
+
+fn clean_required_string(value: &str, label: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    ensure!(!value.is_empty(), "{label} cannot be empty");
+    Ok(value.to_string())
 }
 
 fn clean_optional_string(value: &str) -> Option<String> {
