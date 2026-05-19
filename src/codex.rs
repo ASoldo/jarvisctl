@@ -558,6 +558,19 @@ fn build_codex_prompt(
         }
     }
 
+    if !prompt.contains("Jarvis operator escalation protocol") {
+        if !prompt.ends_with('\n') {
+            prompt.push('\n');
+        }
+        prompt.push_str(
+            "\nJarvis operator escalation protocol:\n\
+             - If work requires sudo, durable credentials, paid endpoints, production mutation, or another privileged action, create a durable request instead of blocking on an interactive prompt.\n\
+             - Use: `jarvisctl operator-request sudo --title \"<short title>\" --reason \"<why this is needed>\" --command \"<exact sudo/admin command>\" --namespace <namespace if known>`.\n\
+             - Include concrete reasoning, blast radius, and the exact command/context needed. Do not store passwords, tokens, or secrets in the request.\n\
+             - Continue safe non-privileged work while waiting, and report what is blocked by the operator request.\n",
+        );
+    }
+
     Ok(prompt)
 }
 
@@ -1284,6 +1297,7 @@ repo_path: /tmp/repo
 
         assert!(prompt.contains("Continue work for 'Demo Ticket'"));
         assert!(prompt.contains("Operator update:\nNeed one more validation pass."));
+        assert!(prompt.contains("Jarvis operator escalation protocol"));
         let _ = fs::remove_dir_all(root);
     }
 
