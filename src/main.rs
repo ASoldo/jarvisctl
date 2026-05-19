@@ -21,6 +21,7 @@ use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 mod agent;
 mod board;
+mod capability;
 mod codex;
 mod codex_app;
 mod control_plane;
@@ -37,6 +38,12 @@ mod ticket;
 mod tui;
 
 use agent::spawn_agent;
+use capability::{
+    CapabilityRegisterOptions, list_capabilities, reconcile_autonomy, register_capability,
+    render_autonomy_reconcile_output, render_capabilities_output, render_capability_output,
+    render_capability_validation_output, render_mission_smoke_output, run_two_node_mission_smoke,
+    show_capability, validate_capabilities, validate_capability,
+};
 use codex::{CodexLaunchOptions, CodexRuntimeDriver, launch_codex_ticket};
 use codex_app::{
     CodexAppInputMode, attach_codex_app_tcp, codex_app_session_metadata_tcp,
@@ -71,8 +78,9 @@ use native::{
 };
 use operator_request::{
     OperatorRequestCreateOptions, OperatorRequestResolveOptions, create_operator_request,
-    list_operator_requests, render_operator_request_output, render_operator_requests_output,
-    resolve_operator_request, show_operator_request,
+    list_operator_requests, notify_operator_requests, render_operator_request_notify_output,
+    render_operator_request_output, render_operator_requests_output, resolve_operator_request,
+    show_operator_request,
 };
 use orchestration::{
     default_autonomy_policy, plan_missions, render_autonomy_policy_output,
@@ -418,6 +426,18 @@ enum Command {
         command: ProposalCommand,
     },
 
+    /// Inspect and validate autonomous capability lanes
+    Capability {
+        #[command(subcommand)]
+        command: CapabilityCommand,
+    },
+
+    /// Reconcile autonomous work queues, blockers, and notifications
+    Autonomy {
+        #[command(subcommand)]
+        command: AutonomyCommand,
+    },
+
     /// Manage durable operator/admin requests and notifications
     #[command(alias = "notify", alias = "operator-requests")]
     OperatorRequest {
@@ -736,6 +756,36 @@ enum MissionCommand {
         output: ControlPlaneOutput,
     },
 
+    /// Create or execute a recorded two-node mission smoke
+    Smoke {
+        #[arg(long = "first-node", alias = "n1")]
+        first_node: String,
+
+        #[arg(long = "second-node", alias = "n2")]
+        second_node: String,
+
+        #[arg(long = "first-task-note", alias = "t1", value_hint = ValueHint::FilePath)]
+        first_task_note: PathBuf,
+
+        #[arg(long = "second-task-note", alias = "t2", value_hint = ValueHint::FilePath)]
+        second_task_note: PathBuf,
+
+        #[arg(long = "namespace-prefix", alias = "ns")]
+        namespace_prefix: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        #[arg(long, default_value_t = false)]
+        execute: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+
+        #[arg(last = true, value_hint = ValueHint::CommandString)]
+        command: Vec<String>,
+    },
+
     /// Show one mission with its event timeline
     Show {
         id: String,
@@ -859,6 +909,79 @@ enum ProposalCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum CapabilityCommand {
+    /// List built-in and registered autonomy capabilities
+    List {
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Show one autonomy capability
+    Show {
+        id: String,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Register or replace an operator-defined capability lane
+    Register {
+        #[arg(long)]
+        id: String,
+
+        #[arg(long)]
+        title: String,
+
+        #[arg(long)]
+        lane: String,
+
+        #[arg(long)]
+        description: String,
+
+        #[arg(long)]
+        status: Option<String>,
+
+        #[arg(long)]
+        confidence: Option<u8>,
+
+        #[arg(long, default_value_t = true)]
+        schedulable: bool,
+
+        #[arg(long = "evidence", alias = "ev")]
+        evidence: Vec<String>,
+
+        #[arg(long = "gap")]
+        gaps: Vec<String>,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Run validator commands for one or all capability lanes
+    Validate {
+        id: Option<String>,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AutonomyCommand {
+    /// Reconcile safe autonomous work and decision-grade blockers
+    Reconcile {
+        #[arg(long, default_value_t = false)]
+        notify: bool,
+
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum OperatorRequestCommand {
     /// Create a durable operator/admin request
     Create {
@@ -944,6 +1067,21 @@ enum OperatorRequestCommand {
     /// Show one operator/admin request
     Show {
         id: String,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Send persistent desktop notifications for pending requests
+    Notify {
+        #[arg(long)]
+        status: Option<String>,
+
+        #[arg(long, default_value_t = true)]
+        persistent: bool,
+
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
 
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
@@ -1729,6 +1867,8 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         Command::Node { command } => node_command(command),
         Command::Mission { command } => mission_command(command),
         Command::Proposal { command } => proposal_command(command),
+        Command::Capability { command } => capability_command(command),
+        Command::Autonomy { command } => autonomy_command(command),
         Command::OperatorRequest { command } => operator_request_command(command),
         Command::Rollout { command } => rollout_command(command),
         Command::Kube { command } => kube_command(command),
@@ -3227,6 +3367,34 @@ fn mission_command(command: MissionCommand) -> Result<(), JarvisError> {
             );
             Ok(())
         }
+        MissionCommand::Smoke {
+            first_node,
+            second_node,
+            first_task_note,
+            second_task_note,
+            namespace_prefix,
+            dry_run,
+            execute,
+            output,
+            command,
+        } => {
+            let report = run_two_node_mission_smoke(
+                first_node,
+                second_node,
+                first_task_note,
+                second_task_note,
+                namespace_prefix,
+                dry_run,
+                execute,
+                command,
+            )
+            .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_mission_smoke_output(&report, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
         MissionCommand::Show { id, output } => {
             let detail = show_mission(&id).map_err(JarvisError::from)?;
             println!(
@@ -3279,6 +3447,89 @@ fn mission_command(command: MissionCommand) -> Result<(), JarvisError> {
             println!(
                 "{}",
                 render_mission_detail_output(&detail, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+    }
+}
+
+fn capability_command(command: CapabilityCommand) -> Result<(), JarvisError> {
+    match command {
+        CapabilityCommand::List { output } => {
+            let records = list_capabilities().map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_capabilities_output(&records, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        CapabilityCommand::Show { id, output } => {
+            let record = show_capability(&id).map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_capability_output(&record, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        CapabilityCommand::Register {
+            id,
+            title,
+            lane,
+            description,
+            status,
+            confidence,
+            schedulable,
+            evidence,
+            gaps,
+            output,
+        } => {
+            let record = register_capability(CapabilityRegisterOptions {
+                id,
+                title,
+                lane,
+                status,
+                confidence,
+                schedulable,
+                description,
+                evidence,
+                gaps,
+            })
+            .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_capability_output(&record, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        CapabilityCommand::Validate { id, output } => {
+            let reports = if let Some(id) = id {
+                vec![validate_capability(&id).map_err(JarvisError::from)?]
+            } else {
+                validate_capabilities().map_err(JarvisError::from)?
+            };
+            println!(
+                "{}",
+                render_capability_validation_output(&reports, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+    }
+}
+
+fn autonomy_command(command: AutonomyCommand) -> Result<(), JarvisError> {
+    match command {
+        AutonomyCommand::Reconcile {
+            notify,
+            dry_run,
+            output,
+        } => {
+            let missions = list_missions().map_err(JarvisError::from)?;
+            let proposals = list_proposals().map_err(JarvisError::from)?;
+            let report = reconcile_autonomy(&missions, &proposals, notify, dry_run)
+                .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_autonomy_reconcile_output(&report, output).map_err(JarvisError::from)?
             );
             Ok(())
         }
@@ -3450,6 +3701,24 @@ fn operator_request_command(command: OperatorRequestCommand) -> Result<(), Jarvi
             println!(
                 "{}",
                 render_operator_request_output(&record, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        OperatorRequestCommand::Notify {
+            status,
+            persistent,
+            dry_run,
+            output,
+        } => {
+            let wanted = status.unwrap_or_else(|| "pending".to_string());
+            let mut records = list_operator_requests().map_err(JarvisError::from)?;
+            records.retain(|record| record.status == wanted);
+            let report = notify_operator_requests(&records, persistent, dry_run)
+                .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_operator_request_notify_output(&report, output)
+                    .map_err(JarvisError::from)?
             );
             Ok(())
         }

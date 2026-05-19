@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_TTL_SECONDS: u64 = 12 * 60 * 60;
@@ -69,6 +70,15 @@ pub struct OperatorRequestResolveOptions {
     pub error: Option<String>,
     pub decided_by: Option<String>,
     pub decision: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorRequestNotifyReport {
+    pub attempted: usize,
+    pub delivered: usize,
+    pub dry_run: bool,
+    pub persistent: bool,
+    pub failures: Vec<String>,
 }
 
 pub fn create_operator_request(
@@ -205,6 +215,88 @@ pub fn expire_operator_request(id: &str, reason: &str) -> anyhow::Result<Operato
             decision: Some(reason.to_string()),
         },
     )
+}
+
+pub fn notify_operator_requests(
+    records: &[OperatorRequestRecord],
+    persistent: bool,
+    dry_run: bool,
+) -> anyhow::Result<OperatorRequestNotifyReport> {
+    let mut delivered = 0;
+    let mut failures = Vec::new();
+    for record in records {
+        if record.status != "pending" {
+            continue;
+        }
+        if dry_run {
+            delivered += 1;
+            continue;
+        }
+        let title = format!("Jarvis needs {}", record.kind);
+        let mut body = format!("{}\n\nReason: {}", record.title, record.reason);
+        if let Some(risk) = record.risk.as_deref() {
+            body.push_str(&format!("\nRisk: {risk}"));
+        }
+        if let Some(command) = record.command.as_deref() {
+            body.push_str(&format!("\nCommand: {command}"));
+        }
+        body.push_str(&format!(
+            "\n\nApprove/deny in Obsidian or run: jarvisctl operator-request show {}",
+            record.id
+        ));
+        let mut command = Command::new("notify-send");
+        command
+            .arg("--app-name=jarvisctl")
+            .arg("--urgency")
+            .arg(
+                if record.severity == "high" || record.severity == "critical" {
+                    "critical"
+                } else {
+                    "normal"
+                },
+            )
+            .arg("--expire-time")
+            .arg(if persistent { "0" } else { "120000" })
+            .arg(title)
+            .arg(body);
+        match command.status() {
+            Ok(status) if status.success() => delivered += 1,
+            Ok(status) => failures.push(format!("{}: notify-send exited with {status}", record.id)),
+            Err(error) => failures.push(format!("{}: {error}", record.id)),
+        }
+    }
+    Ok(OperatorRequestNotifyReport {
+        attempted: records
+            .iter()
+            .filter(|record| record.status == "pending")
+            .count(),
+        delivered,
+        dry_run,
+        persistent,
+        failures,
+    })
+}
+
+pub fn render_operator_request_notify_output(
+    report: &OperatorRequestNotifyReport,
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(report).context("failed to encode notify report")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(report).context("failed to encode notify report")
+        }
+        ControlPlaneOutput::Table => Ok(format!(
+            "ATTEMPTED\tDELIVERED\tPERSISTENT\tDRY_RUN\tFAILURES\n{}\t{}\t{}\t{}\t{}",
+            report.attempted,
+            report.delivered,
+            report.persistent,
+            report.dry_run,
+            report.failures.join("; ")
+        )),
+    }
 }
 
 pub fn render_operator_requests_output(

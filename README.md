@@ -293,13 +293,14 @@ jarvisctl mission complete <mission-id> --outcome "Shortlist ready for HR review
 jarvisctl mission plan <mission-id>
 jarvisctl mission policy
 jarvisctl mission scorecards
+jarvisctl mission smoke --first-node archiechokie --second-node archiebald --first-task-note ./Tickets/a.md --second-task-note ./Tickets/b.md --dry-run
 jarvisctl mission list
 jarvisctl mission show <mission-id>
 ```
 
 Built-in mission templates currently cover CV triage, incident response, code review, report generation, bounded worker offload, gated external runtime evaluation, and cross-node relay handoff. Tickets can set `jarvis_mission` so dispatch automatically records launch and completion events against the mission. `node start-session`, `respond-request`, and `delete` also accept `--mission <id>` for direct lifecycle capture.
 
-`mission plan` is the read-only controller view: it evaluates each mission against the current proposal queue and recommends the next bounded action. `mission policy` exposes the default autonomy gates for credentials, production mutation, bounded worker offload, and cross-node handoff. `mission scorecards` gives lane readiness for remote Codex sessions, bounded worker offload, and proposal gating so the Obsidian dashboard can show where autonomy is safe to expand and where evidence is still missing.
+`mission plan` is the read-only controller view: it evaluates each mission against the current proposal queue and recommends the next bounded action. `mission policy` exposes the default autonomy gates for credentials, production mutation, bounded worker offload, and cross-node handoff. `mission scorecards` gives lane readiness for remote Codex sessions, bounded worker offload, and proposal gating so the Obsidian dashboard can show where autonomy is safe to expand and where evidence is still missing. `mission smoke` records a repeatable two-node mission smoke; run it with `--execute --dry-run=false` when you want it to actually launch paired sessions.
 
 Mission records live under `~/.jarvis/codex/missions/` with append-only event timelines under `~/.jarvis/codex/mission-events/`. They are intentionally separate from tickets: the ticket remains the execution contract, while the mission ledger is the cross-run decision and evidence object.
 
@@ -319,11 +320,25 @@ Operator requests are durable admin/operator notifications that survive dashboar
 ```bash
 jarvisctl operator-request sudo --title "Install package" --reason "Needed for validator smoke" --command "sudo pacman -S package"
 jarvisctl operator-request list
+jarvisctl operator-request notify --persistent
 jarvisctl operator-request resolve <request-id> --status approved --decision "Approved for this maintenance window."
 jarvisctl notify list --output json
 ```
 
 The request record stores title, reason, risk, command/context, namespace/request links, and decision metadata. It does not store passwords, tokens, or other secrets.
+
+Capability and autonomy commands expose the production-readiness layer used by Mission Chain:
+
+```bash
+jarvisctl capability list
+jarvisctl capability show codex-remote-session
+jarvisctl capability validate
+jarvisctl capability register --id custom-worker --title "Custom worker" --lane typed-worker-lane --description "Bounded worker lane"
+jarvisctl autonomy reconcile --dry-run
+jarvisctl autonomy reconcile --notify
+```
+
+The built-in capability registry models remote Codex sessions, bounded worker offload, and operator proposal gating. Each capability carries validators, artifact contracts, evidence, and gaps. `autonomy reconcile` expires stale requests, sends optional persistent desktop notifications, validates capability lanes, and separates safe actions from decision-grade blockers.
 
 Protocol drift for the Codex app-server integration is checked with:
 
