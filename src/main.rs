@@ -71,12 +71,14 @@ use control_plane::{
     open_visit_capsule, orchestration_policy_path, pause_deployment_rollout, preflight_nodes,
     read_auth_audit_events, reconcile_nodes, register_node, render_describe_output,
     render_get_output, render_kubernetes_resources, render_node_probe_output,
-    render_rollout_history_output, render_rollout_status_output, render_worker_runs_output,
+    render_rollout_history_output, render_rollout_status_output,
+    render_worker_model_validation_output, render_worker_runs_output,
     render_worker_validation_output, resolve_service_target, resolve_service_target_for_message,
     respond_cluster_runtime_server_request, restart_deployment_rollout, resume_deployment_rollout,
     rotate_capsule_key, run_node_fanout, run_node_visit, run_worker_offload, schedule_node,
     set_node_cordoned, start_node_pair_session, start_node_session, sync_codex_auth_to_node,
-    tell_cluster_runtime_session, undo_deployment_rollout, wait_for_rollout_status_output,
+    tell_cluster_runtime_session, undo_deployment_rollout, validate_worker_models,
+    wait_for_rollout_status_output,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use mission::{
@@ -1092,6 +1094,15 @@ enum AutonomyCommand {
 enum WorkerCommand {
     /// Validate that at least one service-backed worker lane has a ready runtime endpoint
     Validate {
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Validate that worker provider models are still listed by their providers
+    ValidateModels {
+        #[arg(long)]
+        all: bool,
+
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
@@ -2522,6 +2533,21 @@ fn worker_command(command: WorkerCommand) -> Result<(), JarvisError> {
                 "{}",
                 render_worker_validation_output(output).map_err(JarvisError::from)?
             );
+            Ok(())
+        }
+        WorkerCommand::ValidateModels { all, output } => {
+            let report = validate_worker_models(all).map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_worker_model_validation_output(&report, output)
+                    .map_err(JarvisError::from)?
+            );
+            if report.status == "failed" {
+                return Err(JarvisError::from(anyhow::anyhow!(
+                    "{} worker model(s) unavailable",
+                    report.unavailable
+                )));
+            }
             Ok(())
         }
         WorkerCommand::Offload {

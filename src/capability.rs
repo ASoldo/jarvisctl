@@ -857,11 +857,18 @@ fn builtin_capabilities() -> Vec<CapabilityRecord> {
             confidence: 70,
             schedulable: true,
             description: "Route narrow tasks into worker lanes with validators and explicit artifact contracts.".to_string(),
-            validators: vec![command_validator(
-                "worker-lane-validate",
-                "jarvisctl worker validate --output json",
-                false,
-            )],
+            validators: vec![
+                command_validator(
+                    "worker-lane-validate",
+                    "jarvisctl worker validate --output json",
+                    false,
+                ),
+                command_validator(
+                    "worker-model-availability",
+                    "jarvisctl worker validate-models --all --output json",
+                    true,
+                ),
+            ],
             artifact_contracts: vec![artifact_contract(
                 "validated-artifact",
                 "ticket-defined output path",

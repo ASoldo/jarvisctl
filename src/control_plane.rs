@@ -1230,6 +1230,28 @@ pub struct WorkerValidationReport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerModelValidationResult {
+    pub namespace: String,
+    pub worker: String,
+    pub provider: String,
+    pub model: String,
+    pub status: String,
+    pub detail: String,
+    pub node: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerModelValidationReport {
+    pub status: String,
+    pub workers: usize,
+    pub checked: usize,
+    pub available: usize,
+    pub unavailable: usize,
+    pub skipped: usize,
+    pub results: Vec<WorkerModelValidationResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerOffloadReport {
     pub run_id: String,
     pub job_name: String,
@@ -1260,6 +1282,13 @@ pub struct WorkerOffloadOptions {
     pub output_path: Option<PathBuf>,
     pub job_name: Option<String>,
     pub execute: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SelectedWorker {
+    worker: ResourceEnvelope<WorkerSpec>,
+    selected_class: Option<String>,
+    fallback_class: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4602,7 +4631,8 @@ pub fn run_worker_offload(options: WorkerOffloadOptions) -> anyhow::Result<Worke
     };
     if effective_service_target_kind(&service.spec) == ServiceTargetKind::Worker {
         let started_at_epoch_ms = now_epoch_ms();
-        let worker = select_worker_for_service(&service)?;
+        let selected = select_worker_for_service(&service)?;
+        let worker = selected.worker;
         let job_name = options.job_name.unwrap_or_else(|| {
             format!(
                 "{}-{}-{}",
@@ -4678,8 +4708,8 @@ pub fn run_worker_offload(options: WorkerOffloadOptions) -> anyhow::Result<Worke
             namespace: control_namespace.clone(),
             service_name,
             phase: phase.clone(),
-            selected_class: service.spec.class_name.clone(),
-            fallback_class: false,
+            selected_class: selected.selected_class.clone(),
+            fallback_class: selected.fallback_class,
             worker: Some(worker.metadata.name.clone()),
             worker_namespace: worker_namespace.clone(),
             worker_provider: Some(worker.spec.provider.clone()),
@@ -4706,7 +4736,7 @@ pub fn run_worker_offload(options: WorkerOffloadOptions) -> anyhow::Result<Worke
             prompt_bytes: prompt.len(),
             prompt_preview: preview_text(&prompt, 180),
             selected_class: report.selected_class.clone(),
-            fallback_class: false,
+            fallback_class: selected.fallback_class,
             worker: report.worker.clone(),
             worker_namespace,
             worker_provider: report.worker_provider.clone(),
@@ -4848,6 +4878,80 @@ pub fn list_worker_run_records(
         records.truncate(limit);
     }
     Ok(records)
+}
+
+pub fn validate_worker_models(include_remote: bool) -> anyhow::Result<WorkerModelValidationReport> {
+    let mut results = validate_local_worker_models()?;
+    if include_remote && env::var_os("JARVIS_WORKER_MODEL_VALIDATE_LOCAL_ONLY").is_none() {
+        results.extend(collect_remote_worker_model_validation_results()?);
+    }
+    results.sort_by(|left, right| {
+        left.node
+            .cmp(&right.node)
+            .then_with(|| left.namespace.cmp(&right.namespace))
+            .then_with(|| left.worker.cmp(&right.worker))
+    });
+    let checked = results
+        .iter()
+        .filter(|result| result.status == "available" || result.status == "unavailable")
+        .count();
+    let available = results
+        .iter()
+        .filter(|result| result.status == "available")
+        .count();
+    let unavailable = results
+        .iter()
+        .filter(|result| result.status == "unavailable")
+        .count();
+    let skipped = results
+        .iter()
+        .filter(|result| result.status == "skipped")
+        .count();
+    let status = if unavailable > 0 {
+        "failed"
+    } else if checked > 0 {
+        "passed"
+    } else {
+        "skipped"
+    }
+    .to_string();
+    Ok(WorkerModelValidationReport {
+        status,
+        workers: results.len(),
+        checked,
+        available,
+        unavailable,
+        skipped,
+        results,
+    })
+}
+
+pub fn render_worker_model_validation_output(
+    report: &WorkerModelValidationReport,
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(report).context("failed to encode worker model validation")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(report).context("failed to encode worker model validation")
+        }
+        ControlPlaneOutput::Table => {
+            let mut lines = vec!["WORKER\tPROVIDER\tMODEL\tSTATUS\tDETAIL".to_string()];
+            for result in &report.results {
+                let worker = match result.node.as_deref() {
+                    Some(node) => format!("{}/{}/{}", node, result.namespace, result.worker),
+                    None => format!("{}/{}", result.namespace, result.worker),
+                };
+                lines.push(format!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    worker, result.provider, result.model, result.status, result.detail
+                ));
+            }
+            Ok(lines.join("\n"))
+        }
+    }
 }
 
 pub fn load_worker_run_record(id: &str) -> anyhow::Result<WorkerRunRecord> {
@@ -5002,6 +5106,192 @@ fn execute_provider_worker(
     call_openai_compatible_provider(&endpoint, &api_key, &body)
 }
 
+fn validate_local_worker_models() -> anyhow::Result<Vec<WorkerModelValidationResult>> {
+    let workers = load_manifests_by_kind(ResourceKind::Worker, None)?
+        .into_iter()
+        .filter_map(|manifest| match manifest {
+            ResourceManifest::Worker(worker) => Some(worker),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let node = local_node_name().ok();
+    let mut cache: BTreeMap<String, anyhow::Result<BTreeSet<String>>> = BTreeMap::new();
+    let mut results = Vec::new();
+    for worker in workers {
+        let provider = worker.spec.provider.trim().to_lowercase();
+        let model = worker.spec.model.trim().to_string();
+        let namespace = worker
+            .metadata
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        if provider.is_empty() || model.is_empty() {
+            results.push(WorkerModelValidationResult {
+                namespace,
+                worker: worker.metadata.name,
+                provider: if provider.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    provider
+                },
+                model: if model.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    model
+                },
+                status: "skipped".to_string(),
+                detail: "worker missing provider or model".to_string(),
+                node: node.clone(),
+            });
+            continue;
+        }
+        if provider == "mock" || provider == "local" {
+            results.push(WorkerModelValidationResult {
+                namespace,
+                worker: worker.metadata.name,
+                provider,
+                model,
+                status: "available".to_string(),
+                detail: "local/mock worker does not require provider model lookup".to_string(),
+                node: node.clone(),
+            });
+            continue;
+        }
+        let cache_key = worker_provider_models_cache_key(&worker);
+        if !cache.contains_key(&cache_key) {
+            cache.insert(cache_key.clone(), fetch_worker_provider_models(&worker));
+        }
+        match cache.get(&cache_key).expect("cache entry exists") {
+            Ok(models) if models.contains(&model) => results.push(WorkerModelValidationResult {
+                namespace,
+                worker: worker.metadata.name,
+                provider,
+                model,
+                status: "available".to_string(),
+                detail: "model listed by provider".to_string(),
+                node: node.clone(),
+            }),
+            Ok(_) => results.push(WorkerModelValidationResult {
+                namespace,
+                worker: worker.metadata.name,
+                provider,
+                model,
+                status: "unavailable".to_string(),
+                detail: "model was not listed by provider".to_string(),
+                node: node.clone(),
+            }),
+            Err(error) => results.push(WorkerModelValidationResult {
+                namespace,
+                worker: worker.metadata.name,
+                provider,
+                model,
+                status: "skipped".to_string(),
+                detail: format!("provider model lookup failed: {error:#}"),
+                node: node.clone(),
+            }),
+        }
+    }
+    Ok(results)
+}
+
+fn collect_remote_worker_model_validation_results()
+-> anyhow::Result<Vec<WorkerModelValidationResult>> {
+    let nodes = load_manifests_by_kind(ResourceKind::Node, None)?
+        .into_iter()
+        .filter_map(|manifest| match manifest {
+            ResourceManifest::Node(node) if !node_is_local(&node) => Some(node),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut results = Vec::new();
+    for node in nodes {
+        let output = run_remote_runtime_command_output(
+            &node,
+            vec![
+                "env".to_string(),
+                "JARVIS_WORKER_MODEL_VALIDATE_LOCAL_ONLY=1".to_string(),
+                "jarvisctl".to_string(),
+                "worker".to_string(),
+                "validate-models".to_string(),
+                "--output".to_string(),
+                "json".to_string(),
+            ],
+            60,
+        );
+        let Ok(output) = output else {
+            continue;
+        };
+        let Ok(mut report) = serde_json::from_str::<WorkerModelValidationReport>(&output) else {
+            continue;
+        };
+        for result in &mut report.results {
+            result
+                .node
+                .get_or_insert_with(|| node.metadata.name.clone());
+        }
+        results.extend(report.results);
+    }
+    Ok(results)
+}
+
+fn fetch_worker_provider_models(
+    worker: &ResourceEnvelope<WorkerSpec>,
+) -> anyhow::Result<BTreeSet<String>> {
+    let provider = worker.spec.provider.trim().to_lowercase();
+    let endpoint = worker_provider_models_endpoint(worker)?;
+    let api_key = resolve_worker_api_key(worker)?;
+    let output = ProcessCommand::new("curl")
+        .args([
+            "-sS",
+            "--fail-with-body",
+            "--max-time",
+            "45",
+            "-H",
+            &format!("Authorization: Bearer {api_key}"),
+            &endpoint,
+        ])
+        .output()
+        .context("failed to spawn curl for worker model lookup")?;
+    if !output.status.success() {
+        bail!(
+            "provider model lookup for '{}' failed with status {}: {}{}{}",
+            provider,
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            if output.stderr.is_empty() { "" } else { " / " },
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("provider model response was not JSON")?;
+    Ok(extract_model_ids(&value))
+}
+
+fn extract_model_ids(value: &serde_json::Value) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    collect_model_ids(value, &mut ids);
+    ids
+}
+
+fn collect_model_ids(value: &serde_json::Value, ids: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(id) = map.get("id").and_then(serde_json::Value::as_str) {
+                ids.insert(id.to_string());
+            }
+            for value in map.values() {
+                collect_model_ids(value, ids);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_model_ids(value, ids);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn call_openai_compatible_provider(
     endpoint: &str,
     api_key: &str,
@@ -5101,6 +5391,39 @@ fn worker_provider_endpoint(worker: &ResourceEnvelope<WorkerSpec>) -> anyhow::Re
             worker.spec.provider
         ),
     }
+}
+
+fn worker_provider_models_endpoint(
+    worker: &ResourceEnvelope<WorkerSpec>,
+) -> anyhow::Result<String> {
+    let chat_endpoint = worker_provider_endpoint(worker)?;
+    if chat_endpoint.ends_with("/chat/completions") {
+        return Ok(chat_endpoint
+            .trim_end_matches("/chat/completions")
+            .to_string()
+            + "/models");
+    }
+    if chat_endpoint.ends_with("/responses") {
+        return Ok(chat_endpoint.trim_end_matches("/responses").to_string() + "/models");
+    }
+    let provider = worker.spec.provider.trim().to_lowercase();
+    match provider.as_str() {
+        "nvidia" => Ok("https://integrate.api.nvidia.com/v1/models".to_string()),
+        "openai" => Ok("https://api.openai.com/v1/models".to_string()),
+        "openrouter" => Ok("https://openrouter.ai/api/v1/models".to_string()),
+        _ => bail!(
+            "worker '{}' must set an OpenAI-compatible chat endpoint ending in /chat/completions for model validation",
+            worker.metadata.name
+        ),
+    }
+}
+
+fn worker_provider_models_cache_key(worker: &ResourceEnvelope<WorkerSpec>) -> String {
+    format!(
+        "{}:{}",
+        worker.spec.provider.trim().to_lowercase(),
+        worker_provider_models_endpoint(worker).unwrap_or_default()
+    )
 }
 
 fn resolve_worker_api_key(worker: &ResourceEnvelope<WorkerSpec>) -> anyhow::Result<String> {
@@ -7461,7 +7784,7 @@ fn expand_home_pathbuf(path: &Path) -> PathBuf {
 
 fn select_worker_for_service(
     service: &ResourceEnvelope<ServiceSpec>,
-) -> anyhow::Result<ResourceEnvelope<WorkerSpec>> {
+) -> anyhow::Result<SelectedWorker> {
     let namespace = service.metadata.namespace.as_deref();
     let mut workers = load_manifests_by_kind(ResourceKind::Worker, namespace)?
         .into_iter()
@@ -7469,13 +7792,22 @@ fn select_worker_for_service(
             ResourceManifest::Worker(worker) => Some(worker),
             _ => None,
         })
-        .filter(|worker| worker_matches_service(service, worker))
+        .filter_map(|worker| {
+            worker_matches_service(service, &worker).map(|(selected_class, fallback_class)| {
+                SelectedWorker {
+                    worker,
+                    selected_class,
+                    fallback_class,
+                }
+            })
+        })
         .collect::<Vec<_>>();
     let recent_runs = list_local_worker_run_records().unwrap_or_default();
     workers.sort_by(|left, right| {
-        worker_recent_failure_count(left, &recent_runs)
-            .cmp(&worker_recent_failure_count(right, &recent_runs))
-            .then_with(|| left.metadata.name.cmp(&right.metadata.name))
+        worker_recent_failure_count(&left.worker, &recent_runs)
+            .cmp(&worker_recent_failure_count(&right.worker, &recent_runs))
+            .then_with(|| left.fallback_class.cmp(&right.fallback_class))
+            .then_with(|| left.worker.metadata.name.cmp(&right.worker.metadata.name))
     });
     workers.into_iter().next().ok_or_else(|| {
         anyhow!(
@@ -7489,19 +7821,14 @@ fn select_worker_for_service(
 fn worker_matches_service(
     service: &ResourceEnvelope<ServiceSpec>,
     worker: &ResourceEnvelope<WorkerSpec>,
-) -> bool {
+) -> Option<(Option<String>, bool)> {
     if !service
         .spec
         .selector
         .iter()
         .all(|(key, value)| worker.metadata.labels.get(key) == Some(value))
     {
-        return false;
-    }
-    if let Some(class_name) = service.spec.class_name.as_ref() {
-        if !worker.spec.classes.iter().any(|class| class == class_name) {
-            return false;
-        }
+        return None;
     }
     if !service.spec.required_capabilities.is_empty()
         && !service.spec.required_capabilities.iter().all(|capability| {
@@ -7512,7 +7839,7 @@ fn worker_matches_service(
                 .any(|value| value == capability)
         })
     {
-        return false;
+        return None;
     }
     if !service.spec.preferred_providers.is_empty()
         && !service
@@ -7521,9 +7848,23 @@ fn worker_matches_service(
             .iter()
             .any(|provider| provider == &worker.spec.provider)
     {
-        return false;
+        return None;
     }
-    true
+    if let Some(class_name) = service.spec.class_name.as_ref() {
+        if worker.spec.classes.iter().any(|class| class == class_name) {
+            return Some((Some(class_name.clone()), false));
+        }
+        if let Some(fallback_class) = service
+            .spec
+            .fallback_class_names
+            .iter()
+            .find(|class_name| worker.spec.classes.iter().any(|class| class == *class_name))
+        {
+            return Some((Some(fallback_class.clone()), true));
+        }
+        return None;
+    }
+    Some((None, false))
 }
 
 fn worker_recent_failure_count(
@@ -8401,6 +8742,76 @@ mod tests {
             load_worker_run_record(&records[0].id).unwrap().id,
             records[0].id
         );
+
+        let model_report = validate_worker_models(false).unwrap();
+        assert_eq!(model_report.status, "passed");
+        assert_eq!(model_report.available, 1);
+    }
+
+    #[test]
+    fn worker_service_can_select_fallback_class() {
+        let _lock = home_env_lock().lock().unwrap();
+        let _home = TempHomeGuard::new("jarvisctl-worker-fallback-class");
+        save_manifest(&ResourceManifest::Worker(ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Worker".to_string(),
+            metadata: ResourceMetadata {
+                name: "mid-code".to_string(),
+                namespace: Some("openclaw".to_string()),
+                labels: BTreeMap::from([
+                    ("role".to_string(), "code".to_string()),
+                    ("stability".to_string(), "stable".to_string()),
+                ]),
+                annotations: BTreeMap::new(),
+            },
+            spec: WorkerSpec {
+                provider: "mock".to_string(),
+                model: "mock-json".to_string(),
+                role: "code".to_string(),
+                output_mode: Some("json".to_string()),
+                classes: vec!["mid-code".to_string()],
+                capabilities: vec!["code".to_string(), "json".to_string()],
+                ..WorkerSpec::default()
+            },
+        }))
+        .unwrap();
+        save_manifest(&ResourceManifest::Service(ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Service".to_string(),
+            metadata: ResourceMetadata {
+                name: "code-svc".to_string(),
+                namespace: Some("openclaw".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: ServiceSpec {
+                selector: BTreeMap::from([
+                    ("role".to_string(), "code".to_string()),
+                    ("stability".to_string(), "stable".to_string()),
+                ]),
+                target_kind: Some(ServiceTargetKind::Worker),
+                class_name: Some("junior-code".to_string()),
+                fallback_class_names: vec!["mid-code".to_string()],
+                required_capabilities: vec!["json".to_string()],
+                ..ServiceSpec::default()
+            },
+        }))
+        .unwrap();
+
+        let report = run_worker_offload(WorkerOffloadOptions {
+            service_name: "code-svc".to_string(),
+            control_namespace: Some("openclaw".to_string()),
+            via_runtime_namespace: None,
+            prompt: "Return JSON status.".to_string(),
+            intent: None,
+            output_path: None,
+            job_name: Some("fallback-class-smoke".to_string()),
+            execute: false,
+        })
+        .unwrap();
+        assert_eq!(report.worker.as_deref(), Some("mid-code"));
+        assert_eq!(report.selected_class.as_deref(), Some("mid-code"));
+        assert!(report.fallback_class);
     }
 
     #[test]
