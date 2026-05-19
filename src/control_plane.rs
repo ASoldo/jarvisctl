@@ -4539,7 +4539,10 @@ pub fn validate_worker_lanes() -> anyhow::Result<WorkerValidationReport> {
     let workers = list_worker_summaries(None)?;
     let ready_workers = workers
         .iter()
-        .filter(|worker| !worker.detail.contains("no resolved endpoints"))
+        .filter(|worker| {
+            !worker.detail.contains("no resolved endpoints")
+                && !worker.detail.contains("recent provider failure")
+        })
         .count();
     let status = if ready_workers > 0 {
         "passed"
@@ -4549,7 +4552,7 @@ pub fn validate_worker_lanes() -> anyhow::Result<WorkerValidationReport> {
     .to_string();
     let detail = if ready_workers > 0 {
         format!(
-            "{ready_workers}/{} worker lane(s) have ready endpoints",
+            "{ready_workers}/{} worker lane(s) are admitted",
             workers.len()
         )
     } else if workers.is_empty() {

@@ -473,27 +473,23 @@ pub(crate) fn resource_summary(manifest: &ResourceManifest) -> anyhow::Result<Re
             })
         }
         ResourceManifest::Worker(worker) => {
-            let loaded =
-                !worker.spec.provider.trim().is_empty() && !worker.spec.model.trim().is_empty();
+            let status = worker_status(worker);
             Ok(ResourceSummary {
                 kind: "Worker".to_string(),
                 namespace: worker.metadata.namespace.clone(),
                 name: worker.metadata.name.clone(),
-                status: format!(
-                    "{} ({})",
-                    worker.spec.model,
-                    if worker.spec.role.trim().is_empty() {
-                        "worker"
-                    } else {
-                        worker.spec.role.as_str()
-                    }
-                ),
-                detail: if loaded {
+                status: format!("{} ({})", status.model, status.role),
+                detail: if status.loaded {
                     format!(
-                        "{} · {} · pool {}",
-                        worker.spec.provider,
-                        worker.spec.locality.as_deref().unwrap_or("local"),
-                        worker.spec.pool.as_deref().unwrap_or("default")
+                        "{} · {} · pool {}{}",
+                        status.provider,
+                        status.locality,
+                        status.pool.as_deref().unwrap_or("default"),
+                        if status.admission_code == "recent_failure" {
+                            " · recent provider failure"
+                        } else {
+                            ""
+                        }
                     )
                 } else {
                     "worker missing provider or model".to_string()
@@ -1057,9 +1053,31 @@ pub(crate) fn worker_status(manifest: &ResourceEnvelope<WorkerSpec>) -> WorkerSt
     let provider = manifest.spec.provider.trim().to_string();
     let model = manifest.spec.model.trim().to_string();
     let loaded = !provider.is_empty() && !model.is_empty();
-    let admission_code = if loaded { "ready" } else { "invalid" }.to_string();
-    let admission = if loaded { "ready" } else { "blocked" }.to_string();
-    let admission_reason = if loaded {
+    let recent_failures = if loaded {
+        worker_recent_failure_count(
+            manifest,
+            &list_local_worker_run_records().unwrap_or_default(),
+        )
+    } else {
+        0
+    };
+    let admission_code = if !loaded {
+        "invalid"
+    } else if recent_failures > 0 {
+        "recent_failure"
+    } else {
+        "ready"
+    }
+    .to_string();
+    let admission = if loaded && recent_failures == 0 {
+        "ready"
+    } else {
+        "blocked"
+    }
+    .to_string();
+    let admission_reason = if recent_failures > 0 {
+        format!("{recent_failures} recent provider-backed run failure(s)")
+    } else if loaded {
         "worker manifest has provider and model".to_string()
     } else {
         "worker manifest must define provider and model".to_string()
