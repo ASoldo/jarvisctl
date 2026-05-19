@@ -1,4 +1,5 @@
 use crate::control_plane::ControlPlaneOutput;
+use crate::control_plane::list_worker_run_records;
 use crate::mission::MissionRecord;
 use crate::proposal::ProposalRecord;
 use anyhow::Context;
@@ -188,6 +189,30 @@ pub fn worker_lane_scorecards(
         .iter()
         .filter(|proposal| proposal.status == "pending")
         .count();
+    let worker_runs = list_worker_run_records(Some(100), true).unwrap_or_default();
+    let completed_worker_runs = worker_runs
+        .iter()
+        .filter(|run| {
+            run.phase == "completed" || run.phase == "accepted" || run.phase == "dispatched"
+        })
+        .count();
+    let failed_worker_runs = worker_runs
+        .iter()
+        .filter(|run| run.phase == "failed")
+        .count();
+    let executed_worker_runs = worker_runs
+        .iter()
+        .filter(|run| run.execution_mode == "provider")
+        .count();
+    let worker_confidence = if completed_worker_runs > 0 && failed_worker_runs == 0 {
+        78
+    } else if completed_worker_runs > 0 {
+        62
+    } else if openclaw_evidence > 0 {
+        55
+    } else {
+        35
+    };
     vec![
         WorkerLaneScorecard {
             lane: "codex-remote-session".to_string(),
@@ -206,20 +231,30 @@ pub fn worker_lane_scorecards(
         },
         WorkerLaneScorecard {
             lane: "bounded-worker-offload".to_string(),
-            readiness: if openclaw_evidence > 0 {
+            readiness: if executed_worker_runs > 0 && failed_worker_runs == 0 {
+                "executable"
+            } else if completed_worker_runs > 0 {
+                "routable"
+            } else if openclaw_evidence > 0 {
                 "candidate"
             } else {
                 "unproven"
             }
             .to_string(),
-            confidence: if openclaw_evidence > 0 { 68 } else { 35 },
-            evidence: vec![format!(
-                "{openclaw_evidence} OpenClaw-pattern mission(s) recorded"
-            )],
-            gaps: vec![
-                "record schema/test pass rates per worker lane".to_string(),
-                "promote only lanes with repeatable validation artifacts".to_string(),
+            confidence: worker_confidence,
+            evidence: vec![
+                format!("{openclaw_evidence} OpenClaw-pattern mission(s) recorded"),
+                format!("{completed_worker_runs} worker run(s) accepted/completed"),
+                format!("{executed_worker_runs} provider-backed worker run(s)"),
             ],
+            gaps: if executed_worker_runs > 0 {
+                vec!["promote only lanes with repeatable validation artifacts".to_string()]
+            } else {
+                vec![
+                    "execute at least one provider-backed worker lane smoke".to_string(),
+                    "record schema/test pass rates per worker lane".to_string(),
+                ]
+            },
         },
         WorkerLaneScorecard {
             lane: "operator-proposal-gate".to_string(),

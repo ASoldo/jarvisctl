@@ -66,11 +66,12 @@ use control_plane::{
     apply_kubernetes_resources, apply_kustomization, apply_manifests,
     attach_cluster_runtime_session, authorize_runtime_message, bootstrap_node, check_node_links,
     cleanup_node, cluster_index, delete_cluster_runtime_session, doctor_nodes, inspect_node,
-    interrupt_cluster_runtime_session, load_or_create_orchestration_policy,
-    migrate_session_to_node, open_visit_capsule, orchestration_policy_path,
-    pause_deployment_rollout, preflight_nodes, read_auth_audit_events, reconcile_nodes,
-    register_node, render_describe_output, render_get_output, render_kubernetes_resources,
-    render_node_probe_output, render_rollout_history_output, render_rollout_status_output,
+    interrupt_cluster_runtime_session, list_worker_run_records,
+    load_or_create_orchestration_policy, load_worker_run_record, migrate_session_to_node,
+    open_visit_capsule, orchestration_policy_path, pause_deployment_rollout, preflight_nodes,
+    read_auth_audit_events, reconcile_nodes, register_node, render_describe_output,
+    render_get_output, render_kubernetes_resources, render_node_probe_output,
+    render_rollout_history_output, render_rollout_status_output, render_worker_runs_output,
     render_worker_validation_output, resolve_service_target, resolve_service_target_for_message,
     respond_cluster_runtime_server_request, restart_deployment_rollout, resume_deployment_rollout,
     rotate_capsule_key, run_node_fanout, run_node_visit, run_worker_offload, schedule_node,
@@ -1118,7 +1119,30 @@ enum WorkerCommand {
         #[arg(long = "job-name", alias = "job")]
         job_name: Option<String>,
 
+        #[arg(long)]
+        execute: bool,
+
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// List durable worker offload run records
+    Runs {
+        #[arg(long)]
+        all: bool,
+
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Show one durable worker offload run record
+    ShowRun {
+        id: String,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Yaml)]
         output: ControlPlaneOutput,
     },
 }
@@ -2508,6 +2532,7 @@ fn worker_command(command: WorkerCommand) -> Result<(), JarvisError> {
             prompt,
             output_path,
             job_name,
+            execute,
             output,
         } => {
             let report = run_worker_offload(WorkerOffloadOptions {
@@ -2518,11 +2543,28 @@ fn worker_command(command: WorkerCommand) -> Result<(), JarvisError> {
                 intent,
                 output_path,
                 job_name,
+                execute,
             })
             .map_err(JarvisError::from)?;
             println!(
                 "{}",
                 render_worker_offload_output(&report, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        WorkerCommand::Runs { all, limit, output } => {
+            let records = list_worker_run_records(Some(limit), all).map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_worker_runs_output(&records, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        WorkerCommand::ShowRun { id, output } => {
+            let record = load_worker_run_record(&id).map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_worker_runs_output(&[record], output).map_err(JarvisError::from)?
             );
             Ok(())
         }
@@ -2541,7 +2583,8 @@ fn render_worker_offload_output(
             serde_yaml::to_string(report).context("failed to encode worker offload")
         }
         ControlPlaneOutput::Table => Ok(format!(
-            "JOB\tNAMESPACE\tSERVICE\tPHASE\tWORKER\tOUTPUT\n{}\t{}\t{}\t{}\t{}\t{}",
+            "RUN\tJOB\tNAMESPACE\tSERVICE\tPHASE\tWORKER\tOUTPUT\n{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            report.run_id,
             report.job_name,
             report.namespace,
             report.service_name,

@@ -612,6 +612,8 @@ pub struct WorkerSpec {
     pub provider: String,
     #[serde(default)]
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     #[serde(default)]
     pub role: String,
     #[serde(
@@ -1227,8 +1229,9 @@ pub struct WorkerValidationReport {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerOffloadReport {
+    pub run_id: String,
     pub job_name: String,
     pub namespace: String,
     pub service_name: String,
@@ -1256,6 +1259,38 @@ pub struct WorkerOffloadOptions {
     pub intent: Option<String>,
     pub output_path: Option<PathBuf>,
     pub job_name: Option<String>,
+    pub execute: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerRunRecord {
+    pub id: String,
+    pub job_name: String,
+    pub namespace: String,
+    pub service_name: String,
+    pub phase: String,
+    pub execution_mode: String,
+    pub started_at_epoch_ms: u128,
+    pub completed_at_epoch_ms: u128,
+    pub duration_ms: u128,
+    pub intent: Option<String>,
+    pub prompt_sha256: String,
+    pub prompt_bytes: usize,
+    pub prompt_preview: String,
+    pub selected_class: Option<String>,
+    pub fallback_class: bool,
+    pub worker: Option<String>,
+    pub worker_namespace: Option<String>,
+    pub worker_provider: Option<String>,
+    pub worker_model: Option<String>,
+    pub worker_locality: Option<String>,
+    pub validation_state: Option<String>,
+    pub validation_message: Option<String>,
+    pub artifact_path: Option<String>,
+    pub output_path: Option<String>,
+    pub response_preview: Option<String>,
+    pub error: Option<String>,
+    pub node: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4544,11 +4579,17 @@ pub fn run_worker_offload(options: WorkerOffloadOptions) -> anyhow::Result<Worke
     );
     let prompt = options.prompt.trim().to_string();
     ensure!(!prompt.is_empty(), "worker offload requires --prompt");
-    let service_manifest = load_manifest(
+    let service_manifest = match load_manifest(
         ResourceKind::Service,
         &service_name,
         Some(&control_namespace),
-    )?;
+    ) {
+        Ok(manifest) => manifest,
+        Err(error) if env::var_os("JARVIS_WORKER_OFFLOAD_LOCAL_ONLY").is_none() => {
+            return run_remote_worker_offload(options, error);
+        }
+        Err(error) => return Err(error),
+    };
     let ResourceManifest::Service(service) = service_manifest else {
         bail!(
             "resource '{}/{}' is not a Service",
@@ -4557,8 +4598,8 @@ pub fn run_worker_offload(options: WorkerOffloadOptions) -> anyhow::Result<Worke
         );
     };
     if effective_service_target_kind(&service.spec) == ServiceTargetKind::Worker {
+        let started_at_epoch_ms = now_epoch_ms();
         let worker = select_worker_for_service(&service)?;
-        let output_path = options.output_path.map(|path| expand_home_pathbuf(&path));
         let job_name = options.job_name.unwrap_or_else(|| {
             format!(
                 "{}-{}-{}",
@@ -4567,47 +4608,119 @@ pub fn run_worker_offload(options: WorkerOffloadOptions) -> anyhow::Result<Worke
                 now_epoch_ms()
             )
         });
-        let response = format!(
-            "Accepted bounded offload for worker `{}/{}` through service `{}/{}`. Prompt bytes: {}.",
-            worker
-                .metadata
-                .namespace
-                .as_deref()
-                .unwrap_or(control_namespace.as_str()),
-            worker.metadata.name,
-            control_namespace,
-            service_name,
-            prompt.len()
-        );
+        let run_id = format!("{}-{}", slugify(&job_name), started_at_epoch_ms);
+        let output_path = options
+            .output_path
+            .map(|path| expand_home_pathbuf(&path))
+            .or_else(|| default_worker_artifact_path(&run_id).ok());
+        let worker_namespace = worker
+            .metadata
+            .namespace
+            .clone()
+            .or_else(|| Some(control_namespace.clone()));
+        let (phase, response, validation_state, validation_message, error, execution_mode) =
+            if options.execute {
+                match execute_provider_worker(&worker, &prompt) {
+                    Ok(response) => {
+                        let (state, message) = validate_worker_response(&worker, &response);
+                        (
+                            if state == "passed" {
+                                "completed"
+                            } else {
+                                "failed"
+                            }
+                            .to_string(),
+                            response,
+                            Some(state),
+                            Some(message),
+                            None,
+                            "provider".to_string(),
+                        )
+                    }
+                    Err(error) => (
+                        "failed".to_string(),
+                        format!("Worker provider execution failed: {error:#}"),
+                        Some("failed".to_string()),
+                        Some("provider execution failed".to_string()),
+                        Some(format!("{error:#}")),
+                        "provider".to_string(),
+                    ),
+                }
+            } else {
+                (
+                    "accepted".to_string(),
+                    format!(
+                        "Accepted bounded offload for worker `{}/{}` through service `{}/{}`. Prompt bytes: {}. Re-run with `--execute` to call the provider.",
+                        worker_namespace
+                            .as_deref()
+                            .unwrap_or(control_namespace.as_str()),
+                        worker.metadata.name,
+                        control_namespace,
+                        service_name,
+                        prompt.len()
+                    ),
+                    Some("accepted".to_string()),
+                    Some("Worker service matched a registered worker manifest.".to_string()),
+                    None,
+                    "accepted".to_string(),
+                )
+            };
         if let Some(path) = output_path.as_ref() {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create '{}'", parent.display()))?;
-            }
-            fs::write(path, &response)
-                .with_context(|| format!("failed to write '{}'", path.display()))?;
+            write_worker_artifact(path, &response)?;
         }
-        return Ok(WorkerOffloadReport {
-            job_name,
+        let completed_at_epoch_ms = now_epoch_ms();
+        let report = WorkerOffloadReport {
+            run_id: run_id.clone(),
+            job_name: job_name.clone(),
             namespace: control_namespace.clone(),
             service_name,
-            phase: "accepted".to_string(),
+            phase: phase.clone(),
             selected_class: service.spec.class_name.clone(),
             fallback_class: false,
             worker: Some(worker.metadata.name.clone()),
-            worker_namespace: worker.metadata.namespace.clone(),
+            worker_namespace: worker_namespace.clone(),
             worker_provider: Some(worker.spec.provider.clone()),
             worker_model: Some(worker.spec.model.clone()),
             worker_locality: worker.spec.locality.clone(),
-            validation_state: Some("accepted".to_string()),
-            validation_message: Some(
-                "Worker service matched a registered worker manifest.".to_string(),
-            ),
-            artifact_path: None,
-            output_path: output_path.map(|path| path.display().to_string()),
-            response: Some(response),
-        });
+            validation_state: validation_state.clone(),
+            validation_message: validation_message.clone(),
+            artifact_path: output_path.as_ref().map(|path| path.display().to_string()),
+            output_path: output_path.as_ref().map(|path| path.display().to_string()),
+            response: Some(response.clone()),
+        };
+        let record = WorkerRunRecord {
+            id: run_id,
+            job_name,
+            namespace: control_namespace.clone(),
+            service_name: report.service_name.clone(),
+            phase,
+            execution_mode,
+            started_at_epoch_ms,
+            completed_at_epoch_ms,
+            duration_ms: completed_at_epoch_ms.saturating_sub(started_at_epoch_ms),
+            intent: options.intent.as_deref().and_then(clean_optional_string),
+            prompt_sha256: sha256_hex(prompt.as_bytes()),
+            prompt_bytes: prompt.len(),
+            prompt_preview: preview_text(&prompt, 180),
+            selected_class: report.selected_class.clone(),
+            fallback_class: false,
+            worker: report.worker.clone(),
+            worker_namespace,
+            worker_provider: report.worker_provider.clone(),
+            worker_model: report.worker_model.clone(),
+            worker_locality: report.worker_locality.clone(),
+            validation_state,
+            validation_message,
+            artifact_path: report.artifact_path.clone(),
+            output_path: report.output_path.clone(),
+            response_preview: Some(preview_text(&response, 240)),
+            error,
+            node: local_node_name().ok(),
+        };
+        save_worker_run_record(&record)?;
+        return Ok(report);
     }
+    let started_at_epoch_ms = now_epoch_ms();
     let target = resolve_service_target_for_message(
         &service_name,
         Some(&control_namespace),
@@ -4641,31 +4754,63 @@ pub fn run_worker_offload(options: WorkerOffloadOptions) -> anyhow::Result<Worke
         target.runtime_namespace, control_namespace, service_name
     );
     if let Some(path) = output_path.as_ref() {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create '{}'", parent.display()))?;
-        }
-        fs::write(path, &response)
-            .with_context(|| format!("failed to write '{}'", path.display()))?;
+        write_worker_artifact(path, &response)?;
     }
-    Ok(WorkerOffloadReport {
-        job_name,
+    let completed_at_epoch_ms = now_epoch_ms();
+    let run_id = format!("{}-{}", slugify(&job_name), started_at_epoch_ms);
+    let report = WorkerOffloadReport {
+        run_id: run_id.clone(),
+        job_name: job_name.clone(),
         namespace: control_namespace.clone(),
         service_name,
         phase: "dispatched".to_string(),
         selected_class: Some("runtime".to_string()),
         fallback_class: false,
         worker: Some(target.runtime_namespace),
-        worker_namespace: Some(control_namespace),
+        worker_namespace: Some(control_namespace.clone()),
         worker_provider: Some("codex".to_string()),
         worker_model: Some("codex".to_string()),
         worker_locality: Some("cluster".to_string()),
         validation_state: Some("accepted".to_string()),
         validation_message: Some("Service endpoint resolved and prompt was delivered.".to_string()),
         artifact_path: None,
-        output_path: output_path.map(|path| path.display().to_string()),
+        output_path: output_path.as_ref().map(|path| path.display().to_string()),
         response: Some(response),
-    })
+    };
+    let record = WorkerRunRecord {
+        id: run_id,
+        job_name,
+        namespace: control_namespace,
+        service_name: report.service_name.clone(),
+        phase: report.phase.clone(),
+        execution_mode: "runtime".to_string(),
+        started_at_epoch_ms,
+        completed_at_epoch_ms,
+        duration_ms: completed_at_epoch_ms.saturating_sub(started_at_epoch_ms),
+        intent: options.intent.as_deref().and_then(clean_optional_string),
+        prompt_sha256: sha256_hex(prompt.as_bytes()),
+        prompt_bytes: prompt.len(),
+        prompt_preview: preview_text(&prompt, 180),
+        selected_class: report.selected_class.clone(),
+        fallback_class: false,
+        worker: report.worker.clone(),
+        worker_namespace: report.worker_namespace.clone(),
+        worker_provider: report.worker_provider.clone(),
+        worker_model: report.worker_model.clone(),
+        worker_locality: report.worker_locality.clone(),
+        validation_state: report.validation_state.clone(),
+        validation_message: report.validation_message.clone(),
+        artifact_path: report.artifact_path.clone(),
+        output_path: report.output_path.clone(),
+        response_preview: report
+            .response
+            .as_deref()
+            .map(|response| preview_text(response, 240)),
+        error: None,
+        node: local_node_name().ok(),
+    };
+    save_worker_run_record(&record)?;
+    Ok(report)
 }
 
 pub fn resolve_service_target_for_message(
@@ -4679,6 +4824,518 @@ pub fn resolve_service_target_for_message(
         source_runtime_namespace,
         Some("conversation"),
     )
+}
+
+pub fn list_worker_run_records(
+    limit: Option<usize>,
+    include_remote: bool,
+) -> anyhow::Result<Vec<WorkerRunRecord>> {
+    let mut records = list_local_worker_run_records()?;
+    if include_remote && env::var_os("JARVIS_WORKER_RUNS_LOCAL_ONLY").is_none() {
+        records.extend(collect_remote_worker_run_records()?);
+    }
+    records.sort_by(|left, right| {
+        right
+            .completed_at_epoch_ms
+            .cmp(&left.completed_at_epoch_ms)
+            .then_with(|| right.started_at_epoch_ms.cmp(&left.started_at_epoch_ms))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    if let Some(limit) = limit {
+        records.truncate(limit);
+    }
+    Ok(records)
+}
+
+pub fn load_worker_run_record(id: &str) -> anyhow::Result<WorkerRunRecord> {
+    let path = worker_runs_dir()?.join(format!("{}.json", sanitize_file_id(id)?));
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read worker run '{}'", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("failed to parse '{}'", path.display()))
+}
+
+pub fn render_worker_runs_output(
+    records: &[WorkerRunRecord],
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(records).context("failed to encode worker runs")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(records).context("failed to encode worker runs")
+        }
+        ControlPlaneOutput::Table => {
+            let mut lines =
+                vec!["RUN\tPHASE\tMODE\tSERVICE\tWORKER\tVALIDATION\tOUTPUT".to_string()];
+            for record in records {
+                lines.push(format!(
+                    "{}\t{}\t{}\t{}/{}\t{}\t{}\t{}",
+                    record.id,
+                    record.phase,
+                    record.execution_mode,
+                    record.namespace,
+                    record.service_name,
+                    record.worker.as_deref().unwrap_or("-"),
+                    record.validation_state.as_deref().unwrap_or("-"),
+                    record.output_path.as_deref().unwrap_or("-")
+                ));
+            }
+            Ok(lines.join("\n"))
+        }
+    }
+}
+
+fn run_remote_worker_offload(
+    options: WorkerOffloadOptions,
+    local_error: anyhow::Error,
+) -> anyhow::Result<WorkerOffloadReport> {
+    let nodes = load_manifests_by_kind(ResourceKind::Node, None)?
+        .into_iter()
+        .filter_map(|manifest| match manifest {
+            ResourceManifest::Node(node) if !node_is_local(&node) => Some(node),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut failures = vec![format!("local: {local_error}")];
+    for node in nodes {
+        let mut command = vec![
+            "env".to_string(),
+            "JARVIS_WORKER_OFFLOAD_LOCAL_ONLY=1".to_string(),
+            "jarvisctl".to_string(),
+            "worker".to_string(),
+            "offload".to_string(),
+            "--service".to_string(),
+            options.service_name.clone(),
+            "--resource-namespace".to_string(),
+            normalize_namespaced_resource_namespace(options.control_namespace.as_deref()),
+            "--prompt".to_string(),
+            options.prompt.clone(),
+            "--output".to_string(),
+            "json".to_string(),
+        ];
+        if let Some(namespace) = options.via_runtime_namespace.as_ref() {
+            command.push("--via-runtime-namespace".to_string());
+            command.push(namespace.clone());
+        }
+        if let Some(intent) = options.intent.as_ref() {
+            command.push("--intent".to_string());
+            command.push(intent.clone());
+        }
+        if let Some(output_path) = options.output_path.as_ref() {
+            command.push("--output-path".to_string());
+            command.push(output_path.display().to_string());
+        }
+        if let Some(job_name) = options.job_name.as_ref() {
+            command.push("--job-name".to_string());
+            command.push(job_name.clone());
+        }
+        if options.execute {
+            command.push("--execute".to_string());
+        }
+        match run_remote_runtime_command_output(&node, command, 120) {
+            Ok(stdout) => match serde_json::from_str::<WorkerOffloadReport>(&stdout) {
+                Ok(mut report) => {
+                    report.validation_message = Some(format!(
+                        "{} Remote node: {}.",
+                        report.validation_message.unwrap_or_default(),
+                        node.metadata.name
+                    ));
+                    return Ok(report);
+                }
+                Err(error) => {
+                    failures.push(format!("{}: parse failed: {error}", node.metadata.name))
+                }
+            },
+            Err(error) => failures.push(format!("{}: {error:#}", node.metadata.name)),
+        }
+    }
+    bail!(
+        "worker offload could not run locally or on remote nodes: {}",
+        failures.join("; ")
+    )
+}
+
+fn execute_provider_worker(
+    worker: &ResourceEnvelope<WorkerSpec>,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    let provider = worker.spec.provider.trim().to_lowercase();
+    if provider == "mock" || provider == "local" {
+        return Ok(json!({
+            "worker": worker.metadata.name,
+            "model": worker.spec.model,
+            "status": "completed",
+            "summary": format!("mock worker accepted {} bytes", prompt.len())
+        })
+        .to_string());
+    }
+    let api_key = resolve_worker_api_key(worker)?;
+    let endpoint = worker_provider_endpoint(worker)?;
+    let mut messages = Vec::new();
+    if let Some(system_prompt) = worker
+        .spec
+        .system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        messages.push(json!({"role": "system", "content": system_prompt}));
+    }
+    messages.push(json!({"role": "user", "content": prompt}));
+    let mut body = json!({
+        "model": worker.spec.model,
+        "messages": messages,
+    });
+    if let Some(temperature) = worker.spec.temperature {
+        body["temperature"] = json!(temperature);
+    }
+    if let Some(top_p) = worker.spec.top_p {
+        body["top_p"] = json!(top_p);
+    }
+    if let Some(max_tokens) = worker.spec.num_predict {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    call_openai_compatible_provider(&endpoint, &api_key, &body)
+}
+
+fn call_openai_compatible_provider(
+    endpoint: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+) -> anyhow::Result<String> {
+    let body_raw = serde_json::to_vec(body).context("failed to encode provider request")?;
+    let mut child = ProcessCommand::new("curl")
+        .args([
+            "-sS",
+            "--fail-with-body",
+            "--max-time",
+            "120",
+            "-H",
+            "Content-Type: application/json",
+            "-H",
+            &format!("Authorization: Bearer {api_key}"),
+            "--data-binary",
+            "@-",
+            endpoint,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn curl for worker provider call")?;
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow!("failed to open curl stdin"))?;
+        stdin
+            .write_all(&body_raw)
+            .context("failed to write provider request to curl")?;
+    }
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for worker provider call")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!(
+            "provider HTTP call failed with status {}: {}{}{}",
+            output.status,
+            stdout,
+            if stderr.is_empty() { "" } else { " / " },
+            stderr
+        );
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).context("provider response was not JSON")?;
+    value
+        .pointer("/choices/0/message/content")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            value
+                .pointer("/choices/0/text")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .ok_or_else(|| anyhow!("provider response did not include message content"))
+}
+
+fn worker_provider_endpoint(worker: &ResourceEnvelope<WorkerSpec>) -> anyhow::Result<String> {
+    if let Some(endpoint) = worker
+        .spec
+        .endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(endpoint.to_string());
+    }
+    let provider = worker.spec.provider.trim().to_lowercase();
+    let env_key = format!(
+        "JARVIS_WORKER_{}_ENDPOINT",
+        provider.replace('-', "_").to_uppercase()
+    );
+    if let Ok(endpoint) = env::var(&env_key) {
+        let endpoint = endpoint.trim();
+        if !endpoint.is_empty() {
+            return Ok(endpoint.to_string());
+        }
+    }
+    match provider.as_str() {
+        "nvidia" => Ok("https://integrate.api.nvidia.com/v1/chat/completions".to_string()),
+        "openai" => Ok("https://api.openai.com/v1/chat/completions".to_string()),
+        "openrouter" => Ok("https://openrouter.ai/api/v1/chat/completions".to_string()),
+        "openai-compatible" | "compatible" => bail!(
+            "worker '{}' must set spec.endpoint or {env_key}",
+            worker.metadata.name
+        ),
+        _ => bail!(
+            "worker provider '{}' is not executable yet; supported providers: mock, local, nvidia, openai, openrouter, openai-compatible",
+            worker.spec.provider
+        ),
+    }
+}
+
+fn resolve_worker_api_key(worker: &ResourceEnvelope<WorkerSpec>) -> anyhow::Result<String> {
+    if let Some(reference) = worker.spec.api_key_secret_ref.as_ref() {
+        let namespace = worker.metadata.namespace.as_deref().unwrap_or("default");
+        let manifest = load_manifest(ResourceKind::Secret, &reference.name, Some(namespace))?;
+        let ResourceManifest::Secret(secret) = manifest else {
+            bail!(
+                "resource '{}/{}' is not a Secret",
+                namespace,
+                reference.name
+            );
+        };
+        return secret
+            .spec
+            .string_data
+            .get(&reference.key)
+            .cloned()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "secret '{}/{}' does not contain key '{}'",
+                    namespace,
+                    reference.name,
+                    reference.key
+                )
+            });
+    }
+    let provider = worker.spec.provider.trim().to_uppercase().replace('-', "_");
+    for key in [
+        format!("JARVIS_WORKER_{provider}_API_KEY"),
+        format!("{provider}_API_KEY"),
+        "OPENAI_API_KEY".to_string(),
+    ] {
+        if let Ok(value) = env::var(&key) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Ok(value.to_string());
+            }
+        }
+    }
+    bail!(
+        "worker '{}' has no apiKeySecretRef and no provider API key environment variable",
+        worker.metadata.name
+    )
+}
+
+fn validate_worker_response(
+    worker: &ResourceEnvelope<WorkerSpec>,
+    response: &str,
+) -> (String, String) {
+    if worker
+        .spec
+        .output_mode
+        .as_deref()
+        .map(|value| value.eq_ignore_ascii_case("json"))
+        .unwrap_or(false)
+    {
+        match serde_json::from_str::<serde_json::Value>(response) {
+            Ok(_) => (
+                "passed".to_string(),
+                "worker response matched outputMode=json".to_string(),
+            ),
+            Err(error) => (
+                "failed".to_string(),
+                format!("worker response did not parse as JSON: {error}"),
+            ),
+        }
+    } else {
+        (
+            "passed".to_string(),
+            "worker response captured without schema validation".to_string(),
+        )
+    }
+}
+
+fn default_worker_artifact_path(run_id: &str) -> anyhow::Result<PathBuf> {
+    Ok(worker_run_artifacts_dir()?.join(format!("{}.txt", sanitize_file_id(run_id)?)))
+}
+
+fn write_worker_artifact(path: &Path, response: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create '{}'", parent.display()))?;
+    }
+    atomic_write_string(path, response)
+        .with_context(|| format!("failed to write '{}'", path.display()))
+}
+
+fn save_worker_run_record(record: &WorkerRunRecord) -> anyhow::Result<()> {
+    let path = worker_runs_dir()?.join(format!("{}.json", sanitize_file_id(&record.id)?));
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create '{}'", parent.display()))?;
+    }
+    let raw = serde_json::to_string_pretty(record).context("failed to encode worker run")?;
+    atomic_write_string(&path, &raw)
+}
+
+fn list_local_worker_run_records() -> anyhow::Result<Vec<WorkerRunRecord>> {
+    let dir = worker_runs_dir()?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut records = Vec::new();
+    for entry in
+        fs::read_dir(&dir).with_context(|| format!("failed to read '{}'", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read '{}'", path.display()))?;
+        records.push(
+            serde_json::from_str(&raw)
+                .with_context(|| format!("failed to parse '{}'", path.display()))?,
+        );
+    }
+    Ok(records)
+}
+
+fn collect_remote_worker_run_records() -> anyhow::Result<Vec<WorkerRunRecord>> {
+    let nodes = load_manifests_by_kind(ResourceKind::Node, None)?
+        .into_iter()
+        .filter_map(|manifest| match manifest {
+            ResourceManifest::Node(node) if !node_is_local(&node) => Some(node),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut records = Vec::new();
+    for node in nodes {
+        let output = run_remote_runtime_command_output(
+            &node,
+            vec![
+                "env".to_string(),
+                "JARVIS_WORKER_RUNS_LOCAL_ONLY=1".to_string(),
+                "jarvisctl".to_string(),
+                "worker".to_string(),
+                "runs".to_string(),
+                "--limit".to_string(),
+                "50".to_string(),
+                "--output".to_string(),
+                "json".to_string(),
+            ],
+            30,
+        );
+        let Ok(output) = output else {
+            continue;
+        };
+        let Ok(mut remote_records) = serde_json::from_str::<Vec<WorkerRunRecord>>(&output) else {
+            continue;
+        };
+        for record in &mut remote_records {
+            record
+                .node
+                .get_or_insert_with(|| node.metadata.name.clone());
+        }
+        records.extend(remote_records);
+    }
+    Ok(records)
+}
+
+fn worker_runs_dir() -> anyhow::Result<PathBuf> {
+    Ok(jarvis_codex_dir()?.join("worker-runs"))
+}
+
+fn worker_run_artifacts_dir() -> anyhow::Result<PathBuf> {
+    Ok(jarvis_codex_dir()?.join("worker-artifacts"))
+}
+
+fn sanitize_file_id(id: &str) -> anyhow::Result<String> {
+    let sanitized = slugify(id);
+    ensure!(!sanitized.is_empty(), "invalid empty identifier");
+    Ok(sanitized)
+}
+
+fn clean_optional_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn preview_text(value: &str, limit: usize) -> String {
+    let mut out = String::new();
+    for ch in value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+    {
+        if out.chars().count() >= limit {
+            out.push_str("...");
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn local_node_name() -> anyhow::Result<String> {
+    if let Some(node) = load_manifests_by_kind(ResourceKind::Node, None)?
+        .into_iter()
+        .filter_map(|manifest| match manifest {
+            ResourceManifest::Node(node) if node_is_local(&node) => Some(node),
+            _ => None,
+        })
+        .next()
+    {
+        return Ok(node.metadata.name);
+    }
+    env::var("HOSTNAME")
+        .map(|value| value.trim().to_string())
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            ProcessCommand::new("hostname")
+                .output()
+                .ok()
+                .and_then(|output| {
+                    if output.status.success() {
+                        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .filter(|value| !value.is_empty())
+        })
+        .ok_or_else(|| anyhow!("could not determine local node name"))
 }
 
 pub fn authorize_runtime_message(
@@ -7308,6 +7965,44 @@ fn run_remote_runtime_command(
     Ok(())
 }
 
+fn run_remote_runtime_command_output(
+    node: &ResourceEnvelope<NodeSpec>,
+    command: Vec<String>,
+    timeout_seconds: u64,
+) -> anyhow::Result<String> {
+    let target = node_ssh_target(&node.spec)
+        .ok_or_else(|| anyhow!("Node '{}' has no SSH target", node.metadata.name))?;
+    let remote_command = shell_words::join(command);
+    let output = ProcessCommand::new("timeout")
+        .args([
+            "--kill-after=5s",
+            &format!("{}s", timeout_seconds.max(1)),
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            &target,
+            &remote_command,
+        ])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to run remote command on Node '{}'",
+                node.metadata.name
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "remote command on Node '{}' failed with status {}: {}",
+            node.metadata.name,
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 fn run_remote_runtime_command_interactive(
     node: &ResourceEnvelope<NodeSpec>,
     command: Vec<String>,
@@ -7601,6 +8296,87 @@ mod tests {
         let validation = validate_worker_lanes().unwrap();
         assert_eq!(validation.status, "passed");
         assert_eq!(validation.ready_workers, 1);
+    }
+
+    #[test]
+    fn worker_offload_execute_records_run_and_artifact() {
+        let _lock = home_env_lock().lock().unwrap();
+        let home = TempHomeGuard::new("jarvisctl-worker-offload-run");
+        save_manifest(&ResourceManifest::Worker(ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Worker".to_string(),
+            metadata: ResourceMetadata {
+                name: "mock-code".to_string(),
+                namespace: Some("openclaw".to_string()),
+                labels: BTreeMap::from([
+                    ("role".to_string(), "code".to_string()),
+                    ("stability".to_string(), "stable".to_string()),
+                ]),
+                annotations: BTreeMap::new(),
+            },
+            spec: WorkerSpec {
+                provider: "mock".to_string(),
+                model: "mock-json".to_string(),
+                role: "code".to_string(),
+                output_mode: Some("json".to_string()),
+                classes: vec!["junior-code".to_string()],
+                capabilities: vec!["code".to_string(), "json".to_string()],
+                max_concurrent: Some(2),
+                ..WorkerSpec::default()
+            },
+        }))
+        .unwrap();
+        save_manifest(&ResourceManifest::Service(ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Service".to_string(),
+            metadata: ResourceMetadata {
+                name: "code-svc".to_string(),
+                namespace: Some("openclaw".to_string()),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: ServiceSpec {
+                selector: BTreeMap::from([
+                    ("role".to_string(), "code".to_string()),
+                    ("stability".to_string(), "stable".to_string()),
+                ]),
+                target_kind: Some(ServiceTargetKind::Worker),
+                class_name: Some("junior-code".to_string()),
+                required_capabilities: vec!["json".to_string()],
+                allowed_intents: vec!["task_offload".to_string()],
+                ..ServiceSpec::default()
+            },
+        }))
+        .unwrap();
+
+        let output_path = home.root.join("result.json");
+        let report = run_worker_offload(WorkerOffloadOptions {
+            service_name: "code-svc".to_string(),
+            control_namespace: Some("openclaw".to_string()),
+            via_runtime_namespace: None,
+            prompt: "Return a tiny JSON status.".to_string(),
+            intent: Some("task_offload".to_string()),
+            output_path: Some(output_path.clone()),
+            job_name: Some("mock-worker-smoke".to_string()),
+            execute: true,
+        })
+        .unwrap();
+
+        assert_eq!(report.phase, "completed");
+        assert_eq!(report.validation_state.as_deref(), Some("passed"));
+        assert_eq!(report.worker.as_deref(), Some("mock-code"));
+        assert!(output_path.exists());
+
+        let records = list_worker_run_records(Some(10), false).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].job_name, "mock-worker-smoke");
+        assert_eq!(records[0].execution_mode, "provider");
+        assert_eq!(records[0].phase, "completed");
+        assert_eq!(records[0].validation_state.as_deref(), Some("passed"));
+        assert_eq!(
+            load_worker_run_record(&records[0].id).unwrap().id,
+            records[0].id
+        );
     }
 
     #[test]
