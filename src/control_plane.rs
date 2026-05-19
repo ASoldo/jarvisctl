@@ -475,6 +475,23 @@ pub struct NodeBootstrapOptions {
     pub codex_path: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct NodeSudoOptions {
+    pub node: String,
+    pub command: String,
+    pub password: String,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeSudoReport {
+    pub node: String,
+    pub target: String,
+    pub exit_status: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ResourceMetadata {
     pub name: String,
@@ -3062,6 +3079,134 @@ pub fn render_node_probe_output(name: &str, output: ControlPlaneOutput) -> anyho
         }
         ControlPlaneOutput::Table => Ok(render_node_status_table(&node.metadata.name, &status)),
     }
+}
+
+pub fn run_node_sudo(options: NodeSudoOptions) -> anyhow::Result<NodeSudoReport> {
+    ensure!(
+        !options.password.is_empty(),
+        "sudo password must be provided through stdin"
+    );
+    ensure!(
+        !options.command.trim().is_empty(),
+        "sudo command cannot be empty"
+    );
+    let manifest = load_manifest(ResourceKind::Node, &options.node, None)?;
+    let ResourceManifest::Node(node) = manifest else {
+        bail!("resource '{}' is not a Node", options.node);
+    };
+    if node_is_local(&node) {
+        run_local_sudo_command(&node.metadata.name, &options.command, &options.password)
+    } else {
+        let target = node_ssh_target(&node.spec)
+            .ok_or_else(|| anyhow!("Node '{}' has no SSH target", node.metadata.name))?;
+        run_remote_sudo_command(
+            &node.metadata.name,
+            &target,
+            &options.command,
+            &options.password,
+            options.timeout_seconds,
+        )
+    }
+}
+
+pub fn render_node_sudo_output(
+    report: &NodeSudoReport,
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(report).context("failed to encode node sudo report")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(report).context("failed to encode node sudo report")
+        }
+        ControlPlaneOutput::Table => Ok(format!(
+            "NODE\tTARGET\tEXIT\n{}\t{}\t{}",
+            report.node, report.target, report.exit_status
+        )),
+    }
+}
+
+fn run_local_sudo_command(
+    node_name: &str,
+    command: &str,
+    password: &str,
+) -> anyhow::Result<NodeSudoReport> {
+    let mut child = ProcessCommand::new("sudo")
+        .args(["-S", "-p", "", "sh", "-lc", command])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to start local sudo command")?;
+    {
+        let stdin = child.stdin.as_mut().context("failed to open sudo stdin")?;
+        stdin
+            .write_all(format!("{password}\n").as_bytes())
+            .context("failed to write sudo password")?;
+    }
+    let output = child
+        .wait_with_output()
+        .context("failed waiting for local sudo command")?;
+    Ok(NodeSudoReport {
+        node: node_name.to_string(),
+        target: "local".to_string(),
+        exit_status: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+fn run_remote_sudo_command(
+    node_name: &str,
+    target: &str,
+    command: &str,
+    password: &str,
+    timeout_seconds: u64,
+) -> anyhow::Result<NodeSudoReport> {
+    let command_b64 = BASE64.encode(command.as_bytes());
+    let remote_script = format!(
+        "set -eu\nIFS= read -r JARVIS_SUDO_PASSWORD\nJARVIS_REMOTE_COMMAND=$(printf '%s' {} | base64 -d)\nprintf '%s\\n' \"$JARVIS_SUDO_PASSWORD\" | sudo -S -p '' sh -lc \"$JARVIS_REMOTE_COMMAND\"\n",
+        shell_words::quote(&command_b64)
+    );
+    let remote_command = shell_words::join(["sh".to_string(), "-lc".to_string(), remote_script]);
+    let timeout_duration = format!("{}s", timeout_seconds.max(10));
+    let mut child = ProcessCommand::new("timeout")
+        .args([
+            "--kill-after=5s",
+            &timeout_duration,
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            target,
+            &remote_command,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start remote sudo command on '{target}'"))?;
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .context("failed to open remote sudo stdin")?;
+        stdin
+            .write_all(format!("{password}\n").as_bytes())
+            .context("failed to stream remote sudo password")?;
+    }
+    let output = child
+        .wait_with_output()
+        .context("failed waiting for remote sudo command")?;
+    Ok(NodeSudoReport {
+        node: node_name.to_string(),
+        target: target.to_string(),
+        exit_status: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
 }
 
 pub fn attach_cluster_runtime_session(namespace: &str, agent: &str) -> anyhow::Result<bool> {
