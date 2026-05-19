@@ -231,7 +231,9 @@ pub fn worker_lane_scorecards(
         },
         WorkerLaneScorecard {
             lane: "bounded-worker-offload".to_string(),
-            readiness: if executed_worker_runs > 0 && failed_worker_runs == 0 {
+            readiness: if failed_worker_runs > 0 {
+                "blocked"
+            } else if executed_worker_runs > 0 {
                 "executable"
             } else if completed_worker_runs > 0 {
                 "routable"
@@ -247,7 +249,12 @@ pub fn worker_lane_scorecards(
                 format!("{completed_worker_runs} worker run(s) accepted/completed"),
                 format!("{executed_worker_runs} provider-backed worker run(s)"),
             ],
-            gaps: if executed_worker_runs > 0 {
+            gaps: if failed_worker_runs > 0 {
+                vec![
+                    format!("{failed_worker_runs} provider-backed worker run(s) failed"),
+                    "clear failing or end-of-life worker models before promotion".to_string(),
+                ]
+            } else if executed_worker_runs > 0 {
                 vec!["promote only lanes with repeatable validation artifacts".to_string()]
             } else {
                 vec![

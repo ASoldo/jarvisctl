@@ -7468,7 +7468,12 @@ fn select_worker_for_service(
         })
         .filter(|worker| worker_matches_service(service, worker))
         .collect::<Vec<_>>();
-    workers.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
+    let recent_runs = list_local_worker_run_records().unwrap_or_default();
+    workers.sort_by(|left, right| {
+        worker_recent_failure_count(left, &recent_runs)
+            .cmp(&worker_recent_failure_count(right, &recent_runs))
+            .then_with(|| left.metadata.name.cmp(&right.metadata.name))
+    });
     workers.into_iter().next().ok_or_else(|| {
         anyhow!(
             "worker service '{}/{}' has no matching Worker manifests",
@@ -7516,6 +7521,22 @@ fn worker_matches_service(
         return false;
     }
     true
+}
+
+fn worker_recent_failure_count(
+    worker: &ResourceEnvelope<WorkerSpec>,
+    records: &[WorkerRunRecord],
+) -> usize {
+    let namespace = worker.metadata.namespace.as_deref().unwrap_or("default");
+    records
+        .iter()
+        .filter(|record| {
+            record.phase == "failed"
+                && record.worker.as_deref() == Some(worker.metadata.name.as_str())
+                && record.worker_namespace.as_deref().unwrap_or("default") == namespace
+                && record.worker_model.as_deref() == Some(worker.spec.model.as_str())
+        })
+        .count()
 }
 
 fn service_matches_session(
