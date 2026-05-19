@@ -62,23 +62,25 @@ use codex_app::{
 use control_plane::{
     ControlPlaneOutput, ControlPlaneResourceKindArg, KubernetesRenderOutput, NodeBootstrapOptions,
     NodeFanoutOptions, NodeLinksOptions, NodePairSessionOptions, NodeRegisterOptions,
-    NodeScheduleOptions, NodeStartSessionOptions, NodeVisitOptions, WorkerOffloadOptions,
-    apply_kubernetes_resources, apply_kustomization, apply_manifests,
+    NodeScheduleOptions, NodeStartSessionOptions, NodeVisitOptions, WorkerDriftSmokeOptions,
+    WorkerOffloadOptions, apply_kubernetes_resources, apply_kustomization, apply_manifests,
     attach_cluster_runtime_session, authorize_runtime_message, bootstrap_node, check_node_links,
     cleanup_node, cluster_index, delete_cluster_runtime_session, doctor_nodes, inspect_node,
     interrupt_cluster_runtime_session, list_worker_run_records,
-    load_or_create_orchestration_policy, load_worker_run_record, migrate_session_to_node,
-    open_visit_capsule, orchestration_policy_path, pause_deployment_rollout, preflight_nodes,
-    read_auth_audit_events, reconcile_nodes, register_node, render_describe_output,
+    load_or_create_orchestration_policy, load_worker_run_record, mark_worker_run,
+    migrate_session_to_node, open_visit_capsule, orchestration_policy_path,
+    pause_deployment_rollout, preflight_nodes, prune_worker_runs, read_auth_audit_events,
+    read_worker_run_artifact, reconcile_nodes, register_node, render_describe_output,
     render_get_output, render_kubernetes_resources, render_node_probe_output,
-    render_rollout_history_output, render_rollout_status_output,
-    render_worker_model_validation_output, render_worker_runs_output,
-    render_worker_validation_output, resolve_service_target, resolve_service_target_for_message,
+    render_rollout_history_output, render_rollout_status_output, render_worker_drift_smoke_output,
+    render_worker_model_validation_output, render_worker_run_artifact_output,
+    render_worker_run_prune_output, render_worker_runs_output, render_worker_validation_output,
+    resolve_service_target, resolve_service_target_for_message,
     respond_cluster_runtime_server_request, restart_deployment_rollout, resume_deployment_rollout,
-    rotate_capsule_key, run_node_fanout, run_node_visit, run_worker_offload, schedule_node,
-    set_node_cordoned, start_node_pair_session, start_node_session, sync_codex_auth_to_node,
-    tell_cluster_runtime_session, undo_deployment_rollout, validate_worker_models,
-    wait_for_rollout_status_output,
+    rotate_capsule_key, run_node_fanout, run_node_visit, run_worker_drift_smoke,
+    run_worker_offload, schedule_node, set_node_cordoned, start_node_pair_session,
+    start_node_session, sync_codex_auth_to_node, tell_cluster_runtime_session,
+    undo_deployment_rollout, validate_worker_models, wait_for_rollout_status_output,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use mission::{
@@ -1154,6 +1156,82 @@ enum WorkerCommand {
         id: String,
 
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Yaml)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Read the artifact produced by a worker run
+    Artifact {
+        id: String,
+
+        #[arg(long)]
+        all: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Mark a worker run as acknowledged, remediated, or ignored
+    MarkRun {
+        id: String,
+
+        #[arg(long)]
+        status: String,
+
+        #[arg(long)]
+        note: Option<String>,
+
+        #[arg(long)]
+        all: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Json)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Validate models and execute a provider-backed smoke through a worker service
+    DriftSmoke {
+        #[arg(long, alias = "svc")]
+        service: String,
+
+        #[arg(short = 'n', long = "resource-namespace", alias = "ns", alias = "rns")]
+        resource_namespace: Option<String>,
+
+        #[arg(long)]
+        prompt: Option<String>,
+
+        #[arg(long = "output-path", alias = "artifact", value_hint = ValueHint::FilePath)]
+        output_path: Option<PathBuf>,
+
+        #[arg(long = "job-name", alias = "job")]
+        job_name: Option<String>,
+
+        #[arg(long)]
+        all: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Json)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Prune or redact worker run records and artifacts
+    PruneRuns {
+        #[arg(long = "max-age-days", default_value_t = 30)]
+        max_age_days: u64,
+
+        #[arg(long, default_value_t = true)]
+        dry_run: bool,
+
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+
+        #[arg(long, default_value_t = false)]
+        redact: bool,
+
+        #[arg(long = "no-redact", default_value_t = false)]
+        no_redact: bool,
+
+        #[arg(long)]
+        all: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
 }
@@ -2591,6 +2669,75 @@ fn worker_command(command: WorkerCommand) -> Result<(), JarvisError> {
             println!(
                 "{}",
                 render_worker_runs_output(&[record], output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        WorkerCommand::Artifact { id, all, output } => {
+            let report = read_worker_run_artifact(&id, all).map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_worker_run_artifact_output(&report, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        WorkerCommand::MarkRun {
+            id,
+            status,
+            note,
+            all,
+            output,
+        } => {
+            let record = mark_worker_run(&id, &status, note, all).map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_worker_runs_output(&[record], output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        WorkerCommand::DriftSmoke {
+            service,
+            resource_namespace,
+            prompt,
+            output_path,
+            job_name,
+            all,
+            output,
+        } => {
+            let report = run_worker_drift_smoke(WorkerDriftSmokeOptions {
+                service_name: service,
+                control_namespace: resource_namespace,
+                prompt,
+                output_path,
+                job_name,
+                all,
+            })
+            .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_worker_drift_smoke_output(&report, output).map_err(JarvisError::from)?
+            );
+            if report.status == "failed" {
+                return Err(JarvisError::from(anyhow::anyhow!(
+                    "worker drift smoke failed"
+                )));
+            }
+            Ok(())
+        }
+        WorkerCommand::PruneRuns {
+            max_age_days,
+            dry_run,
+            apply,
+            redact,
+            no_redact,
+            all,
+            output,
+        } => {
+            let report =
+                prune_worker_runs(max_age_days, dry_run && !apply, redact && !no_redact, all)
+                    .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_worker_run_prune_output(&report, output).map_err(JarvisError::from)?
             );
             Ok(())
         }

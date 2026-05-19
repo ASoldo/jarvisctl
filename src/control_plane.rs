@@ -1320,6 +1320,51 @@ pub struct WorkerRunRecord {
     pub response_preview: Option<String>,
     pub error: Option<String>,
     pub node: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation_note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediated_at_epoch_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub redacted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerDriftSmokeReport {
+    pub status: String,
+    pub model_validation: WorkerModelValidationReport,
+    pub offload: Option<WorkerOffloadReport>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerDriftSmokeOptions {
+    pub service_name: String,
+    pub control_namespace: Option<String>,
+    pub prompt: Option<String>,
+    pub output_path: Option<PathBuf>,
+    pub job_name: Option<String>,
+    pub all: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerRunArtifactReport {
+    pub id: String,
+    pub node: Option<String>,
+    pub path: Option<String>,
+    pub available: bool,
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerRunPruneReport {
+    pub dry_run: bool,
+    pub max_age_days: u64,
+    pub scanned: usize,
+    pub removed_records: usize,
+    pub removed_artifacts: usize,
+    pub redacted_records: usize,
+    pub remote_reports: Vec<WorkerRunPruneReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4769,6 +4814,10 @@ pub fn run_worker_offload(options: WorkerOffloadOptions) -> anyhow::Result<Worke
             response_preview: Some(preview_text(&response, 240)),
             error,
             node: local_node_name().ok(),
+            remediation_status: None,
+            remediation_note: None,
+            remediated_at_epoch_ms: None,
+            redacted: false,
         };
         save_worker_run_record(&record)?;
         return Ok(report);
@@ -4861,6 +4910,10 @@ pub fn run_worker_offload(options: WorkerOffloadOptions) -> anyhow::Result<Worke
             .map(|response| preview_text(response, 240)),
         error: None,
         node: local_node_name().ok(),
+        remediation_status: None,
+        remediation_note: None,
+        remediated_at_epoch_ms: None,
+        redacted: false,
     };
     save_worker_run_record(&record)?;
     Ok(report)
@@ -5010,6 +5063,266 @@ pub fn render_worker_runs_output(
             }
             Ok(lines.join("\n"))
         }
+    }
+}
+
+pub fn run_worker_drift_smoke(
+    options: WorkerDriftSmokeOptions,
+) -> anyhow::Result<WorkerDriftSmokeReport> {
+    let model_validation = validate_worker_models(options.all)?;
+    if model_validation.status == "failed" {
+        return Ok(WorkerDriftSmokeReport {
+            status: "failed".to_string(),
+            model_validation,
+            offload: None,
+        });
+    }
+    let service_name = options.service_name;
+    let namespace = options.control_namespace;
+    let prompt = options.prompt.unwrap_or_else(|| {
+        "Return strict JSON only with keys status, note, and checked_at. Use status ok if this worker lane is currently usable.".to_string()
+    });
+    let job_name = options.job_name.unwrap_or_else(|| {
+        format!(
+            "worker-drift-smoke-{}-{}",
+            slugify(&service_name),
+            now_epoch_ms()
+        )
+    });
+    let offload = run_worker_offload(WorkerOffloadOptions {
+        service_name,
+        control_namespace: namespace,
+        via_runtime_namespace: None,
+        prompt,
+        intent: Some("drift_smoke".to_string()),
+        output_path: options.output_path,
+        job_name: Some(job_name),
+        execute: true,
+    })?;
+    let status =
+        if offload.phase == "completed" && offload.validation_state.as_deref() == Some("passed") {
+            "passed"
+        } else {
+            "failed"
+        }
+        .to_string();
+    Ok(WorkerDriftSmokeReport {
+        status,
+        model_validation,
+        offload: Some(offload),
+    })
+}
+
+pub fn render_worker_drift_smoke_output(
+    report: &WorkerDriftSmokeReport,
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(report).context("failed to encode worker drift smoke")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(report).context("failed to encode worker drift smoke")
+        }
+        ControlPlaneOutput::Table => {
+            let offload = report.offload.as_ref();
+            Ok(format!(
+                "STATUS\tMODELS\tRUN\tPHASE\tWORKER\n{}\t{}/{}\t{}\t{}\t{}",
+                report.status,
+                report.model_validation.available,
+                report.model_validation.checked,
+                offload.map(|run| run.run_id.as_str()).unwrap_or("-"),
+                offload.map(|run| run.phase.as_str()).unwrap_or("-"),
+                offload.and_then(|run| run.worker.as_deref()).unwrap_or("-")
+            ))
+        }
+    }
+}
+
+pub fn read_worker_run_artifact(
+    id: &str,
+    include_remote: bool,
+) -> anyhow::Result<WorkerRunArtifactReport> {
+    match read_local_worker_run_artifact(id) {
+        Ok(report) => return Ok(report),
+        Err(local_error)
+            if include_remote && env::var_os("JARVIS_WORKER_RUNS_LOCAL_ONLY").is_none() =>
+        {
+            let nodes = load_manifests_by_kind(ResourceKind::Node, None)?
+                .into_iter()
+                .filter_map(|manifest| match manifest {
+                    ResourceManifest::Node(node) if !node_is_local(&node) => Some(node),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for node in nodes {
+                let output = run_remote_runtime_command_output(
+                    &node,
+                    vec![
+                        "env".to_string(),
+                        "JARVIS_WORKER_RUNS_LOCAL_ONLY=1".to_string(),
+                        "jarvisctl".to_string(),
+                        "worker".to_string(),
+                        "artifact".to_string(),
+                        id.to_string(),
+                        "--output".to_string(),
+                        "json".to_string(),
+                    ],
+                    30,
+                );
+                let Ok(output) = output else {
+                    continue;
+                };
+                if let Ok(mut report) = serde_json::from_str::<WorkerRunArtifactReport>(&output) {
+                    report
+                        .node
+                        .get_or_insert_with(|| node.metadata.name.clone());
+                    return Ok(report);
+                }
+            }
+            Err(local_error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn render_worker_run_artifact_output(
+    report: &WorkerRunArtifactReport,
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(report).context("failed to encode worker artifact")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(report).context("failed to encode worker artifact")
+        }
+        ControlPlaneOutput::Table => Ok(report.content.clone().unwrap_or_else(|| {
+            format!(
+                "artifact unavailable for {} ({})",
+                report.id,
+                report.path.as_deref().unwrap_or("-")
+            )
+        })),
+    }
+}
+
+pub fn mark_worker_run(
+    id: &str,
+    status: &str,
+    note: Option<String>,
+    include_remote: bool,
+) -> anyhow::Result<WorkerRunRecord> {
+    match mark_local_worker_run(id, status, note.clone()) {
+        Ok(record) => return Ok(record),
+        Err(local_error)
+            if include_remote && env::var_os("JARVIS_WORKER_RUNS_LOCAL_ONLY").is_none() =>
+        {
+            let nodes = load_manifests_by_kind(ResourceKind::Node, None)?
+                .into_iter()
+                .filter_map(|manifest| match manifest {
+                    ResourceManifest::Node(node) if !node_is_local(&node) => Some(node),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for node in nodes {
+                let mut command = vec![
+                    "env".to_string(),
+                    "JARVIS_WORKER_RUNS_LOCAL_ONLY=1".to_string(),
+                    "jarvisctl".to_string(),
+                    "worker".to_string(),
+                    "mark-run".to_string(),
+                    id.to_string(),
+                    "--status".to_string(),
+                    status.to_string(),
+                    "--output".to_string(),
+                    "json".to_string(),
+                ];
+                if let Some(note) = note.as_ref() {
+                    command.push("--note".to_string());
+                    command.push(note.clone());
+                }
+                let output = run_remote_runtime_command_output(&node, command, 30);
+                let Ok(output) = output else {
+                    continue;
+                };
+                if let Ok(mut record) = serde_json::from_str::<WorkerRunRecord>(&output) {
+                    record
+                        .node
+                        .get_or_insert_with(|| node.metadata.name.clone());
+                    return Ok(record);
+                }
+            }
+            Err(local_error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn prune_worker_runs(
+    max_age_days: u64,
+    dry_run: bool,
+    redact: bool,
+    include_remote: bool,
+) -> anyhow::Result<WorkerRunPruneReport> {
+    let mut report = prune_local_worker_runs(max_age_days, dry_run, redact)?;
+    if include_remote && env::var_os("JARVIS_WORKER_RUNS_LOCAL_ONLY").is_none() {
+        let nodes = load_manifests_by_kind(ResourceKind::Node, None)?
+            .into_iter()
+            .filter_map(|manifest| match manifest {
+                ResourceManifest::Node(node) if !node_is_local(&node) => Some(node),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for node in nodes {
+            let output = run_remote_runtime_command_output(
+                &node,
+                vec![
+                    "env".to_string(),
+                    "JARVIS_WORKER_RUNS_LOCAL_ONLY=1".to_string(),
+                    "jarvisctl".to_string(),
+                    "worker".to_string(),
+                    "prune-runs".to_string(),
+                    "--max-age-days".to_string(),
+                    max_age_days.to_string(),
+                    "--output".to_string(),
+                    "json".to_string(),
+                    if dry_run { "--dry-run" } else { "--apply" }.to_string(),
+                    if redact { "--redact" } else { "--no-redact" }.to_string(),
+                ],
+                45,
+            );
+            let Ok(output) = output else {
+                continue;
+            };
+            if let Ok(remote) = serde_json::from_str::<WorkerRunPruneReport>(&output) {
+                report.remote_reports.push(remote);
+            }
+        }
+    }
+    Ok(report)
+}
+
+pub fn render_worker_run_prune_output(
+    report: &WorkerRunPruneReport,
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(report).context("failed to encode worker prune report")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(report).context("failed to encode worker prune report")
+        }
+        ControlPlaneOutput::Table => Ok(format!(
+            "DRY_RUN\tSCANNED\tREMOVED_RECORDS\tREMOVED_ARTIFACTS\tREDACTED\tREMOTE\n{}\t{}\t{}\t{}\t{}\t{}",
+            report.dry_run,
+            report.scanned,
+            report.removed_records,
+            report.removed_artifacts,
+            report.redacted_records,
+            report.remote_reports.len()
+        )),
     }
 }
 
@@ -5595,13 +5908,17 @@ fn write_worker_artifact(path: &Path, response: &str) -> anyhow::Result<()> {
 }
 
 fn save_worker_run_record(record: &WorkerRunRecord) -> anyhow::Result<()> {
-    let path = worker_runs_dir()?.join(format!("{}.json", sanitize_file_id(&record.id)?));
+    let path = worker_run_record_path(&record.id)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create '{}'", parent.display()))?;
     }
     let raw = serde_json::to_string_pretty(record).context("failed to encode worker run")?;
     atomic_write_string(&path, &raw)
+}
+
+fn worker_run_record_path(id: &str) -> anyhow::Result<PathBuf> {
+    Ok(worker_runs_dir()?.join(format!("{}.json", sanitize_file_id(id)?)))
 }
 
 fn list_local_worker_run_records() -> anyhow::Result<Vec<WorkerRunRecord>> {
@@ -5667,6 +5984,109 @@ fn collect_remote_worker_run_records() -> anyhow::Result<Vec<WorkerRunRecord>> {
         records.extend(remote_records);
     }
     Ok(records)
+}
+
+fn read_local_worker_run_artifact(id: &str) -> anyhow::Result<WorkerRunArtifactReport> {
+    let record = load_worker_run_record(id)?;
+    let path = record
+        .artifact_path
+        .as_deref()
+        .or(record.output_path.as_deref())
+        .map(PathBuf::from);
+    let Some(path) = path else {
+        return Ok(WorkerRunArtifactReport {
+            id: id.to_string(),
+            node: local_node_name().ok(),
+            path: None,
+            available: false,
+            content: None,
+        });
+    };
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read worker artifact '{}'", path.display()))?;
+    Ok(WorkerRunArtifactReport {
+        id: id.to_string(),
+        node: record.node.or_else(|| local_node_name().ok()),
+        path: Some(path.display().to_string()),
+        available: true,
+        content: Some(content),
+    })
+}
+
+fn mark_local_worker_run(
+    id: &str,
+    status: &str,
+    note: Option<String>,
+) -> anyhow::Result<WorkerRunRecord> {
+    let mut record = load_worker_run_record(id)?;
+    let status = status.trim();
+    ensure!(
+        !status.is_empty(),
+        "worker run remediation status cannot be empty"
+    );
+    record.remediation_status = Some(status.to_string());
+    record.remediation_note = note.and_then(|value| clean_optional_string(&value));
+    record.remediated_at_epoch_ms = Some(now_epoch_ms());
+    save_worker_run_record(&record)?;
+    Ok(record)
+}
+
+fn prune_local_worker_runs(
+    max_age_days: u64,
+    dry_run: bool,
+    redact: bool,
+) -> anyhow::Result<WorkerRunPruneReport> {
+    let records = list_local_worker_run_records()?;
+    let cutoff = now_epoch_ms().saturating_sub(max_age_days as u128 * 86_400_000);
+    let mut report = WorkerRunPruneReport {
+        dry_run,
+        max_age_days,
+        scanned: records.len(),
+        removed_records: 0,
+        removed_artifacts: 0,
+        redacted_records: 0,
+        remote_reports: Vec::new(),
+    };
+    for mut record in records {
+        let old = record.completed_at_epoch_ms < cutoff;
+        if old {
+            report.removed_records += 1;
+            if !dry_run {
+                let _ = fs::remove_file(worker_run_record_path(&record.id)?);
+            }
+            if let Some(path) = record
+                .artifact_path
+                .as_deref()
+                .or(record.output_path.as_deref())
+            {
+                let path = PathBuf::from(path);
+                if path.exists() {
+                    report.removed_artifacts += 1;
+                    if !dry_run {
+                        let _ = fs::remove_file(path);
+                    }
+                }
+            }
+            continue;
+        }
+        if redact && !record.redacted {
+            report.redacted_records += 1;
+            if !dry_run {
+                record.prompt_preview = "[redacted by retention policy]".to_string();
+                record.response_preview = record
+                    .response_preview
+                    .as_ref()
+                    .map(|_| "[redacted by retention policy]".to_string());
+                record.error = record
+                    .error
+                    .as_ref()
+                    .map(|_| "[redacted by retention policy]".to_string());
+                record.redacted = true;
+                save_worker_run_record(&record)?;
+            }
+        }
+    }
+    Ok(report)
 }
 
 fn worker_runs_dir() -> anyhow::Result<PathBuf> {
