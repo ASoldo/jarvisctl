@@ -5246,7 +5246,7 @@ pub fn mark_worker_run(
                 let Ok(output) = output else {
                     continue;
                 };
-                if let Ok(mut record) = serde_json::from_str::<WorkerRunRecord>(&output) {
+                if let Ok(mut record) = parse_worker_run_record_output(&output) {
                     record
                         .node
                         .get_or_insert_with(|| node.metadata.name.clone());
@@ -6029,6 +6029,17 @@ fn mark_local_worker_run(
     record.remediated_at_epoch_ms = Some(now_epoch_ms());
     save_worker_run_record(&record)?;
     Ok(record)
+}
+
+fn parse_worker_run_record_output(output: &str) -> anyhow::Result<WorkerRunRecord> {
+    if let Ok(record) = serde_json::from_str::<WorkerRunRecord>(output) {
+        return Ok(record);
+    }
+    let mut records = serde_json::from_str::<Vec<WorkerRunRecord>>(output)
+        .context("failed to decode worker run record output")?;
+    records
+        .pop()
+        .context("worker run record output did not contain a record")
 }
 
 fn prune_local_worker_runs(
