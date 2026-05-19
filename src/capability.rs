@@ -95,6 +95,54 @@ pub struct MissionSmokeReport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecurringMissionSmokeConfig {
+    pub enabled: bool,
+    pub first_node: String,
+    pub second_node: String,
+    pub first_task_note: String,
+    pub second_task_note: String,
+    pub namespace_prefix: String,
+    pub interval_seconds: u64,
+    pub execute: bool,
+    pub updated_at_epoch_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RecurringMissionSmokeState {
+    #[serde(default)]
+    pub last_run_epoch_ms: Option<u128>,
+    #[serde(default)]
+    pub last_status: Option<String>,
+    #[serde(default)]
+    pub last_mission_id: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub run_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecurringMissionSmokeStatus {
+    pub configured: bool,
+    pub due: bool,
+    pub next_run_epoch_ms: Option<u128>,
+    pub config: Option<RecurringMissionSmokeConfig>,
+    pub state: RecurringMissionSmokeState,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecurringMissionSmokeConfigureOptions {
+    pub first_node: String,
+    pub second_node: String,
+    pub first_task_note: Option<PathBuf>,
+    pub second_task_note: Option<PathBuf>,
+    pub namespace_prefix: Option<String>,
+    pub interval_seconds: u64,
+    pub execute: bool,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutonomyReconcileAction {
     pub kind: String,
     pub status: String,
@@ -111,6 +159,8 @@ pub struct AutonomyReconcileReport {
     pub capability_count: usize,
     pub safe_actions: Vec<AutonomyReconcileAction>,
     pub blocked_actions: Vec<AutonomyReconcileAction>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub smoke_reports: Vec<MissionSmokeReport>,
     pub notifications_sent: usize,
     pub expired_requests: Vec<String>,
 }
@@ -392,6 +442,171 @@ pub fn run_two_node_mission_smoke(
     })
 }
 
+pub fn configure_recurring_mission_smoke(
+    options: RecurringMissionSmokeConfigureOptions,
+) -> anyhow::Result<RecurringMissionSmokeStatus> {
+    let first_node = clean_required(&options.first_node, "first node")?;
+    let second_node = clean_required(&options.second_node, "second node")?;
+    let first_task_note = options.first_task_note.unwrap_or(default_smoke_ticket_path(
+        &first_node,
+        &second_node,
+        "first",
+    )?);
+    let second_task_note = options
+        .second_task_note
+        .unwrap_or(default_smoke_ticket_path(
+            &first_node,
+            &second_node,
+            "second",
+        )?);
+    ensure_smoke_ticket(
+        &first_task_note,
+        &first_node,
+        &second_node,
+        "First node should report local readiness, exchange one concise partner message, and record evidence.",
+    )?;
+    ensure_smoke_ticket(
+        &second_task_note,
+        &second_node,
+        &first_node,
+        "Second node should report local readiness, exchange one concise partner message, and record evidence.",
+    )?;
+    let config = RecurringMissionSmokeConfig {
+        enabled: options.enabled,
+        first_node,
+        second_node,
+        first_task_note: first_task_note.display().to_string(),
+        second_task_note: second_task_note.display().to_string(),
+        namespace_prefix: options
+            .namespace_prefix
+            .unwrap_or_else(|| "jarvis-smoke".to_string()),
+        interval_seconds: options.interval_seconds.max(3600),
+        execute: options.execute,
+        updated_at_epoch_ms: now_epoch_ms(),
+    };
+    write_recurring_smoke_config(&config)?;
+    recurring_mission_smoke_status()
+}
+
+pub fn recurring_mission_smoke_status() -> anyhow::Result<RecurringMissionSmokeStatus> {
+    let config = load_recurring_smoke_config()?;
+    let state = load_recurring_smoke_state()?;
+    let now = now_epoch_ms();
+    let (due, next_run_epoch_ms) =
+        if let Some(config) = config.as_ref().filter(|config| config.enabled) {
+            let interval_ms = u128::from(config.interval_seconds) * 1000;
+            let next = state
+                .last_run_epoch_ms
+                .map(|last| last.saturating_add(interval_ms))
+                .unwrap_or(now);
+            (next <= now, Some(next))
+        } else {
+            (false, None)
+        };
+    Ok(RecurringMissionSmokeStatus {
+        configured: config.is_some(),
+        due,
+        next_run_epoch_ms,
+        config,
+        state,
+    })
+}
+
+pub fn run_recurring_mission_smoke(force: bool) -> anyhow::Result<Option<MissionSmokeReport>> {
+    let status = recurring_mission_smoke_status()?;
+    let Some(config) = status.config else {
+        return Ok(None);
+    };
+    if !config.enabled || (!status.due && !force) {
+        return Ok(None);
+    }
+    let mut state = status.state;
+    match run_two_node_mission_smoke(
+        config.first_node.clone(),
+        config.second_node.clone(),
+        PathBuf::from(&config.first_task_note),
+        PathBuf::from(&config.second_task_note),
+        Some(config.namespace_prefix.clone()),
+        !config.execute,
+        config.execute,
+        Vec::new(),
+    ) {
+        Ok(report) => {
+            state.last_run_epoch_ms = Some(now_epoch_ms());
+            state.last_status = Some(report.status.clone());
+            state.last_mission_id = Some(report.mission_id.clone());
+            state.last_error = None;
+            state.run_count = state.run_count.saturating_add(1);
+            write_recurring_smoke_state(&state)?;
+            Ok(Some(report))
+        }
+        Err(error) => {
+            state.last_run_epoch_ms = Some(now_epoch_ms());
+            state.last_status = Some("failed".to_string());
+            state.last_error = Some(error.to_string());
+            state.run_count = state.run_count.saturating_add(1);
+            write_recurring_smoke_state(&state)?;
+            Err(error)
+        }
+    }
+}
+
+pub fn run_due_recurring_mission_smoke(
+    dry_run: bool,
+) -> anyhow::Result<Option<MissionSmokeReport>> {
+    let status = recurring_mission_smoke_status()?;
+    let Some(config) = status.config.as_ref() else {
+        return Ok(None);
+    };
+    if !config.enabled || !status.due {
+        return Ok(None);
+    }
+    if dry_run {
+        return Ok(Some(MissionSmokeReport {
+            id: format!("two-node-smoke-planned-{}", now_epoch_ms()),
+            status: "planned".to_string(),
+            dry_run: true,
+            first_node: config.first_node.clone(),
+            second_node: config.second_node.clone(),
+            mission_id: "-".to_string(),
+            command: format!("jarvisctl mission smoke-run --force --output table"),
+            evidence: vec!["recurring smoke is due".to_string()],
+        }));
+    }
+    run_recurring_mission_smoke(false)
+}
+
+pub fn render_recurring_mission_smoke_status(
+    status: &RecurringMissionSmokeStatus,
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(status).context("failed to encode mission smoke status")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(status).context("failed to encode mission smoke status")
+        }
+        ControlPlaneOutput::Table => Ok(format!(
+            "CONFIGURED\tENABLED\tDUE\tNEXT_RUN\tLAST_STATUS\tLAST_MISSION\tRUNS\n{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            status.configured,
+            status
+                .config
+                .as_ref()
+                .map(|config| config.enabled)
+                .unwrap_or(false),
+            status.due,
+            status
+                .next_run_epoch_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            status.state.last_status.as_deref().unwrap_or("-"),
+            status.state.last_mission_id.as_deref().unwrap_or("-"),
+            status.state.run_count
+        )),
+    }
+}
+
 pub fn render_mission_smoke_output(
     report: &MissionSmokeReport,
     output: ControlPlaneOutput,
@@ -494,6 +709,19 @@ pub fn reconcile_autonomy(
             command: Some("jarvisctl mission plan".to_string()),
         });
     }
+    let mut smoke_reports = Vec::new();
+    if let Some(report) = run_due_recurring_mission_smoke(dry_run)? {
+        safe_actions.push(AutonomyReconcileAction {
+            kind: "mission-smoke".to_string(),
+            status: report.status.clone(),
+            summary: format!(
+                "Recurring two-node mission smoke {} for {} and {}.",
+                report.status, report.first_node, report.second_node
+            ),
+            command: Some("jarvisctl mission smoke-run --force".to_string()),
+        });
+        smoke_reports.push(report);
+    }
     let pending_proposals = proposals
         .iter()
         .filter(|proposal| proposal.status == "pending")
@@ -544,6 +772,7 @@ pub fn reconcile_autonomy(
         capability_count: capabilities.len(),
         safe_actions,
         blocked_actions,
+        smoke_reports,
         notifications_sent: notify_report.map(|report| report.delivered).unwrap_or(0),
         expired_requests,
     })
@@ -789,6 +1018,89 @@ fn write_capability(record: &CapabilityRecord) -> anyhow::Result<()> {
     let raw = serde_json::to_string_pretty(record).context("failed to encode capability")?;
     fs::write(&tmp, raw).with_context(|| format!("failed to write '{}'", tmp.display()))?;
     fs::rename(&tmp, &path)
+        .with_context(|| format!("failed to move '{}' to '{}'", tmp.display(), path.display()))
+}
+
+fn load_recurring_smoke_config() -> anyhow::Result<Option<RecurringMissionSmokeConfig>> {
+    let path = recurring_smoke_config_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read '{}'", path.display()))?;
+    let config = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse '{}'", path.display()))?;
+    Ok(Some(config))
+}
+
+fn write_recurring_smoke_config(config: &RecurringMissionSmokeConfig) -> anyhow::Result<()> {
+    let path = recurring_smoke_config_path()?;
+    write_json_file(&path, config)
+}
+
+fn load_recurring_smoke_state() -> anyhow::Result<RecurringMissionSmokeState> {
+    let path = recurring_smoke_state_path()?;
+    if !path.exists() {
+        return Ok(RecurringMissionSmokeState::default());
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read '{}'", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("failed to parse '{}'", path.display()))
+}
+
+fn write_recurring_smoke_state(state: &RecurringMissionSmokeState) -> anyhow::Result<()> {
+    let path = recurring_smoke_state_path()?;
+    write_json_file(&path, state)
+}
+
+fn recurring_smoke_config_path() -> anyhow::Result<PathBuf> {
+    Ok(jarvis_codex_dir()?
+        .join("mission-smoke")
+        .join("config.json"))
+}
+
+fn recurring_smoke_state_path() -> anyhow::Result<PathBuf> {
+    Ok(jarvis_codex_dir()?.join("mission-smoke").join("state.json"))
+}
+
+fn default_smoke_ticket_path(
+    first_node: &str,
+    second_node: &str,
+    side: &str,
+) -> anyhow::Result<PathBuf> {
+    Ok(jarvis_codex_dir()?
+        .join("mission-smoke")
+        .join(format!("two-node-{first_node}-{second_node}-{side}.md")))
+}
+
+fn ensure_smoke_ticket(
+    path: &Path,
+    node: &str,
+    partner: &str,
+    objective: &str,
+) -> anyhow::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create '{}'", parent.display()))?;
+    }
+    let body = format!(
+        "---\ntype: ticket\nstatus: ready_for_codex\npriority: medium\nowner: jarvisctl\nlabels:\n  - smoke\n  - two-node\n---\n\n# Two-node smoke: {node}\n\n## Objective\n{objective}\n\n## Protocol\n- Work only from node `{node}`.\n- Coordinate with partner node `{partner}` using the paired session protocol.\n- Report local Jarvis/Codex readiness, timer state, and one concise partner message.\n- Record final evidence in the mission ledger or ticket outcome.\n"
+    );
+    fs::write(path, body).with_context(|| format!("failed to write '{}'", path.display()))
+}
+
+fn write_json_file<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create '{}'", parent.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let raw = serde_json::to_string_pretty(value).context("failed to encode JSON")?;
+    fs::write(&tmp, raw).with_context(|| format!("failed to write '{}'", tmp.display()))?;
+    fs::rename(&tmp, path)
         .with_context(|| format!("failed to move '{}' to '{}'", tmp.display(), path.display()))
 }
 

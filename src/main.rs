@@ -45,10 +45,13 @@ use autonomy::{
     render_autonomy_service_status, run_autonomy_daemon, uninstall_autonomy_user_service,
 };
 use capability::{
-    CapabilityRegisterOptions, list_capabilities, reconcile_autonomy, register_capability,
-    render_autonomy_reconcile_output, render_capabilities_output, render_capability_output,
-    render_capability_validation_output, render_mission_smoke_output, run_two_node_mission_smoke,
-    show_capability, validate_capabilities, validate_capability,
+    CapabilityRegisterOptions, RecurringMissionSmokeConfigureOptions,
+    configure_recurring_mission_smoke, list_capabilities, reconcile_autonomy,
+    recurring_mission_smoke_status, register_capability, render_autonomy_reconcile_output,
+    render_capabilities_output, render_capability_output, render_capability_validation_output,
+    render_mission_smoke_output, render_recurring_mission_smoke_status,
+    run_recurring_mission_smoke, run_two_node_mission_smoke, show_capability,
+    validate_capabilities, validate_capability,
 };
 use codex::{CodexLaunchOptions, CodexRuntimeDriver, launch_codex_ticket};
 use codex_app::{
@@ -782,7 +785,7 @@ enum MissionCommand {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
 
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = true)]
         execute: bool,
 
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
@@ -790,6 +793,51 @@ enum MissionCommand {
 
         #[arg(last = true, value_hint = ValueHint::CommandString)]
         command: Vec<String>,
+    },
+
+    /// Configure recurring two-node smoke that the autonomy timer runs when due
+    SmokeSchedule {
+        #[arg(long = "first-node", alias = "n1")]
+        first_node: String,
+
+        #[arg(long = "second-node", alias = "n2")]
+        second_node: String,
+
+        #[arg(long = "first-task-note", alias = "t1", value_hint = ValueHint::FilePath)]
+        first_task_note: Option<PathBuf>,
+
+        #[arg(long = "second-task-note", alias = "t2", value_hint = ValueHint::FilePath)]
+        second_task_note: Option<PathBuf>,
+
+        #[arg(long = "namespace-prefix", alias = "ns")]
+        namespace_prefix: Option<String>,
+
+        #[arg(long = "interval-seconds", alias = "interval", default_value_t = 24 * 60 * 60)]
+        interval_seconds: u64,
+
+        #[arg(long, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = true)]
+        execute: bool,
+
+        #[arg(long, default_value_t = true, default_missing_value = "true", num_args = 0..=1, require_equals = true)]
+        enabled: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Show recurring two-node smoke schedule and last-run state
+    SmokeStatus {
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Run the configured recurring two-node smoke now
+    SmokeRun {
+        #[arg(long, default_value_t = false)]
+        force: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
     },
 
     /// Show one mission with its event timeline
@@ -3444,6 +3492,61 @@ fn mission_command(command: MissionCommand) -> Result<(), JarvisError> {
                 "{}",
                 render_mission_smoke_output(&report, output).map_err(JarvisError::from)?
             );
+            Ok(())
+        }
+        MissionCommand::SmokeSchedule {
+            first_node,
+            second_node,
+            first_task_note,
+            second_task_note,
+            namespace_prefix,
+            interval_seconds,
+            execute,
+            enabled,
+            output,
+        } => {
+            let status = configure_recurring_mission_smoke(RecurringMissionSmokeConfigureOptions {
+                first_node,
+                second_node,
+                first_task_note,
+                second_task_note,
+                namespace_prefix,
+                interval_seconds,
+                execute,
+                enabled,
+            })
+            .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_recurring_mission_smoke_status(&status, output)
+                    .map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        MissionCommand::SmokeStatus { output } => {
+            let status = recurring_mission_smoke_status().map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_recurring_mission_smoke_status(&status, output)
+                    .map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        MissionCommand::SmokeRun { force, output } => {
+            let report = run_recurring_mission_smoke(force).map_err(JarvisError::from)?;
+            if let Some(report) = report {
+                println!(
+                    "{}",
+                    render_mission_smoke_output(&report, output).map_err(JarvisError::from)?
+                );
+            } else {
+                let status = recurring_mission_smoke_status().map_err(JarvisError::from)?;
+                println!(
+                    "{}",
+                    render_recurring_mission_smoke_status(&status, output)
+                        .map_err(JarvisError::from)?
+                );
+            }
             Ok(())
         }
         MissionCommand::Show { id, output } => {
