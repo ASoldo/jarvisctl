@@ -10,6 +10,7 @@ use crate::codex_app::{
 use crate::native::{
     NativeSessionMetadata, RuntimeContextMetadata, collect_native_sessions, delete_native_session,
 };
+use crate::operator_request::OperatorRequestRecord;
 use crate::ticket::slugify;
 use anyhow::{Context, anyhow, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -210,6 +211,7 @@ pub struct NodeStartSessionOptions {
     pub retries: usize,
     pub task_note: PathBuf,
     pub namespace: Option<String>,
+    pub fresh_session: bool,
     pub resume_session_id: Option<String>,
     pub working_directory: Option<PathBuf>,
     pub message: Option<String>,
@@ -347,6 +349,31 @@ pub struct NodeCleanupResult {
     pub skipped_active_leases: Vec<String>,
     pub removed_visit_artifacts: usize,
     pub stderr: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimePruneResult {
+    pub generated_at_epoch_ms: u128,
+    pub apply: bool,
+    pub include_remote: bool,
+    pub max_age_minutes: u64,
+    pub pruned: usize,
+    pub records: Vec<RuntimePruneRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimePruneRecord {
+    pub namespace: String,
+    pub backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    pub age_minutes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_status: Option<String>,
+    pub running_agents: usize,
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1805,6 +1832,114 @@ pub fn cleanup_node(name: &str, max_age_days: u64) -> anyhow::Result<NodeCleanup
     )
 }
 
+pub fn prune_completed_runtime_sessions(
+    max_age_minutes: u64,
+    apply: bool,
+    include_remote: bool,
+) -> anyhow::Result<RuntimePruneResult> {
+    let now = now_epoch_ms();
+    let min_age_ms = u128::from(max_age_minutes) * 60_000;
+    let mut records = Vec::new();
+
+    for session in collect_runtime_sessions()? {
+        let node = session
+            .context
+            .as_ref()
+            .and_then(|context| context.labels.get("jarvisctl.io/node"))
+            .cloned();
+        if !include_remote && session_is_remote(&session) {
+            continue;
+        }
+        let age_ms = now.saturating_sub(session.created_at_epoch_ms);
+        if age_ms < min_age_ms {
+            continue;
+        }
+        if !session_is_prunable(&session) {
+            continue;
+        }
+        let mut record = RuntimePruneRecord {
+            namespace: session.namespace.clone(),
+            backend: session.backend.clone(),
+            node,
+            age_minutes: (age_ms / 60_000).try_into().unwrap_or(u64::MAX),
+            turn_status: session
+                .context
+                .as_ref()
+                .and_then(|context| context.turn_status.clone()),
+            running_agents: session.agents.iter().filter(|agent| agent.running).count(),
+            action: if apply {
+                "delete".to_string()
+            } else {
+                "would-delete".to_string()
+            },
+            error: None,
+        };
+        if apply {
+            match delete_runtime_session(&session) {
+                Ok(()) => record.action = "deleted".to_string(),
+                Err(error) => {
+                    record.action = "failed".to_string();
+                    record.error = Some(error.to_string());
+                }
+            }
+        }
+        records.push(record);
+    }
+
+    Ok(RuntimePruneResult {
+        generated_at_epoch_ms: now,
+        apply,
+        include_remote,
+        max_age_minutes,
+        pruned: records
+            .iter()
+            .filter(|record| record.action == "deleted" || record.action == "would-delete")
+            .count(),
+        records,
+    })
+}
+
+pub fn render_runtime_prune_output(
+    result: &RuntimePruneResult,
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(result).context("failed to encode runtime prune result")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(result).context("failed to encode runtime prune result")
+        }
+        ControlPlaneOutput::Table => {
+            let mut lines =
+                vec!["NAMESPACE\tNODE\tBACKEND\tAGE_MIN\tTURN\tAGENTS\tACTION".to_string()];
+            for record in &result.records {
+                let action = match record.error.as_deref() {
+                    Some(error) => format!("{}:{}", record.action, error),
+                    None => record.action.clone(),
+                };
+                lines.push(format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    record.namespace,
+                    record.node.as_deref().unwrap_or("local"),
+                    record.backend,
+                    record.age_minutes,
+                    record.turn_status.as_deref().unwrap_or("-"),
+                    record.running_agents,
+                    action
+                ));
+            }
+            if result.records.is_empty() {
+                lines.push(format!(
+                    "-\t-\t-\t-\t-\t-\tno prunable sessions older than {}m",
+                    result.max_age_minutes
+                ));
+            }
+            Ok(lines.join("\n"))
+        }
+    }
+}
+
 pub fn schedule_node(options: NodeScheduleOptions) -> anyhow::Result<NodeScheduleResult> {
     let nodes = load_manifests_by_kind(ResourceKind::Node, None)?
         .into_iter()
@@ -2429,6 +2564,9 @@ fn start_node_session_once(
         "--startup-delay-ms".to_string(),
         options.startup_delay_ms.to_string(),
     ];
+    if options.fresh_session && options.resume_session_id.is_none() {
+        remote_args.push("--fresh".to_string());
+    }
     if let Some(resume_session_id) = options.resume_session_id.as_deref() {
         remote_args.push("--resume-session-id".to_string());
         remote_args.push(resume_session_id.to_string());
@@ -2516,7 +2654,7 @@ fn start_local_node_session_once(
         namespace: Some(namespace.clone()),
         agents: 1,
         agent: "agent0".to_string(),
-        fresh_session: options.resume_session_id.is_none(),
+        fresh_session: options.fresh_session && options.resume_session_id.is_none(),
         resume_session_id: options.resume_session_id.clone(),
         working_directory: options.working_directory.clone(),
         prompt_file: None,
@@ -2689,6 +2827,7 @@ pub fn start_node_pair_session(
         retries: options.retries,
         task_note: options.first_task_note.clone(),
         namespace: Some(first_namespace.clone()),
+        fresh_session: true,
         resume_session_id: None,
         working_directory: None,
         message: Some(first_intro),
@@ -2702,6 +2841,7 @@ pub fn start_node_pair_session(
         retries: options.retries,
         task_note: options.second_task_note.clone(),
         namespace: Some(second_namespace.clone()),
+        fresh_session: true,
         resume_session_id: None,
         working_directory: None,
         message: Some(second_intro),
@@ -3233,7 +3373,9 @@ pub fn tell_cluster_runtime_session(
     contents: &str,
     mode: &str,
 ) -> anyhow::Result<bool> {
-    let Some(node) = remote_node_for_runtime_session(namespace)? else {
+    let Some(node) =
+        remote_node_for_runtime_session_with_retry(namespace, Duration::from_secs(15))?
+    else {
         return Ok(false);
     };
     run_remote_runtime_command(
@@ -3252,6 +3394,153 @@ pub fn tell_cluster_runtime_session(
         ],
     )?;
     Ok(true)
+}
+
+pub fn list_cluster_operator_requests() -> anyhow::Result<Vec<OperatorRequestRecord>> {
+    let mut records = Vec::new();
+    for node in remote_nodes()? {
+        let Ok(stdout) = run_remote_runtime_command_output(
+            &node,
+            vec![
+                "jarvisctl".to_string(),
+                "operator-request".to_string(),
+                "list".to_string(),
+                "--all".to_string(),
+                "--output".to_string(),
+                "json".to_string(),
+            ],
+            20,
+        ) else {
+            continue;
+        };
+        let Ok(mut remote_records) =
+            serde_json::from_str::<Vec<OperatorRequestRecord>>(stdout.trim())
+        else {
+            continue;
+        };
+        for record in &mut remote_records {
+            record.source_node = Some(node.metadata.name.clone());
+            record.remote = Some(true);
+        }
+        records.extend(remote_records);
+    }
+    Ok(records)
+}
+
+pub fn show_cluster_operator_request(id: &str) -> anyhow::Result<Option<OperatorRequestRecord>> {
+    for node in remote_nodes()? {
+        let Ok(stdout) = run_remote_runtime_command_output(
+            &node,
+            vec![
+                "jarvisctl".to_string(),
+                "operator-request".to_string(),
+                "show".to_string(),
+                id.to_string(),
+                "--output".to_string(),
+                "json".to_string(),
+            ],
+            20,
+        ) else {
+            continue;
+        };
+        let Ok(mut record) = serde_json::from_str::<OperatorRequestRecord>(stdout.trim()) else {
+            continue;
+        };
+        record.source_node = Some(node.metadata.name.clone());
+        record.remote = Some(true);
+        return Ok(Some(record));
+    }
+    Ok(None)
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteOperatorRequestResolveOptions {
+    pub node: Option<String>,
+    pub id: String,
+    pub status: String,
+    pub response_json: Option<String>,
+    pub error: Option<String>,
+    pub decided_by: Option<String>,
+    pub decision: Option<String>,
+}
+
+pub fn resolve_cluster_operator_request(
+    options: RemoteOperatorRequestResolveOptions,
+) -> anyhow::Result<Option<OperatorRequestRecord>> {
+    let nodes = match options
+        .node
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(node_name) => {
+            let manifest = load_manifest(ResourceKind::Node, node_name, None)?;
+            match manifest {
+                ResourceManifest::Node(node) if !node_is_local(&node) => vec![node],
+                ResourceManifest::Node(_) => Vec::new(),
+                _ => bail!("resource '{}' is not a Node", node_name),
+            }
+        }
+        None => remote_nodes()?,
+    };
+    for node in nodes {
+        let mut args = vec![
+            "jarvisctl".to_string(),
+            "operator-request".to_string(),
+            "resolve".to_string(),
+            options.id.clone(),
+            "--status".to_string(),
+            options.status.clone(),
+            "--output".to_string(),
+            "json".to_string(),
+        ];
+        if let Some(response_json) = options
+            .response_json
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            args.push("--response-json".to_string());
+            args.push(response_json.to_string());
+        }
+        if let Some(error) = options
+            .error
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            args.push("--error".to_string());
+            args.push(error.to_string());
+        }
+        if let Some(decided_by) = options
+            .decided_by
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            args.push("--decided-by".to_string());
+            args.push(decided_by.to_string());
+        }
+        if let Some(decision) = options
+            .decision
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            args.push("--decision".to_string());
+            args.push(decision.to_string());
+        }
+        let Ok(stdout) = run_remote_runtime_command_output(&node, args, 30) else {
+            continue;
+        };
+        let Ok(mut record) = serde_json::from_str::<OperatorRequestRecord>(stdout.trim()) else {
+            continue;
+        };
+        record.source_node = Some(node.metadata.name.clone());
+        record.remote = Some(true);
+        return Ok(Some(record));
+    }
+    Ok(None)
 }
 
 pub fn interrupt_cluster_runtime_session(namespace: &str, agent: &str) -> anyhow::Result<bool> {
@@ -9115,15 +9404,40 @@ fn collect_runtime_sessions() -> anyhow::Result<Vec<NativeSessionMetadata>> {
     Ok(sessions)
 }
 
+fn session_is_remote(session: &NativeSessionMetadata) -> bool {
+    let Some(node_name) = session
+        .context
+        .as_ref()
+        .and_then(|context| context.labels.get("jarvisctl.io/node"))
+    else {
+        return false;
+    };
+    match load_manifest(ResourceKind::Node, node_name, None) {
+        Ok(ResourceManifest::Node(node)) => !node_is_local(&node),
+        _ => false,
+    }
+}
+
+fn session_is_prunable(session: &NativeSessionMetadata) -> bool {
+    let turn_status = session
+        .context
+        .as_ref()
+        .and_then(|context| context.turn_status.as_deref());
+    if turn_status == Some("inProgress") {
+        return false;
+    }
+    if matches!(
+        turn_status,
+        Some("completed" | "failed" | "canceled" | "cancelled")
+    ) {
+        return true;
+    }
+    session.agents.iter().all(|agent| !agent.running)
+}
+
 fn collect_remote_runtime_sessions() -> anyhow::Result<Vec<NativeSessionMetadata>> {
     let mut sessions = Vec::new();
-    let nodes = load_manifests_by_kind(ResourceKind::Node, None)?
-        .into_iter()
-        .filter_map(|manifest| match manifest {
-            ResourceManifest::Node(node) if !node_is_local(&node) => Some(node),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let nodes = remote_nodes()?;
 
     for node in nodes {
         let Some(target) = node_ssh_target(&node.spec) else {
@@ -9174,6 +9488,16 @@ fn collect_remote_runtime_sessions() -> anyhow::Result<Vec<NativeSessionMetadata
         sessions.extend(remote_sessions);
     }
     Ok(sessions)
+}
+
+fn remote_nodes() -> anyhow::Result<Vec<ResourceEnvelope<NodeSpec>>> {
+    Ok(load_manifests_by_kind(ResourceKind::Node, None)?
+        .into_iter()
+        .filter_map(|manifest| match manifest {
+            ResourceManifest::Node(node) if !node_is_local(&node) => Some(node),
+            _ => None,
+        })
+        .collect())
 }
 
 fn load_runtime_session_by_namespace(namespace: &str) -> anyhow::Result<NativeSessionMetadata> {
@@ -9243,6 +9567,22 @@ fn remote_node_for_runtime_session(
     match load_manifest(ResourceKind::Node, node_name, None) {
         Ok(ResourceManifest::Node(node)) if !node_is_local(&node) => Ok(Some(node)),
         _ => Ok(None),
+    }
+}
+
+fn remote_node_for_runtime_session_with_retry(
+    runtime_namespace: &str,
+    timeout: Duration,
+) -> anyhow::Result<Option<ResourceEnvelope<NodeSpec>>> {
+    let started = Instant::now();
+    loop {
+        if let Some(node) = remote_node_for_runtime_session(runtime_namespace)? {
+            return Ok(Some(node));
+        }
+        if started.elapsed() >= timeout {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(750));
     }
 }
 

@@ -357,6 +357,7 @@ fn handle_ready_transition(
                 .unwrap_or(policy.retries),
             task_note: ticket_path.clone(),
             namespace: Some(expected_namespace.clone()),
+            fresh_session: last_codex_session_id.is_none(),
             resume_session_id: last_codex_session_id.clone(),
             working_directory: None,
             message: None,

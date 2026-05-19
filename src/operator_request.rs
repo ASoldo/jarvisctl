@@ -13,6 +13,10 @@ const DEFAULT_TTL_SECONDS: u64 = 12 * 60 * 60;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperatorRequestRecord {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<bool>,
     pub title: String,
     pub kind: String,
     pub status: String,
@@ -89,6 +93,8 @@ pub fn create_operator_request(
     let id = format!("{}-{}", slugify(&options.title), now);
     let record = OperatorRequestRecord {
         id,
+        source_node: None,
+        remote: None,
         title: options.title,
         kind: clean_or(options.kind, "operator"),
         status: "pending".to_string(),
@@ -355,15 +361,12 @@ fn write_operator_request(record: &OperatorRequestRecord) -> anyhow::Result<()> 
         .with_context(|| format!("failed to move '{}' to '{}'", tmp.display(), path.display()))
 }
 
-fn parse_operator_request_record(
-    raw: &str,
-    path: &Path,
-) -> anyhow::Result<OperatorRequestRecord> {
+fn parse_operator_request_record(raw: &str, path: &Path) -> anyhow::Result<OperatorRequestRecord> {
     match serde_json::from_str(raw) {
         Ok(record) => Ok(record),
         Err(strict_error) => {
-            let mut stream = serde_json::Deserializer::from_str(raw)
-                .into_iter::<OperatorRequestRecord>();
+            let mut stream =
+                serde_json::Deserializer::from_str(raw).into_iter::<OperatorRequestRecord>();
             match stream.next() {
                 Some(Ok(record)) => Ok(record),
                 Some(Err(stream_error)) => Err(stream_error)

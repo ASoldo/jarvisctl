@@ -63,25 +63,27 @@ use control_plane::{
     ControlPlaneOutput, ControlPlaneResourceKindArg, KubernetesRenderOutput, NodeBootstrapOptions,
     NodeFanoutOptions, NodeLinksOptions, NodePairSessionOptions, NodeRegisterOptions,
     NodeScheduleOptions, NodeStartSessionOptions, NodeSudoOptions, NodeVisitOptions,
-    WorkerDriftSmokeOptions, WorkerDriftSmokeScheduleOptions, WorkerOffloadOptions,
-    apply_kubernetes_resources, apply_kustomization, apply_manifests,
+    RemoteOperatorRequestResolveOptions, WorkerDriftSmokeOptions, WorkerDriftSmokeScheduleOptions,
+    WorkerOffloadOptions, apply_kubernetes_resources, apply_kustomization, apply_manifests,
     attach_cluster_runtime_session, authorize_runtime_message, bootstrap_node, check_node_links,
     cleanup_node, cluster_index, configure_worker_drift_smoke_schedule,
     delete_cluster_runtime_session, doctor_nodes, inspect_node, interrupt_cluster_runtime_session,
-    list_worker_run_records, load_or_create_orchestration_policy, load_worker_run_record,
-    mark_worker_run, migrate_session_to_node, open_visit_capsule, orchestration_policy_path,
-    pause_deployment_rollout, preflight_nodes, prune_worker_runs, read_auth_audit_events,
+    list_cluster_operator_requests, list_worker_run_records, load_or_create_orchestration_policy,
+    load_worker_run_record, mark_worker_run, migrate_session_to_node, open_visit_capsule,
+    orchestration_policy_path, pause_deployment_rollout, preflight_nodes,
+    prune_completed_runtime_sessions, prune_worker_runs, read_auth_audit_events,
     read_worker_run_artifact, reconcile_nodes, register_node, render_describe_output,
     render_get_output, render_kubernetes_resources, render_node_probe_output,
     render_node_sudo_output, render_rollout_history_output, render_rollout_status_output,
-    render_worker_drift_smoke_output, render_worker_drift_smoke_schedule_status,
-    render_worker_model_validation_output, render_worker_run_artifact_output,
-    render_worker_run_prune_output, render_worker_runs_output, render_worker_validation_output,
-    resolve_service_target, resolve_service_target_for_message,
-    respond_cluster_runtime_server_request, restart_deployment_rollout, resume_deployment_rollout,
-    rotate_capsule_key, run_node_fanout, run_node_sudo, run_node_visit,
-    run_recurring_worker_drift_smoke, run_worker_drift_smoke, run_worker_offload, schedule_node,
-    set_node_cordoned, start_node_pair_session, start_node_session, sync_codex_auth_to_node,
+    render_runtime_prune_output, render_worker_drift_smoke_output,
+    render_worker_drift_smoke_schedule_status, render_worker_model_validation_output,
+    render_worker_run_artifact_output, render_worker_run_prune_output, render_worker_runs_output,
+    render_worker_validation_output, resolve_cluster_operator_request, resolve_service_target,
+    resolve_service_target_for_message, respond_cluster_runtime_server_request,
+    restart_deployment_rollout, resume_deployment_rollout, rotate_capsule_key, run_node_fanout,
+    run_node_sudo, run_node_visit, run_recurring_worker_drift_smoke, run_worker_drift_smoke,
+    run_worker_offload, schedule_node, set_node_cordoned, show_cluster_operator_request,
+    start_node_pair_session, start_node_session, sync_codex_auth_to_node,
     tell_cluster_runtime_session, undo_deployment_rollout, validate_worker_models,
     wait_for_rollout_status_output, worker_drift_smoke_schedule_status,
 };
@@ -1354,6 +1356,9 @@ enum OperatorRequestCommand {
         #[arg(long, default_value_t = false)]
         all: bool,
 
+        #[arg(long, default_value_t = false)]
+        cluster: bool,
+
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
@@ -1361,6 +1366,12 @@ enum OperatorRequestCommand {
     /// Show one operator/admin request
     Show {
         id: String,
+
+        #[arg(long)]
+        node: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        cluster: bool,
 
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
@@ -1399,6 +1410,9 @@ enum OperatorRequestCommand {
 
         #[arg(long)]
         decision: Option<String>,
+
+        #[arg(long)]
+        node: Option<String>,
 
         #[arg(long)]
         mission: Option<String>,
@@ -1652,6 +1666,9 @@ enum NodeCommand {
         #[arg(long = "resume-session-id", alias = "sid")]
         resume_session_id: Option<String>,
 
+        #[arg(long, default_value_t = false, conflicts_with = "resume_session_id")]
+        resume_latest: bool,
+
         #[arg(long, alias = "wd", value_hint = ValueHint::DirPath)]
         working_directory: Option<PathBuf>,
 
@@ -1768,6 +1785,21 @@ enum NodeCommand {
 
         #[arg(long = "max-age-days", alias = "max-age", default_value_t = 7)]
         max_age_days: u64,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Archive/delete completed idle app-server sessions after an operator-visible retention window
+    PruneSessions {
+        #[arg(long = "max-age-minutes", alias = "max-age", default_value_t = 30)]
+        max_age_minutes: u64,
+
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+
+        #[arg(long = "include-remote", alias = "remote", default_value_t = true)]
+        include_remote: bool,
 
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
@@ -3555,6 +3587,7 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
             task_note,
             namespace,
             resume_session_id,
+            resume_latest,
             working_directory,
             message,
             startup_delay_ms,
@@ -3573,6 +3606,7 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                 retries: retries.unwrap_or(policy.retries),
                 task_note,
                 namespace,
+                fresh_session: !resume_latest,
                 resume_session_id,
                 working_directory,
                 message,
@@ -3823,6 +3857,20 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                     );
                 }
             }
+            Ok(())
+        }
+        NodeCommand::PruneSessions {
+            max_age_minutes,
+            apply,
+            include_remote,
+            output,
+        } => {
+            let result = prune_completed_runtime_sessions(max_age_minutes, apply, include_remote)
+                .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_runtime_prune_output(&result, output).map_err(JarvisError::from)?
+            );
             Ok(())
         }
     }
@@ -4351,9 +4399,13 @@ fn operator_request_command(command: OperatorRequestCommand) -> Result<(), Jarvi
         OperatorRequestCommand::List {
             status,
             all,
+            cluster,
             output,
         } => {
             let mut records = list_operator_requests().map_err(JarvisError::from)?;
+            if cluster {
+                records.extend(list_cluster_operator_requests().map_err(JarvisError::from)?);
+            }
             if !all {
                 let wanted = status.unwrap_or_else(|| "pending".to_string());
                 records.retain(|record| record.status == wanted);
@@ -4366,8 +4418,35 @@ fn operator_request_command(command: OperatorRequestCommand) -> Result<(), Jarvi
             );
             Ok(())
         }
-        OperatorRequestCommand::Show { id, output } => {
-            let record = show_operator_request(&id).map_err(JarvisError::from)?;
+        OperatorRequestCommand::Show {
+            id,
+            node,
+            cluster,
+            output,
+        } => {
+            let record = if node.is_some() || cluster {
+                show_cluster_operator_request(&id)
+                    .map_err(JarvisError::from)?
+                    .ok_or_else(|| {
+                        JarvisError::Other(anyhow::anyhow!(
+                            "operator request '{}' does not exist on remote nodes",
+                            id
+                        ))
+                    })?
+            } else {
+                match show_operator_request(&id) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        if let Some(record) =
+                            show_cluster_operator_request(&id).map_err(JarvisError::from)?
+                        {
+                            record
+                        } else {
+                            return Err(JarvisError::from(error));
+                        }
+                    }
+                }
+            };
             println!(
                 "{}",
                 render_operator_request_output(&record, output).map_err(JarvisError::from)?
@@ -4399,11 +4478,39 @@ fn operator_request_command(command: OperatorRequestCommand) -> Result<(), Jarvi
             error,
             decided_by,
             decision,
+            node,
             mission,
             output,
         } => {
-            let response = parse_optional_json(response_json.as_deref(), "--response-json")?;
-            let existing = show_operator_request(&id).map_err(JarvisError::from)?;
+            let parsed_response = parse_optional_json(response_json.as_deref(), "--response-json")?;
+            let existing = match show_operator_request(&id) {
+                Ok(record) if node.is_none() => record,
+                local_result => {
+                    if node.is_some() || local_result.is_err() {
+                        let remote =
+                            resolve_cluster_operator_request(RemoteOperatorRequestResolveOptions {
+                                node: node.clone(),
+                                id: id.clone(),
+                                status: status.clone(),
+                                response_json: response_json.clone(),
+                                error: error.clone(),
+                                decided_by: decided_by.clone(),
+                                decision: decision.clone(),
+                            })
+                            .map_err(JarvisError::from)?;
+                        if let Some(record) = remote {
+                            println!(
+                                "{}",
+                                render_operator_request_output(&record, output)
+                                    .map_err(JarvisError::from)?
+                            );
+                            return Ok(());
+                        }
+                    }
+                    local_result.map_err(JarvisError::from)?
+                }
+            };
+            let response = default_operator_request_response(&existing, &status, parsed_response);
             if let (Some(namespace), Some(request_id)) = (
                 existing.namespace.as_deref(),
                 existing.request_id.as_deref(),
@@ -4490,6 +4597,42 @@ fn parse_optional_json(
         })
     })
     .transpose()
+}
+
+fn default_operator_request_response(
+    record: &operator_request::OperatorRequestRecord,
+    status: &str,
+    explicit: Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    if explicit.is_some() || status == "denied" {
+        return explicit;
+    }
+    let decisions = record
+        .params
+        .as_ref()
+        .and_then(|params| params.get("availableDecisions"))
+        .and_then(|decisions| decisions.as_array())?;
+    decisions
+        .iter()
+        .find(|decision| decision.as_str() == Some("accept"))
+        .cloned()
+        .or_else(|| {
+            decisions
+                .iter()
+                .find(|decision| {
+                    decision
+                        .as_object()
+                        .map(|object| object.contains_key("accept"))
+                        .unwrap_or(false)
+                })
+                .cloned()
+        })
+        .or_else(|| {
+            decisions
+                .iter()
+                .find(|decision| decision.as_str() != Some("cancel"))
+                .cloned()
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
