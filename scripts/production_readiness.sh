@@ -20,11 +20,18 @@ echo "== heartbeat timer =="
 jarvisctl node heartbeat-service-status --output json |
   jq -r '[.timer_active, .timer_enabled] | @tsv'
 
+echo "== local codex doctor =="
+codex doctor --json |
+  jq -r '[.overallStatus, .codexVersion, .checks["auth.credentials"].status, .checks["network.websocket_reachability"].status, .checks["updates.status"].status] | @tsv'
+
 if ssh -o BatchMode=yes -o ConnectTimeout=8 "${remote_node}" 'command -v jarvisctl >/dev/null' >/dev/null 2>&1; then
   echo "== remote heartbeat: ${remote_node} =="
   jarvisctl node heartbeat "${remote_node}" --output json | jq -e '.heartbeat_epoch_ms > 0' >/dev/null
   ssh -o BatchMode=yes -o ConnectTimeout=8 "${remote_node}" \
     'jarvisctl node heartbeat-service-status --output json | jq -r '\''[.timer_active, .timer_enabled] | @tsv'\'''
+  echo "== remote codex doctor: ${remote_node} =="
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "${remote_node}" \
+    'codex doctor --json | jq -r '\''[.overallStatus, .codexVersion, .checks["auth.credentials"].status, .checks["network.websocket_reachability"].status, .checks["updates.status"].status] | @tsv'\'''
 else
   echo "== remote heartbeat: skipped (${remote_node} is not reachable with batch SSH) =="
 fi

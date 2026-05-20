@@ -506,6 +506,16 @@ pub struct NodeHeartbeatServiceStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct NodeTaskNoteCollectReport {
+    pub node: String,
+    pub namespace: String,
+    pub remote_path: String,
+    pub destination: String,
+    pub collected: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct NodeFanoutFailure {
     pub node: String,
     pub error: String,
@@ -2297,6 +2307,20 @@ pub fn doctor_nodes() -> anyhow::Result<Vec<NodeDoctorCheck>> {
             if facts.get("jarvisctl").is_none() {
                 issues.push("jarvisctl_missing".to_string());
             }
+            if facts
+                .get("ssh_proxy_config_mode")
+                .and_then(|mode| u32::from_str_radix(mode.trim(), 8).ok())
+                .map(|mode| mode & 0o022 != 0)
+                .unwrap_or(false)
+            {
+                issues.push(format!(
+                    "ssh_proxy_config_insecure_mode={}",
+                    facts
+                        .get("ssh_proxy_config_mode")
+                        .map(String::as_str)
+                        .unwrap_or("unknown")
+                ));
+            }
         }
         checks.push(NodeDoctorCheck {
             node: node.metadata.name,
@@ -2933,25 +2957,11 @@ fn stage_task_note_for_remote_session(
         "task note '{}' is not a file",
         task_note.display()
     );
-    let remote_home = run_shell_probe(Some(target), "printf '%s' \"$HOME\"", "remote home lookup")?;
-    let remote_home = remote_home.trim();
-    ensure!(
-        !remote_home.is_empty(),
-        "Node '{}' returned an empty HOME path",
-        node.metadata.name
-    );
-    let remote_dir = PathBuf::from(remote_home)
-        .join(".jarvis")
-        .join("codex")
-        .join("task-notes")
-        .join(slugify(namespace));
-    let remote_name = task_note
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(slugify)
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "task-note-md".to_string());
-    let remote_path = remote_dir.join(format!("{remote_name}.md"));
+    let remote_path = remote_task_note_path(node, target, namespace, task_note)?;
+    let remote_dir = remote_path
+        .parent()
+        .ok_or_else(|| anyhow!("remote task note path has no parent"))?
+        .to_path_buf();
     let mkdir_script = format!(
         "mkdir -p {}",
         shell_words::quote(&remote_dir.display().to_string())
@@ -2985,6 +2995,100 @@ fn stage_task_note_for_remote_session(
     );
     let staged = remote_path;
     Ok((staged.clone(), Some(staged)))
+}
+
+fn remote_task_note_path(
+    node: &ResourceEnvelope<NodeSpec>,
+    target: &str,
+    namespace: &str,
+    task_note: &Path,
+) -> anyhow::Result<PathBuf> {
+    let remote_home = run_shell_probe(Some(target), "printf '%s' \"$HOME\"", "remote home lookup")?;
+    let remote_home = remote_home.trim();
+    ensure!(
+        !remote_home.is_empty(),
+        "Node '{}' returned an empty HOME path",
+        node.metadata.name
+    );
+    let remote_dir = PathBuf::from(remote_home)
+        .join(".jarvis")
+        .join("codex")
+        .join("task-notes")
+        .join(slugify(namespace));
+    let remote_name = task_note
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(slugify)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "task-note-md".to_string());
+    Ok(remote_dir.join(format!("{remote_name}.md")))
+}
+
+pub fn collect_node_task_note(
+    node_name: &str,
+    namespace: &str,
+    task_note: &Path,
+    destination: Option<&Path>,
+) -> anyhow::Result<NodeTaskNoteCollectReport> {
+    ensure!(
+        !namespace.trim().is_empty(),
+        "namespace is required to collect a staged task note"
+    );
+    let node = load_node_manifest(node_name)?;
+    let destination = destination.unwrap_or(task_note);
+    if node_is_local(&node) {
+        return Ok(NodeTaskNoteCollectReport {
+            node: node.metadata.name,
+            namespace: namespace.to_string(),
+            remote_path: task_note.display().to_string(),
+            destination: destination.display().to_string(),
+            collected: false,
+            detail: "node is local; task note already lives on this machine".to_string(),
+        });
+    }
+    let target = node_ssh_target(&node.spec)
+        .ok_or_else(|| anyhow!("Node '{}' has no SSH target", node.metadata.name))?;
+    let remote_path = remote_task_note_path(&node, &target, namespace, task_note)?;
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create '{}'", parent.display()))?;
+    }
+    let tmp = destination.with_extension("collecting.tmp");
+    let source = format!("{target}:{}", remote_path.display());
+    let status = ProcessCommand::new("scp")
+        .args([
+            "-q",
+            &source,
+            tmp.to_str()
+                .ok_or_else(|| anyhow!("destination path is not valid UTF-8"))?,
+        ])
+        .status()
+        .with_context(|| {
+            format!(
+                "failed to collect task note from Node '{}'",
+                node.metadata.name
+            )
+        })?;
+    ensure!(
+        status.success(),
+        "task note collection from Node '{}' failed with {status}",
+        node.metadata.name
+    );
+    fs::rename(&tmp, destination).with_context(|| {
+        format!(
+            "failed to move '{}' to '{}'",
+            tmp.display(),
+            destination.display()
+        )
+    })?;
+    Ok(NodeTaskNoteCollectReport {
+        node: node.metadata.name,
+        namespace: namespace.to_string(),
+        remote_path: remote_path.display().to_string(),
+        destination: destination.display().to_string(),
+        collected: true,
+        detail: "collected staged remote task note".to_string(),
+    })
 }
 
 pub fn start_node_pair_session(
@@ -5347,6 +5451,11 @@ printf 'heartbeat_epoch_ms='
 if [ -f "$heartbeat_file" ]; then sed -n 's/.*"ts_epoch_ms"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$heartbeat_file" | head -n 1; else printf '0\n'; fi
 printf 'heartbeat_age_seconds='
 if [ -f "$heartbeat_file" ]; then now_ms=$(date +%s%3N 2>/dev/null || printf '0'); ts_ms=$(sed -n 's/.*"ts_epoch_ms"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$heartbeat_file" | head -n 1); if [ -n "$ts_ms" ] && [ "$now_ms" -gt 0 ]; then echo $(( (now_ms - ts_ms) / 1000 )); else echo 0; fi; else printf '0\n'; fi
+ssh_proxy_config="/etc/ssh/ssh_config.d/20-systemd-ssh-proxy.conf"
+printf 'ssh_proxy_config_mode='
+if [ -e "$ssh_proxy_config" ]; then stat -Lc '%a' "$ssh_proxy_config" 2>/dev/null || true; else echo missing; fi
+printf 'ssh_proxy_config_owner='
+if [ -e "$ssh_proxy_config" ]; then stat -Lc '%U:%G' "$ssh_proxy_config" 2>/dev/null || true; else echo missing; fi
 printf 'codex_auth='
 test -s "$HOME/.codex/auth.json" && echo present || echo missing"#;
     run_shell_probe(target, script, "node inspect")

@@ -2,11 +2,13 @@
 
 `jarvisctl` treats Codex app-server as the agent runtime contract. The Obsidian plugin should write durable ticket frontmatter; `jarvisctl` turns that frontmatter into app-server `thread/start`, `thread/resume`, `thread/goal/set`, and `turn/start` parameters.
 
-Checked against Codex CLI `0.131.0` and the generated experimental app-server schema from `codex app-server generate-json-schema --experimental --out <dir>`.
+Checked against Codex CLI `0.132.0` and the generated experimental app-server schema from `codex app-server generate-json-schema --experimental --out <dir>`.
 
 ## Current release signals
 
 - `codex remote-control` is now the preferred headless remote entrypoint for remotely controlled app-server runtimes.
+- `codex doctor --json` is now part of the production readiness path. Jarvis keeps the fast node probes lightweight, then runs doctor during full readiness checks to validate auth, app-server daemon state, websocket reachability, update status, feature flags, and install provenance.
+- `codex features list` exposes effective feature state. Current 0.132.0 surfaces stable features such as `apps`, `plugins`, `plugin_hooks`, `browser_use`, `computer_use`, `multi_agent`, `shell_tool`, `unified_exec`, and `workspace_dependencies`; experimental/under-development features should stay explicit in ticket frontmatter instead of becoming hidden defaults.
 - `thread/start`, `thread/resume`, and `turn/start` now expose richer per-thread and per-turn configuration: model, service tier, approvals reviewer, permission profiles, environments, personality, and instruction overrides.
 - Experimental app-server fields require `initialize.capabilities.experimentalApi = true`.
 - `permissions` is a named profile string in `thread/start`, `thread/resume`, and `turn/start`; extra writable roots map to `runtimeWorkspaceRoots`.

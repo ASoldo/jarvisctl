@@ -67,7 +67,7 @@ use control_plane::{
     WorkerDriftSmokeScheduleOptions, WorkerOffloadOptions, ack_cluster_relay_message,
     ack_relay_message, apply_kubernetes_resources, apply_kustomization, apply_manifests,
     attach_cluster_runtime_session, authorize_runtime_message, bootstrap_node, check_node_links,
-    cleanup_node, cluster_index, configure_worker_drift_smoke_schedule,
+    cleanup_node, cluster_index, collect_node_task_note, configure_worker_drift_smoke_schedule,
     delete_cluster_runtime_session, doctor_nodes, flush_cluster_relay_messages,
     flush_relay_messages, heartbeat_node, inspect_node, install_node_heartbeat_user_service,
     interrupt_cluster_runtime_session, list_cluster_operator_requests, list_cluster_relay_messages,
@@ -1627,6 +1627,23 @@ enum NodeCommand {
 
     /// Show this node heartbeat user-systemd timer state
     HeartbeatServiceStatus {
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Collect a staged remote task note back to the control node
+    CollectTaskNote {
+        name: String,
+
+        #[arg(long = "namespace", alias = "ns")]
+        namespace: String,
+
+        #[arg(long = "task-note", alias = "tn", value_hint = ValueHint::FilePath)]
+        task_note: PathBuf,
+
+        #[arg(long = "destination", alias = "dest", value_hint = ValueHint::FilePath)]
+        destination: Option<PathBuf>,
+
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
@@ -3215,6 +3232,41 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                 "{}",
                 render_node_heartbeat_service_status(&status, output).map_err(JarvisError::from)?
             );
+            Ok(())
+        }
+        NodeCommand::CollectTaskNote {
+            name,
+            namespace,
+            task_note,
+            destination,
+            output,
+        } => {
+            let report =
+                collect_node_task_note(&name, &namespace, &task_note, destination.as_deref())
+                    .map_err(JarvisError::from)?;
+            match output {
+                ControlPlaneOutput::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(anyhow::Error::from)?
+                ),
+                ControlPlaneOutput::Yaml => {
+                    println!(
+                        "{}",
+                        serde_yaml::to_string(&report).map_err(anyhow::Error::from)?
+                    )
+                }
+                ControlPlaneOutput::Table => {
+                    println!("NODE\tNAMESPACE\tCOLLECTED\tDESTINATION\tDETAIL");
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        report.node,
+                        report.namespace,
+                        report.collected,
+                        report.destination,
+                        report.detail
+                    );
+                }
+            }
             Ok(())
         }
         NodeCommand::Preflight { output } => {

@@ -345,11 +345,13 @@ jarvisctl node heartbeat
 jarvisctl node heartbeat archiebald
 jarvisctl node install-heartbeat-user-service --interval-seconds 120
 jarvisctl node heartbeat-service-status
+jarvisctl node collect-task-note archiebald --namespace live-drill-archiebald --task-note /path/to/local-ticket.md
 scripts/cluster_ops_regression.sh archiebald
 scripts/production_readiness.sh archiebald
 ```
 
 `install-heartbeat-user-service` writes `jarvisctl-heartbeat.service` and `jarvisctl-heartbeat.timer` under `~/.config/systemd/user/`. Run it on every node after `cargo install --path .` so `node doctor`, the status bar, and the Obsidian dashboard can distinguish a genuinely stale node from a node that was only registered once.
+`collect-task-note` pulls a staged remote ticket copy back into the control-node path after a remote agent updates its local task note, which keeps mission evidence from being stranded on worker nodes.
 
 Capability and autonomy commands expose the production-readiness layer used by Mission Chain:
 
