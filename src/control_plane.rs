@@ -351,6 +351,16 @@ pub struct NodeCleanupResult {
     pub stderr: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayPruneReport {
+    pub scanned: usize,
+    pub removed: usize,
+    pub kept_pending: usize,
+    pub kept_recent: usize,
+    pub max_age_days: u64,
+    pub dry_run: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimePruneResult {
     pub generated_at_epoch_ms: u128,
@@ -461,6 +471,14 @@ pub struct NodeDoctorCheck {
     pub schedulable: bool,
     pub issues: Vec<String>,
     pub facts: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeHeartbeatReport {
+    pub node: String,
+    pub target: String,
+    pub heartbeat_epoch_ms: u128,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1814,6 +1832,37 @@ pub fn inspect_node(name: &str) -> anyhow::Result<NodeInspectResult> {
     })
 }
 
+pub fn heartbeat_node(name: Option<&str>) -> anyhow::Result<NodeHeartbeatReport> {
+    let node_name = match name.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(name) if name != "local" => name.to_string(),
+        _ => local_node_name()?,
+    };
+    let manifest = load_manifest(ResourceKind::Node, &node_name, None)?;
+    let ResourceManifest::Node(node) = manifest else {
+        bail!("resource '{}' is not a Node", node_name);
+    };
+    let target = node_ssh_target(&node.spec).unwrap_or_else(|| "local".to_string());
+    let output = run_node_heartbeat_command(if node_is_local(&node) {
+        None
+    } else {
+        Some(target.as_str())
+    })?;
+    let facts = parse_probe_output(&output);
+    let heartbeat_epoch_ms = facts
+        .get("heartbeat_epoch_ms")
+        .and_then(|value| value.parse::<u128>().ok())
+        .unwrap_or_else(now_epoch_ms);
+    Ok(NodeHeartbeatReport {
+        node: node.metadata.name,
+        target,
+        heartbeat_epoch_ms,
+        path: facts
+            .get("heartbeat_path")
+            .cloned()
+            .unwrap_or_else(|| "~/.jarvis/codex/heartbeat.json".to_string()),
+    })
+}
+
 pub fn cleanup_node(name: &str, max_age_days: u64) -> anyhow::Result<NodeCleanupResult> {
     let manifest = load_manifest(ResourceKind::Node, name, None)?;
     let ResourceManifest::Node(node) = manifest else {
@@ -2059,6 +2108,14 @@ pub fn doctor_nodes() -> anyhow::Result<Vec<NodeDoctorCheck>> {
             }
         };
         if available {
+            if let Some(age_seconds) = facts
+                .get("heartbeat_age_seconds")
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                if age_seconds > node_heartbeat_stale_seconds() {
+                    issues.push(format!("heartbeat_stale={}s", age_seconds));
+                }
+            }
             for (key, expected) in [
                 ("codex_auth", "present"),
                 ("memory", "present"),
@@ -3730,6 +3787,99 @@ pub fn ack_relay_message(id: &str) -> anyhow::Result<RelayMessageRecord> {
     Ok(record)
 }
 
+pub fn prune_relay_messages(max_age_days: u64, dry_run: bool) -> anyhow::Result<RelayPruneReport> {
+    let records = list_relay_messages(None, None)?;
+    let cutoff = now_epoch_ms().saturating_sub(max_age_days as u128 * 86_400_000);
+    let mut report = RelayPruneReport {
+        scanned: records.len(),
+        removed: 0,
+        kept_pending: 0,
+        kept_recent: 0,
+        max_age_days,
+        dry_run,
+    };
+    for record in records {
+        let terminal = matches!(
+            record.status.as_str(),
+            "acked" | "delivered" | "failed" | "denied" | "expired"
+        );
+        if !terminal {
+            report.kept_pending += 1;
+            continue;
+        }
+        if record.updated_at_epoch_ms >= cutoff {
+            report.kept_recent += 1;
+            continue;
+        }
+        report.removed += 1;
+        if !dry_run {
+            let path = relay_message_path(&record.id)?;
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(report)
+}
+
+pub fn prune_cluster_relay_messages(
+    max_age_days: u64,
+    dry_run: bool,
+) -> anyhow::Result<Vec<RelayPruneReport>> {
+    let mut reports = Vec::new();
+    for node in remote_nodes()? {
+        let mut args = vec![
+            "jarvisctl".to_string(),
+            "message".to_string(),
+            "prune".to_string(),
+            "--max-age-days".to_string(),
+            max_age_days.to_string(),
+            "--output".to_string(),
+            "json".to_string(),
+        ];
+        if !dry_run {
+            args.push("--apply".to_string());
+        }
+        let Ok(stdout) = run_remote_runtime_command_output(&node, args, 30) else {
+            continue;
+        };
+        let Ok(report) = serde_json::from_str::<RelayPruneReport>(stdout.trim()) else {
+            continue;
+        };
+        reports.push(report);
+    }
+    Ok(reports)
+}
+
+pub fn render_relay_prune_output(
+    reports: &[RelayPruneReport],
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(reports).context("failed to encode relay prune report")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(reports).context("failed to encode relay prune report")
+        }
+        ControlPlaneOutput::Table => {
+            let mut lines = vec![
+                "SCANNED\tREMOVED\tKEPT_PENDING\tKEPT_RECENT\tMAX_AGE_DAYS\tDRY_RUN".to_string(),
+            ];
+            for report in reports {
+                lines.push(format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    report.scanned,
+                    report.removed,
+                    report.kept_pending,
+                    report.kept_recent,
+                    report.max_age_days,
+                    report.dry_run
+                ));
+            }
+            Ok(lines.join("\n"))
+        }
+    }
+}
+
 pub fn render_relay_message_output(
     record: &RelayMessageRecord,
     output: ControlPlaneOutput,
@@ -5026,9 +5176,28 @@ printf 'auth_leases='
 find "$HOME/.jarvis/codex/auth-leases" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l
 printf 'visit_artifacts='
 find "$HOME/.jarvis/codex/visits" -type f 2>/dev/null | wc -l
+heartbeat_file="$HOME/.jarvis/codex/heartbeat.json"
+printf 'heartbeat_epoch_ms='
+if [ -f "$heartbeat_file" ]; then sed -n 's/.*"ts_epoch_ms"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$heartbeat_file" | head -n 1; else printf '0\n'; fi
+printf 'heartbeat_age_seconds='
+if [ -f "$heartbeat_file" ]; then now_ms=$(date +%s%3N 2>/dev/null || printf '0'); ts_ms=$(sed -n 's/.*"ts_epoch_ms"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$heartbeat_file" | head -n 1); if [ -n "$ts_ms" ] && [ "$now_ms" -gt 0 ]; then echo $(( (now_ms - ts_ms) / 1000 )); else echo 0; fi; else printf '0\n'; fi
 printf 'codex_auth='
 test -s "$HOME/.codex/auth.json" && echo present || echo missing"#;
     run_shell_probe(target, script, "node inspect")
+}
+
+fn run_node_heartbeat_command(target: Option<&str>) -> anyhow::Result<String> {
+    let script = r#"set -eu
+dir="$HOME/.jarvis/codex"
+mkdir -p "$dir"
+path="$dir/heartbeat.json"
+now_ms=$(date +%s%3N 2>/dev/null || printf '0')
+host=$(cat /proc/sys/kernel/hostname 2>/dev/null || uname -n 2>/dev/null || true)
+printf '{"ts_epoch_ms":%s,"hostname":"%s","pid":%s}\n' "$now_ms" "$host" "$$" > "$path"
+printf 'heartbeat_epoch_ms=%s\n' "$now_ms"
+printf 'heartbeat_path=%s\n' "$path"
+"#;
+    run_shell_probe(target, script, "node heartbeat")
 }
 
 fn run_shell_probe(target: Option<&str>, script: &str, label: &str) -> anyhow::Result<String> {
@@ -5075,6 +5244,13 @@ fn node_probe_timeout_seconds() -> u64 {
         .and_then(|value| value.trim().parse::<u64>().ok())
         .map(|value| value.clamp(1, 120))
         .unwrap_or(10)
+}
+
+fn node_heartbeat_stale_seconds() -> u64 {
+    env::var("JARVIS_NODE_HEARTBEAT_STALE_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(300)
 }
 
 fn run_node_cleanup_command(

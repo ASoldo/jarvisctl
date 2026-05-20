@@ -69,16 +69,17 @@ use control_plane::{
     attach_cluster_runtime_session, authorize_runtime_message, bootstrap_node, check_node_links,
     cleanup_node, cluster_index, configure_worker_drift_smoke_schedule,
     delete_cluster_runtime_session, doctor_nodes, flush_cluster_relay_messages,
-    flush_relay_messages, inspect_node, interrupt_cluster_runtime_session,
+    flush_relay_messages, heartbeat_node, inspect_node, interrupt_cluster_runtime_session,
     list_cluster_operator_requests, list_cluster_relay_messages, list_relay_messages,
     list_worker_run_records, load_or_create_orchestration_policy, load_worker_run_record,
     mark_worker_run, migrate_session_to_node, open_visit_capsule, orchestration_policy_path,
-    pause_deployment_rollout, preflight_nodes, prune_completed_runtime_sessions, prune_worker_runs,
+    pause_deployment_rollout, preflight_nodes, prune_cluster_relay_messages,
+    prune_completed_runtime_sessions, prune_relay_messages, prune_worker_runs,
     read_auth_audit_events, read_worker_run_artifact, reconcile_nodes, register_node,
     render_describe_output, render_get_output, render_kubernetes_resources,
     render_node_probe_output, render_node_sudo_output, render_relay_message_output,
-    render_relay_messages_output, render_rollout_history_output, render_rollout_status_output,
-    render_runtime_prune_output, render_worker_drift_smoke_output,
+    render_relay_messages_output, render_relay_prune_output, render_rollout_history_output,
+    render_rollout_status_output, render_runtime_prune_output, render_worker_drift_smoke_output,
     render_worker_drift_smoke_schedule_status, render_worker_model_validation_output,
     render_worker_run_artifact_output, render_worker_run_prune_output, render_worker_runs_output,
     render_worker_validation_output, resolve_cluster_operator_request, resolve_service_target,
@@ -1507,6 +1508,24 @@ enum MessageCommand {
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
+
+    /// Prune old terminal relay messages while preserving pending work
+    Prune {
+        #[arg(long = "max-age-days", default_value_t = 14)]
+        max_age_days: u64,
+
+        #[arg(long, default_value_t = true)]
+        dry_run: bool,
+
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+
+        #[arg(long, default_value_t = false)]
+        cluster: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1577,6 +1596,14 @@ enum NodeCommand {
 
     /// Check all registered nodes for orchestration readiness
     Doctor {
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Write a durable heartbeat on a local or registered node
+    Heartbeat {
+        name: Option<String>,
+
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
@@ -3117,6 +3144,29 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                             }
                         );
                     }
+                }
+            }
+            Ok(())
+        }
+        NodeCommand::Heartbeat { name, output } => {
+            let report = heartbeat_node(name.as_deref()).map_err(JarvisError::from)?;
+            match output {
+                ControlPlaneOutput::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(anyhow::Error::from)?
+                ),
+                ControlPlaneOutput::Yaml => {
+                    println!(
+                        "{}",
+                        serde_yaml::to_string(&report).map_err(anyhow::Error::from)?
+                    )
+                }
+                ControlPlaneOutput::Table => {
+                    println!("NODE\tTARGET\tHEARTBEAT_EPOCH_MS\tPATH");
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        report.node, report.target, report.heartbeat_epoch_ms, report.path
+                    );
                 }
             }
             Ok(())
@@ -4787,6 +4837,29 @@ fn message_command(command: MessageCommand) -> Result<(), JarvisError> {
             println!(
                 "{}",
                 render_relay_message_output(&record, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        MessageCommand::Prune {
+            max_age_days,
+            dry_run,
+            apply,
+            cluster,
+            output,
+        } => {
+            let effective_dry_run = dry_run && !apply;
+            let mut reports = vec![
+                prune_relay_messages(max_age_days, effective_dry_run).map_err(JarvisError::from)?,
+            ];
+            if cluster {
+                reports.extend(
+                    prune_cluster_relay_messages(max_age_days, effective_dry_run)
+                        .map_err(JarvisError::from)?,
+                );
+            }
+            println!(
+                "{}",
+                render_relay_prune_output(&reports, output).map_err(JarvisError::from)?
             );
             Ok(())
         }

@@ -334,7 +334,16 @@ jarvisctl message send --from-namespace local-ns --to-namespace partner-ns --tex
 jarvisctl message list --all --cluster
 jarvisctl message flush --cluster
 jarvisctl message ack <message-id> --node archiebald
+jarvisctl message prune --max-age-days 14 --cluster
 scripts/cluster_relay_smoke.sh archiebald
+```
+
+Node heartbeat records give the dashboard and status bar a durable freshness signal in addition to live SSH probes. Use `node heartbeat` from timers, login hooks, or the dashboard node action; `node doctor` reports `heartbeat_age_seconds` and marks old heartbeat records as stale without making a never-heartbeated node fail its first bootstrap.
+
+```bash
+jarvisctl node heartbeat
+jarvisctl node heartbeat archiebald
+scripts/cluster_ops_regression.sh archiebald
 ```
 
 Capability and autonomy commands expose the production-readiness layer used by Mission Chain:
