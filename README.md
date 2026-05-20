@@ -327,6 +327,16 @@ jarvisctl notify list --output json
 
 The request record stores title, reason, risk, command/context, namespace/request links, and decision metadata. It does not store passwords, tokens, or other secrets.
 
+Relay messages are durable cross-runtime operator messages. `message send` first tries the normal app-server `tell` route; when the target namespace is not routable, the message remains queued instead of failing the workflow. The control plane and Obsidian Cluster Ops can list, retry, and acknowledge local and remote relay queues:
+
+```bash
+jarvisctl message send --from-namespace local-ns --to-namespace partner-ns --text "Need your node-local finding."
+jarvisctl message list --all --cluster
+jarvisctl message flush --cluster
+jarvisctl message ack <message-id> --node archiebald
+scripts/cluster_relay_smoke.sh archiebald
+```
+
 Capability and autonomy commands expose the production-readiness layer used by Mission Chain:
 
 ```bash
