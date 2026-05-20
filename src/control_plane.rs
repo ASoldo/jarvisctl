@@ -2972,7 +2972,7 @@ fn pair_intro_message(
     shared_message: &str,
 ) -> String {
     format!(
-        "Paired cluster workload '{coordination_id}' started.\n\nYour node: {own_node}\nYour namespace: {own_namespace}\nPartner node: {partner_node}\nPartner namespace: {partner_namespace}\nCoordination note on the control plane: {}\n\nProtocol:\n- Do your node-local part of the task in your own workspace.\n- Send partner messages with: `jarvisctl tell --namespace {partner_namespace} --text '<message>' --mode auto`.\n- Keep partner messages concise and include what you need or what you learned.\n- If you spawn subagents, keep their outputs summarized in this namespace before relaying across nodes.\n- Record final node-local outcome in your ticket.\n\nShared operator message:\n{shared_message}",
+        "Paired cluster workload '{coordination_id}' started.\n\nYour node: {own_node}\nYour namespace: {own_namespace}\nPartner node: {partner_node}\nPartner namespace: {partner_namespace}\nCoordination note on the control plane: {}\n\nProtocol:\n- Do your node-local part of the task in your own workspace.\n- Send partner messages with: `jarvisctl tell --namespace {partner_namespace} --text '<message>' --mode auto`.\n- If the first partner message says the runtime session does not exist, wait 10 seconds and retry once; jarvisctl can use the staged pair note as a direct routing fallback when the live remote index is late.\n- Keep partner messages concise and include what you need or what you learned.\n- If you spawn subagents, keep their outputs summarized in this namespace before relaying across nodes.\n- Record final node-local outcome in your ticket.\n\nShared operator message:\n{shared_message}",
         coordination_note.display()
     )
 }
@@ -9579,11 +9579,69 @@ fn remote_node_for_runtime_session_with_retry(
         if let Some(node) = remote_node_for_runtime_session(runtime_namespace)? {
             return Ok(Some(node));
         }
+        if let Some(node) = remote_node_for_pair_namespace(runtime_namespace)? {
+            return Ok(Some(node));
+        }
         if started.elapsed() >= timeout {
             return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(750));
     }
+}
+
+fn remote_node_for_pair_namespace(
+    runtime_namespace: &str,
+) -> anyhow::Result<Option<ResourceEnvelope<NodeSpec>>> {
+    let dir = jarvis_codex_dir()?.join("pairs");
+    if !dir.exists() {
+        return Ok(None);
+    }
+    for entry in fs::read_dir(&dir).with_context(|| {
+        format!(
+            "failed to read pair coordination directory '{}'",
+            dir.display()
+        )
+    })? {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("md") {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let fields = parse_pair_coordination_fields(&raw);
+        let node_name = if fields.get("first_namespace").map(String::as_str)
+            == Some(runtime_namespace)
+        {
+            fields.get("first_node")
+        } else if fields.get("second_namespace").map(String::as_str) == Some(runtime_namespace) {
+            fields.get("second_node")
+        } else {
+            None
+        };
+        let Some(node_name) = node_name else {
+            continue;
+        };
+        let Ok(ResourceManifest::Node(node)) = load_manifest(ResourceKind::Node, node_name, None)
+        else {
+            continue;
+        };
+        if !node_is_local(&node) {
+            return Ok(Some(node));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_pair_coordination_fields(raw: &str) -> BTreeMap<String, String> {
+    raw.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let line = line.strip_prefix("- ")?;
+            let (key, value) = line.split_once(':')?;
+            Some((key.trim().to_string(), value.trim().to_string()))
+        })
+        .collect()
 }
 
 fn run_remote_runtime_command(
