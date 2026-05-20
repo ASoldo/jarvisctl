@@ -47,6 +47,8 @@ use storage::*;
 const API_VERSION: &str = "jarvisctl.io/v1alpha1";
 const DEFAULT_KUBERNETES_RUNTIME_IMAGE: &str = "node:25-bookworm-slim";
 const DEFAULT_KUBERNETES_RUNTIME_CONTROL_PORT: u16 = 47832;
+const HEARTBEAT_SERVICE_NAME: &str = "jarvisctl-heartbeat.service";
+const HEARTBEAT_TIMER_NAME: &str = "jarvisctl-heartbeat.timer";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum ControlPlaneOutput {
@@ -479,6 +481,28 @@ pub struct NodeHeartbeatReport {
     pub target: String,
     pub heartbeat_epoch_ms: u128,
     pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeHeartbeatServiceInstallReport {
+    pub installed: bool,
+    pub enabled: bool,
+    pub started: bool,
+    pub service_unit_path: String,
+    pub timer_unit_path: String,
+    pub interval_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeHeartbeatServiceStatus {
+    pub service_unit: String,
+    pub timer_unit: String,
+    pub service_unit_path: String,
+    pub timer_unit_path: String,
+    pub service_active: String,
+    pub service_enabled: String,
+    pub timer_active: String,
+    pub timer_enabled: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1861,6 +1885,148 @@ pub fn heartbeat_node(name: Option<&str>) -> anyhow::Result<NodeHeartbeatReport>
             .cloned()
             .unwrap_or_else(|| "~/.jarvis/codex/heartbeat.json".to_string()),
     })
+}
+
+pub fn install_node_heartbeat_user_service(
+    interval_seconds: u64,
+    enable: bool,
+    start: bool,
+) -> anyhow::Result<NodeHeartbeatServiceInstallReport> {
+    let dir = systemd_user_dir()?;
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create '{}'", dir.display()))?;
+    let service_path = dir.join(HEARTBEAT_SERVICE_NAME);
+    let timer_path = dir.join(HEARTBEAT_TIMER_NAME);
+    let interval = interval_seconds.max(60);
+    let service = "[Unit]\nDescription=jarvisctl node heartbeat\nAfter=default.target\n\n[Service]\nType=oneshot\nExecStart=/bin/sh -lc 'exec \"$HOME/.cargo/bin/jarvisctl\" node heartbeat'\nEnvironment=RUST_LOG=warn\nNice=15\nIOSchedulingClass=best-effort\nIOSchedulingPriority=7\n\n[Install]\nWantedBy=default.target\n";
+    let timer = format!(
+        "[Unit]\nDescription=Run jarvisctl node heartbeat periodically\n\n[Timer]\nOnBootSec=30s\nOnUnitActiveSec={interval}s\nAccuracySec=10s\nPersistent=true\nUnit={HEARTBEAT_SERVICE_NAME}\n\n[Install]\nWantedBy=timers.target\n"
+    );
+    fs::write(&service_path, service)
+        .with_context(|| format!("failed to write '{}'", service_path.display()))?;
+    fs::write(&timer_path, timer)
+        .with_context(|| format!("failed to write '{}'", timer_path.display()))?;
+
+    run_systemctl_user(&["daemon-reload"], false)?;
+    let mut enabled = false;
+    let mut started = false;
+    if enable || start {
+        let mut args = vec!["enable"];
+        if start {
+            args.push("--now");
+        }
+        args.push(HEARTBEAT_TIMER_NAME);
+        run_systemctl_user(&args, false)?;
+        enabled = true;
+        started = start;
+    }
+
+    Ok(NodeHeartbeatServiceInstallReport {
+        installed: true,
+        enabled,
+        started,
+        service_unit_path: service_path.display().to_string(),
+        timer_unit_path: timer_path.display().to_string(),
+        interval_seconds: interval,
+    })
+}
+
+pub fn node_heartbeat_service_status() -> anyhow::Result<NodeHeartbeatServiceStatus> {
+    let dir = systemd_user_dir()?;
+    let service_path = dir.join(HEARTBEAT_SERVICE_NAME);
+    let timer_path = dir.join(HEARTBEAT_TIMER_NAME);
+    Ok(NodeHeartbeatServiceStatus {
+        service_unit: HEARTBEAT_SERVICE_NAME.to_string(),
+        timer_unit: HEARTBEAT_TIMER_NAME.to_string(),
+        service_unit_path: service_path.display().to_string(),
+        timer_unit_path: timer_path.display().to_string(),
+        service_active: systemctl_user_value(&["is-active", HEARTBEAT_SERVICE_NAME]),
+        service_enabled: systemctl_user_value(&["is-enabled", HEARTBEAT_SERVICE_NAME]),
+        timer_active: systemctl_user_value(&["is-active", HEARTBEAT_TIMER_NAME]),
+        timer_enabled: systemctl_user_value(&["is-enabled", HEARTBEAT_TIMER_NAME]),
+    })
+}
+
+pub fn render_node_heartbeat_service_install(
+    report: &NodeHeartbeatServiceInstallReport,
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => serde_json::to_string_pretty(report)
+            .context("failed to encode node heartbeat service install report"),
+        ControlPlaneOutput::Yaml => serde_yaml::to_string(report)
+            .context("failed to encode node heartbeat service install report"),
+        ControlPlaneOutput::Table => Ok(format!(
+            "INSTALLED\tENABLED\tSTARTED\tINTERVAL_SECONDS\tTIMER\n{}\t{}\t{}\t{}\t{}",
+            report.installed,
+            report.enabled,
+            report.started,
+            report.interval_seconds,
+            report.timer_unit_path
+        )),
+    }
+}
+
+pub fn render_node_heartbeat_service_status(
+    status: &NodeHeartbeatServiceStatus,
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => serde_json::to_string_pretty(status)
+            .context("failed to encode node heartbeat service status"),
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(status).context("failed to encode node heartbeat service status")
+        }
+        ControlPlaneOutput::Table => Ok(format!(
+            "SERVICE\tSERVICE_ACTIVE\tTIMER\tTIMER_ACTIVE\tTIMER_ENABLED\n{}\t{}\t{}\t{}\t{}",
+            status.service_unit,
+            status.service_active,
+            status.timer_unit,
+            status.timer_active,
+            status.timer_enabled
+        )),
+    }
+}
+
+fn systemd_user_dir() -> anyhow::Result<PathBuf> {
+    let home = env::var("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".config/systemd/user"))
+}
+
+fn run_systemctl_user(args: &[&str], allow_failure: bool) -> anyhow::Result<()> {
+    let status = ProcessCommand::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .status()
+        .context("failed to run systemctl --user")?;
+    if !status.success() && !allow_failure {
+        bail!("systemctl --user {} exited with {status}", args.join(" "));
+    }
+    Ok(())
+}
+
+fn systemctl_user_value(args: &[&str]) -> String {
+    match ProcessCommand::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !stdout.is_empty() {
+                return stdout;
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.is_empty() {
+                "unknown".to_string()
+            } else {
+                stderr
+            }
+        }
+        Err(error) => format!("error: {error}"),
+    }
 }
 
 pub fn cleanup_node(name: &str, max_age_days: u64) -> anyhow::Result<NodeCleanupResult> {

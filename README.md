@@ -343,8 +343,13 @@ Node heartbeat records give the dashboard and status bar a durable freshness sig
 ```bash
 jarvisctl node heartbeat
 jarvisctl node heartbeat archiebald
+jarvisctl node install-heartbeat-user-service --interval-seconds 120
+jarvisctl node heartbeat-service-status
 scripts/cluster_ops_regression.sh archiebald
+scripts/production_readiness.sh archiebald
 ```
+
+`install-heartbeat-user-service` writes `jarvisctl-heartbeat.service` and `jarvisctl-heartbeat.timer` under `~/.config/systemd/user/`. Run it on every node after `cargo install --path .` so `node doctor`, the status bar, and the Obsidian dashboard can distinguish a genuinely stale node from a node that was only registered once.
 
 Capability and autonomy commands expose the production-readiness layer used by Mission Chain:
 

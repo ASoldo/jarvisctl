@@ -69,14 +69,16 @@ use control_plane::{
     attach_cluster_runtime_session, authorize_runtime_message, bootstrap_node, check_node_links,
     cleanup_node, cluster_index, configure_worker_drift_smoke_schedule,
     delete_cluster_runtime_session, doctor_nodes, flush_cluster_relay_messages,
-    flush_relay_messages, heartbeat_node, inspect_node, interrupt_cluster_runtime_session,
-    list_cluster_operator_requests, list_cluster_relay_messages, list_relay_messages,
-    list_worker_run_records, load_or_create_orchestration_policy, load_worker_run_record,
-    mark_worker_run, migrate_session_to_node, open_visit_capsule, orchestration_policy_path,
+    flush_relay_messages, heartbeat_node, inspect_node, install_node_heartbeat_user_service,
+    interrupt_cluster_runtime_session, list_cluster_operator_requests, list_cluster_relay_messages,
+    list_relay_messages, list_worker_run_records, load_or_create_orchestration_policy,
+    load_worker_run_record, mark_worker_run, migrate_session_to_node,
+    node_heartbeat_service_status, open_visit_capsule, orchestration_policy_path,
     pause_deployment_rollout, preflight_nodes, prune_cluster_relay_messages,
     prune_completed_runtime_sessions, prune_relay_messages, prune_worker_runs,
     read_auth_audit_events, read_worker_run_artifact, reconcile_nodes, register_node,
     render_describe_output, render_get_output, render_kubernetes_resources,
+    render_node_heartbeat_service_install, render_node_heartbeat_service_status,
     render_node_probe_output, render_node_sudo_output, render_relay_message_output,
     render_relay_messages_output, render_relay_prune_output, render_rollout_history_output,
     render_rollout_status_output, render_runtime_prune_output, render_worker_drift_smoke_output,
@@ -1604,6 +1606,27 @@ enum NodeCommand {
     Heartbeat {
         name: Option<String>,
 
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Install or update the user-systemd timer that refreshes this node heartbeat
+    InstallHeartbeatUserService {
+        #[arg(long = "interval-seconds", alias = "interval", default_value_t = 120)]
+        interval_seconds: u64,
+
+        #[arg(long, default_value_t = true, default_missing_value = "true", num_args = 0..=1, require_equals = true)]
+        enable: bool,
+
+        #[arg(long, default_value_t = true, default_missing_value = "true", num_args = 0..=1, require_equals = true)]
+        start: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Show this node heartbeat user-systemd timer state
+    HeartbeatServiceStatus {
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
@@ -3169,6 +3192,29 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                     );
                 }
             }
+            Ok(())
+        }
+        NodeCommand::InstallHeartbeatUserService {
+            interval_seconds,
+            enable,
+            start,
+            output,
+        } => {
+            let report = install_node_heartbeat_user_service(interval_seconds, enable, start)
+                .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_node_heartbeat_service_install(&report, output)
+                    .map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        NodeCommand::HeartbeatServiceStatus { output } => {
+            let status = node_heartbeat_service_status().map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_node_heartbeat_service_status(&status, output).map_err(JarvisError::from)?
+            );
             Ok(())
         }
         NodeCommand::Preflight { output } => {
