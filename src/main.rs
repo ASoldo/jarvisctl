@@ -90,8 +90,9 @@ use control_plane::{
     run_node_sudo, run_node_visit, run_recurring_worker_drift_smoke, run_worker_drift_smoke,
     run_worker_offload, schedule_node, send_relay_message, set_node_cordoned,
     show_cluster_operator_request, start_node_pair_session, start_node_session,
-    sync_codex_auth_to_node, tell_cluster_runtime_session, undo_deployment_rollout,
-    validate_worker_models, wait_for_rollout_status_output, worker_drift_smoke_schedule_status,
+    sync_codex_auth_to_node, tell_cluster_runtime_session, tell_runtime_session_on_node,
+    undo_deployment_rollout, validate_worker_models, wait_for_rollout_status_output,
+    worker_drift_smoke_schedule_status,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use mission::{
@@ -630,17 +631,25 @@ enum Command {
         #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
         backend: SessionBackend,
 
+        /// Direct target in node/namespace or node/namespace/agent form
+        #[arg(long, conflicts_with_all = ["service", "namespace", "node"])]
+        target: Option<String>,
+
+        /// Route directly to a specific Jarvis node
+        #[arg(long)]
+        node: Option<String>,
+
         #[arg(
             long,
             alias = "ns",
-            required_unless_present = "service",
-            conflicts_with = "service"
+            required_unless_present_any = ["service", "target"],
+            conflicts_with_all = ["service", "target"]
         )]
         namespace: Option<String>,
         #[arg(
             long,
-            required_unless_present = "namespace",
-            conflicts_with = "namespace"
+            required_unless_present_any = ["namespace", "target"],
+            conflicts_with_all = ["namespace", "target"]
         )]
         service: Option<String>,
         #[arg(
@@ -2431,6 +2440,8 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         }
         Command::Tell {
             backend,
+            target,
+            node,
             namespace,
             service,
             resource_namespace,
@@ -2440,15 +2451,31 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             no_enter,
             mode,
         } => {
+            let target = target
+                .as_deref()
+                .map(parse_runtime_tell_target)
+                .transpose()?;
+            let node = target
+                .as_ref()
+                .and_then(|target| target.node.as_deref())
+                .or(node.as_deref());
+            let agent = target
+                .as_ref()
+                .and_then(|target| target.agent.as_deref())
+                .unwrap_or(&agent);
             let namespace = resolve_tell_runtime_namespace(
-                namespace.as_deref(),
+                target
+                    .as_ref()
+                    .and_then(|target| target.namespace.as_deref())
+                    .or(namespace.as_deref()),
                 service.as_deref(),
                 resource_namespace.as_deref(),
             )?;
             tell(
                 backend,
+                node,
                 &namespace,
-                &agent,
+                agent,
                 file.as_deref(),
                 text.as_deref(),
                 !no_enter,
@@ -6007,9 +6034,40 @@ fn exec_agent(backend: SessionBackend, namespace: &str, agent: &str) -> Result<(
     attach_runtime_session(namespace, agent).map_err(JarvisError::from)
 }
 
+#[derive(Debug)]
+struct RuntimeTellTarget {
+    node: Option<String>,
+    namespace: Option<String>,
+    agent: Option<String>,
+}
+
+fn parse_runtime_tell_target(value: &str) -> anyhow::Result<RuntimeTellTarget> {
+    let parts = value
+        .split('/')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    match parts.as_slice() {
+        [node, namespace] => Ok(RuntimeTellTarget {
+            node: Some((*node).to_string()),
+            namespace: Some((*namespace).to_string()),
+            agent: None,
+        }),
+        [node, namespace, agent] => Ok(RuntimeTellTarget {
+            node: Some((*node).to_string()),
+            namespace: Some((*namespace).to_string()),
+            agent: Some((*agent).to_string()),
+        }),
+        _ => Err(anyhow::anyhow!(
+            "--target must use node/namespace or node/namespace/agent"
+        )),
+    }
+}
+
 #[instrument(err)]
 fn tell(
     backend: SessionBackend,
+    node: Option<&str>,
     namespace: &str,
     agent: &str,
     file: Option<&str>,
@@ -6032,11 +6090,30 @@ fn tell(
         }
     };
     let _ = backend;
+    let mode_arg = codex_input_mode_arg(mode);
+    if let Some(node) = node {
+        if tell_runtime_session_on_node(node, namespace, agent, &contents, mode_arg)
+            .map_err(JarvisError::from)?
+        {
+            if let Some(file) = file {
+                println!(
+                    "Sent '{}' to '{}':'{}' on node '{}'",
+                    file, namespace, agent, node
+                );
+            } else {
+                println!(
+                    "Sent text to '{}':'{}' on node '{}'",
+                    namespace, agent, node
+                );
+            }
+            return Ok(());
+        }
+    }
+
     if let Err(local_error) = tell_runtime_session(namespace, agent, &contents, press_enter, mode) {
         if !press_enter {
             return Err(JarvisError::from(local_error));
         }
-        let mode_arg = codex_input_mode_arg(mode);
         if !tell_cluster_runtime_session(namespace, agent, &contents, mode_arg)
             .map_err(JarvisError::from)?
         {
@@ -6245,7 +6322,7 @@ fn print_process_info(p: &sysinfo::Process) {
 
 #[cfg(test)]
 mod tests {
-    use super::select_kube_runtime_control_port;
+    use super::{parse_runtime_tell_target, select_kube_runtime_control_port};
 
     #[test]
     fn selects_named_control_port_first() {
@@ -6278,5 +6355,20 @@ mod tests {
                 .to_string()
                 .contains("multiple ports without a unique 'control' port")
         );
+    }
+
+    #[test]
+    fn parses_runtime_tell_target_address() {
+        let target = parse_runtime_tell_target("archiebald/demo-ns/agent1").unwrap();
+        assert_eq!(target.node.as_deref(), Some("archiebald"));
+        assert_eq!(target.namespace.as_deref(), Some("demo-ns"));
+        assert_eq!(target.agent.as_deref(), Some("agent1"));
+
+        let target = parse_runtime_tell_target("archiebald/demo-ns").unwrap();
+        assert_eq!(target.node.as_deref(), Some("archiebald"));
+        assert_eq!(target.namespace.as_deref(), Some("demo-ns"));
+        assert_eq!(target.agent, None);
+
+        assert!(parse_runtime_tell_target("demo-ns").is_err());
     }
 }

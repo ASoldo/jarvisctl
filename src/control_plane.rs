@@ -3723,6 +3723,39 @@ pub fn tell_cluster_runtime_session(
     Ok(true)
 }
 
+pub fn tell_runtime_session_on_node(
+    node_name: &str,
+    namespace: &str,
+    agent: &str,
+    contents: &str,
+    mode: &str,
+) -> anyhow::Result<bool> {
+    let manifest = load_manifest(ResourceKind::Node, node_name, None)
+        .with_context(|| format!("failed to load Node '{}'", node_name))?;
+    let ResourceManifest::Node(node) = manifest else {
+        bail!("resource '{}' is not a Node", node_name);
+    };
+    if node_is_local(&node) {
+        return Ok(false);
+    }
+    run_remote_runtime_command(
+        &node,
+        vec![
+            "jarvisctl".to_string(),
+            "tell".to_string(),
+            "--namespace".to_string(),
+            namespace.to_string(),
+            "--agent".to_string(),
+            agent.to_string(),
+            "--text".to_string(),
+            contents.to_string(),
+            "--mode".to_string(),
+            mode.to_string(),
+        ],
+    )?;
+    Ok(true)
+}
+
 pub fn list_cluster_operator_requests() -> anyhow::Result<Vec<OperatorRequestRecord>> {
     let mut records = Vec::new();
     for node in remote_nodes()? {
