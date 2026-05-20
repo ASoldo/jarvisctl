@@ -63,18 +63,21 @@ use control_plane::{
     ControlPlaneOutput, ControlPlaneResourceKindArg, KubernetesRenderOutput, NodeBootstrapOptions,
     NodeFanoutOptions, NodeLinksOptions, NodePairSessionOptions, NodeRegisterOptions,
     NodeScheduleOptions, NodeStartSessionOptions, NodeSudoOptions, NodeVisitOptions,
-    RemoteOperatorRequestResolveOptions, WorkerDriftSmokeOptions, WorkerDriftSmokeScheduleOptions,
-    WorkerOffloadOptions, apply_kubernetes_resources, apply_kustomization, apply_manifests,
+    RelayMessageSendOptions, RemoteOperatorRequestResolveOptions, WorkerDriftSmokeOptions,
+    WorkerDriftSmokeScheduleOptions, WorkerOffloadOptions, ack_cluster_relay_message,
+    ack_relay_message, apply_kubernetes_resources, apply_kustomization, apply_manifests,
     attach_cluster_runtime_session, authorize_runtime_message, bootstrap_node, check_node_links,
     cleanup_node, cluster_index, configure_worker_drift_smoke_schedule,
-    delete_cluster_runtime_session, doctor_nodes, inspect_node, interrupt_cluster_runtime_session,
-    list_cluster_operator_requests, list_worker_run_records, load_or_create_orchestration_policy,
-    load_worker_run_record, mark_worker_run, migrate_session_to_node, open_visit_capsule,
-    orchestration_policy_path, pause_deployment_rollout, preflight_nodes,
-    prune_completed_runtime_sessions, prune_worker_runs, read_auth_audit_events,
-    read_worker_run_artifact, reconcile_nodes, register_node, render_describe_output,
-    render_get_output, render_kubernetes_resources, render_node_probe_output,
-    render_node_sudo_output, render_rollout_history_output, render_rollout_status_output,
+    delete_cluster_runtime_session, doctor_nodes, flush_cluster_relay_messages,
+    flush_relay_messages, inspect_node, interrupt_cluster_runtime_session,
+    list_cluster_operator_requests, list_cluster_relay_messages, list_relay_messages,
+    list_worker_run_records, load_or_create_orchestration_policy, load_worker_run_record,
+    mark_worker_run, migrate_session_to_node, open_visit_capsule, orchestration_policy_path,
+    pause_deployment_rollout, preflight_nodes, prune_completed_runtime_sessions, prune_worker_runs,
+    read_auth_audit_events, read_worker_run_artifact, reconcile_nodes, register_node,
+    render_describe_output, render_get_output, render_kubernetes_resources,
+    render_node_probe_output, render_node_sudo_output, render_relay_message_output,
+    render_relay_messages_output, render_rollout_history_output, render_rollout_status_output,
     render_runtime_prune_output, render_worker_drift_smoke_output,
     render_worker_drift_smoke_schedule_status, render_worker_model_validation_output,
     render_worker_run_artifact_output, render_worker_run_prune_output, render_worker_runs_output,
@@ -82,10 +85,10 @@ use control_plane::{
     resolve_service_target_for_message, respond_cluster_runtime_server_request,
     restart_deployment_rollout, resume_deployment_rollout, rotate_capsule_key, run_node_fanout,
     run_node_sudo, run_node_visit, run_recurring_worker_drift_smoke, run_worker_drift_smoke,
-    run_worker_offload, schedule_node, set_node_cordoned, show_cluster_operator_request,
-    start_node_pair_session, start_node_session, sync_codex_auth_to_node,
-    tell_cluster_runtime_session, undo_deployment_rollout, validate_worker_models,
-    wait_for_rollout_status_output, worker_drift_smoke_schedule_status,
+    run_worker_offload, schedule_node, send_relay_message, set_node_cordoned,
+    show_cluster_operator_request, start_node_pair_session, start_node_session,
+    sync_codex_auth_to_node, tell_cluster_runtime_session, undo_deployment_rollout,
+    validate_worker_models, wait_for_rollout_status_output, worker_drift_smoke_schedule_status,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use mission::{
@@ -469,6 +472,13 @@ enum Command {
     OperatorRequest {
         #[command(subcommand)]
         command: OperatorRequestCommand,
+    },
+
+    /// Queue, inspect, retry, and acknowledge cross-runtime relay messages
+    #[command(alias = "messages", alias = "relay")]
+    Message {
+        #[command(subcommand)]
+        command: MessageCommand,
     },
 
     /// Inspect or trigger Deployment rollouts
@@ -1423,6 +1433,83 @@ enum OperatorRequestCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum MessageCommand {
+    /// Send a durable relay message to a runtime namespace
+    Send {
+        #[arg(long = "to-namespace", alias = "to-ns", alias = "ns")]
+        to_namespace: String,
+
+        #[arg(long = "from-namespace", alias = "from-ns")]
+        from_namespace: Option<String>,
+
+        #[arg(long = "to-node", alias = "node")]
+        to_node: Option<String>,
+
+        #[arg(long, default_value = "agent0")]
+        agent: String,
+
+        #[arg(long, default_value = "auto")]
+        mode: String,
+
+        #[arg(long, default_value = "operator")]
+        kind: String,
+
+        #[arg(long, conflicts_with = "file")]
+        text: Option<String>,
+
+        #[arg(long = "file", alias = "f", value_hint = ValueHint::FilePath, conflicts_with = "text")]
+        file: Option<PathBuf>,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// List durable relay messages
+    List {
+        #[arg(long = "namespace", alias = "ns")]
+        namespace: Option<String>,
+
+        #[arg(long)]
+        status: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        all: bool,
+
+        #[arg(long, default_value_t = false)]
+        cluster: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Retry pending relay messages
+    Flush {
+        #[arg(long = "namespace", alias = "ns")]
+        namespace: Option<String>,
+
+        #[arg(long)]
+        status: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        cluster: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Mark a relay message as acknowledged
+    Ack {
+        id: String,
+
+        #[arg(long)]
+        node: Option<String>,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum NodeCommand {
     /// Register a local, SSH, or Tailscale-reachable worker node
     Register {
@@ -2214,6 +2301,7 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         Command::Capability { command } => capability_command(command),
         Command::Autonomy { command } => autonomy_command(command),
         Command::OperatorRequest { command } => operator_request_command(command),
+        Command::Message { command } => message_command(command),
         Command::Rollout { command } => rollout_command(command),
         Command::Kube { command } => kube_command(command),
         Command::Dashboard {
@@ -4582,6 +4670,123 @@ fn operator_request_command(command: OperatorRequestCommand) -> Result<(), Jarvi
             println!(
                 "{}",
                 render_operator_request_output(&record, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+    }
+}
+
+fn message_command(command: MessageCommand) -> Result<(), JarvisError> {
+    match command {
+        MessageCommand::Send {
+            to_namespace,
+            from_namespace,
+            to_node,
+            agent,
+            mode,
+            kind,
+            text,
+            file,
+            output,
+        } => {
+            let body = match (text, file) {
+                (Some(text), None) => text,
+                (None, Some(file)) => fs::read_to_string(&file).map_err(JarvisError::from)?,
+                (Some(_), Some(_)) => {
+                    return Err(JarvisError::Other(anyhow::anyhow!(
+                        "--text and --file cannot be used together"
+                    )));
+                }
+                (None, None) => {
+                    return Err(JarvisError::Other(anyhow::anyhow!(
+                        "provide either --text or --file"
+                    )));
+                }
+            };
+            let record = send_relay_message(RelayMessageSendOptions {
+                from_namespace,
+                to_namespace,
+                to_node,
+                agent,
+                mode,
+                kind,
+                body,
+            })
+            .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_relay_message_output(&record, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        MessageCommand::List {
+            namespace,
+            status,
+            all,
+            cluster,
+            output,
+        } => {
+            let wanted = if all {
+                status.as_deref()
+            } else {
+                Some(status.as_deref().unwrap_or("pending"))
+            };
+            let mut records =
+                list_relay_messages(namespace.as_deref(), wanted).map_err(JarvisError::from)?;
+            if cluster {
+                records.extend(
+                    list_cluster_relay_messages(namespace.as_deref(), wanted)
+                        .map_err(JarvisError::from)?,
+                );
+                records.sort_by(|left, right| {
+                    right.updated_at_epoch_ms.cmp(&left.updated_at_epoch_ms)
+                });
+            }
+            println!(
+                "{}",
+                render_relay_messages_output(&records, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        MessageCommand::Flush {
+            namespace,
+            status,
+            cluster,
+            output,
+        } => {
+            let mut records = flush_relay_messages(namespace.as_deref(), status.as_deref())
+                .map_err(JarvisError::from)?;
+            if cluster {
+                records.extend(
+                    flush_cluster_relay_messages(namespace.as_deref(), status.as_deref())
+                        .map_err(JarvisError::from)?,
+                );
+                records.sort_by(|left, right| {
+                    right.updated_at_epoch_ms.cmp(&left.updated_at_epoch_ms)
+                });
+            }
+            println!(
+                "{}",
+                render_relay_messages_output(&records, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        MessageCommand::Ack { id, node, output } => {
+            let record = if node.is_some() {
+                ack_cluster_relay_message(node.as_deref(), &id)
+                    .map_err(JarvisError::from)?
+                    .ok_or_else(|| {
+                        JarvisError::Other(anyhow::anyhow!(
+                            "relay message '{}' does not exist on remote nodes",
+                            id
+                        ))
+                    })?
+            } else {
+                ack_relay_message(&id).map_err(JarvisError::from)?
+            };
+            println!(
+                "{}",
+                render_relay_message_output(&record, output).map_err(JarvisError::from)?
             );
             Ok(())
         }

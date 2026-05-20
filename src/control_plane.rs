@@ -2972,7 +2972,7 @@ fn pair_intro_message(
     shared_message: &str,
 ) -> String {
     format!(
-        "Paired cluster workload '{coordination_id}' started.\n\nYour node: {own_node}\nYour namespace: {own_namespace}\nPartner node: {partner_node}\nPartner namespace: {partner_namespace}\nCoordination note on the control plane: {}\n\nProtocol:\n- Do your node-local part of the task in your own workspace.\n- Send partner messages with: `jarvisctl tell --namespace {partner_namespace} --text '<message>' --mode auto`.\n- If the first partner message says the runtime session does not exist, wait 10 seconds and retry once; jarvisctl can use the staged pair note as a direct routing fallback when the live remote index is late.\n- Keep partner messages concise and include what you need or what you learned.\n- If you spawn subagents, keep their outputs summarized in this namespace before relaying across nodes.\n- Record final node-local outcome in your ticket.\n\nShared operator message:\n{shared_message}",
+        "Paired cluster workload '{coordination_id}' started.\n\nYour node: {own_node}\nYour namespace: {own_namespace}\nPartner node: {partner_node}\nPartner namespace: {partner_namespace}\nCoordination note on the control plane: {}\n\nProtocol:\n- Do your node-local part of the task in your own workspace.\n- Send partner messages with: `jarvisctl message send --from-namespace {own_namespace} --to-namespace {partner_namespace} --text '<message>' --mode auto`.\n- Relay messages are durable: if direct delivery is blocked, jarvisctl keeps them pending so the control plane can inspect and retry with `jarvisctl message flush`.\n- Keep partner messages concise and include what you need or what you learned.\n- If you spawn subagents, keep their outputs summarized in this namespace before relaying across nodes.\n- Record final node-local outcome in your ticket.\n\nShared operator message:\n{shared_message}",
         coordination_note.display()
     )
 }
@@ -3425,6 +3425,366 @@ pub fn list_cluster_operator_requests() -> anyhow::Result<Vec<OperatorRequestRec
         records.extend(remote_records);
     }
     Ok(records)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayMessageRecord {
+    pub id: String,
+    pub created_at_epoch_ms: u128,
+    pub updated_at_epoch_ms: u128,
+    pub from_node: Option<String>,
+    pub from_namespace: Option<String>,
+    pub to_node: Option<String>,
+    pub to_namespace: String,
+    pub agent: String,
+    pub mode: String,
+    pub kind: String,
+    pub status: String,
+    pub body: String,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+    pub delivered_at_epoch_ms: Option<u128>,
+    pub acked_at_epoch_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_node: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RelayMessageSendOptions {
+    pub from_namespace: Option<String>,
+    pub to_namespace: String,
+    pub to_node: Option<String>,
+    pub agent: String,
+    pub mode: String,
+    pub kind: String,
+    pub body: String,
+}
+
+fn relay_messages_dir() -> anyhow::Result<PathBuf> {
+    Ok(jarvis_codex_dir()?.join("messages"))
+}
+
+fn relay_message_path(id: &str) -> anyhow::Result<PathBuf> {
+    Ok(relay_messages_dir()?.join(format!("{}.json", slugify(id))))
+}
+
+fn save_relay_message(record: &RelayMessageRecord) -> anyhow::Result<()> {
+    let dir = relay_messages_dir()?;
+    fs::create_dir_all(&dir)?;
+    let path = relay_message_path(&record.id)?;
+    atomic_write_string(&path, &serde_json::to_string_pretty(record)?)
+}
+
+fn load_relay_message(id: &str) -> anyhow::Result<RelayMessageRecord> {
+    let path = relay_message_path(id)?;
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("failed to read relay message '{}'", path.display()))?;
+    serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse relay message '{}'", path.display()))
+}
+
+pub fn list_relay_messages(
+    namespace: Option<&str>,
+    status: Option<&str>,
+) -> anyhow::Result<Vec<RelayMessageRecord>> {
+    let dir = relay_messages_dir()?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut records = Vec::new();
+    for entry in
+        fs::read_dir(&dir).with_context(|| format!("failed to read '{}'", dir.display()))?
+    {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<RelayMessageRecord>(&raw) else {
+            continue;
+        };
+        if let Some(namespace) = namespace {
+            if record.to_namespace != namespace
+                && record.from_namespace.as_deref() != Some(namespace)
+            {
+                continue;
+            }
+        }
+        if let Some(status) = status {
+            if record.status != status {
+                continue;
+            }
+        }
+        records.push(record);
+    }
+    records.sort_by(|left, right| right.updated_at_epoch_ms.cmp(&left.updated_at_epoch_ms));
+    Ok(records)
+}
+
+pub fn list_cluster_relay_messages(
+    namespace: Option<&str>,
+    status: Option<&str>,
+) -> anyhow::Result<Vec<RelayMessageRecord>> {
+    let mut records = Vec::new();
+    for node in remote_nodes()? {
+        let mut args = vec![
+            "jarvisctl".to_string(),
+            "message".to_string(),
+            "list".to_string(),
+            "--all".to_string(),
+            "--output".to_string(),
+            "json".to_string(),
+        ];
+        if let Some(namespace) = namespace {
+            args.push("--namespace".to_string());
+            args.push(namespace.to_string());
+        }
+        if let Some(status) = status {
+            args.push("--status".to_string());
+            args.push(status.to_string());
+        }
+        let Ok(stdout) = run_remote_runtime_command_output(&node, args, 20) else {
+            continue;
+        };
+        let Ok(mut remote_records) = serde_json::from_str::<Vec<RelayMessageRecord>>(stdout.trim())
+        else {
+            continue;
+        };
+        for record in &mut remote_records {
+            record.source_node = Some(node.metadata.name.clone());
+            record.remote = Some(true);
+        }
+        records.extend(remote_records);
+    }
+    Ok(records)
+}
+
+pub fn flush_cluster_relay_messages(
+    namespace: Option<&str>,
+    status: Option<&str>,
+) -> anyhow::Result<Vec<RelayMessageRecord>> {
+    let mut records = Vec::new();
+    for node in remote_nodes()? {
+        let mut args = vec![
+            "jarvisctl".to_string(),
+            "message".to_string(),
+            "flush".to_string(),
+            "--output".to_string(),
+            "json".to_string(),
+        ];
+        if let Some(namespace) = namespace {
+            args.push("--namespace".to_string());
+            args.push(namespace.to_string());
+        }
+        if let Some(status) = status {
+            args.push("--status".to_string());
+            args.push(status.to_string());
+        }
+        let Ok(stdout) = run_remote_runtime_command_output(&node, args, 30) else {
+            continue;
+        };
+        let Ok(mut remote_records) = serde_json::from_str::<Vec<RelayMessageRecord>>(stdout.trim())
+        else {
+            continue;
+        };
+        for record in &mut remote_records {
+            record.source_node = Some(node.metadata.name.clone());
+            record.remote = Some(true);
+        }
+        records.extend(remote_records);
+    }
+    Ok(records)
+}
+
+pub fn ack_cluster_relay_message(
+    node_name: Option<&str>,
+    id: &str,
+) -> anyhow::Result<Option<RelayMessageRecord>> {
+    let nodes = match node_name.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(node_name) => {
+            let manifest = load_manifest(ResourceKind::Node, node_name, None)?;
+            match manifest {
+                ResourceManifest::Node(node) if !node_is_local(&node) => vec![node],
+                ResourceManifest::Node(_) => Vec::new(),
+                _ => bail!("resource '{}' is not a Node", node_name),
+            }
+        }
+        None => remote_nodes()?,
+    };
+    for node in nodes {
+        let Ok(stdout) = run_remote_runtime_command_output(
+            &node,
+            vec![
+                "jarvisctl".to_string(),
+                "message".to_string(),
+                "ack".to_string(),
+                id.to_string(),
+                "--output".to_string(),
+                "json".to_string(),
+            ],
+            20,
+        ) else {
+            continue;
+        };
+        let Ok(mut record) = serde_json::from_str::<RelayMessageRecord>(stdout.trim()) else {
+            continue;
+        };
+        record.source_node = Some(node.metadata.name.clone());
+        record.remote = Some(true);
+        return Ok(Some(record));
+    }
+    Ok(None)
+}
+
+fn try_deliver_relay_message(record: &mut RelayMessageRecord) -> anyhow::Result<bool> {
+    record.attempts = record.attempts.saturating_add(1);
+    record.updated_at_epoch_ms = now_epoch_ms();
+    match tell_cluster_runtime_session(
+        &record.to_namespace,
+        &record.agent,
+        &record.body,
+        &record.mode,
+    ) {
+        Ok(true) => {
+            record.status = "delivered".to_string();
+            record.last_error = None;
+            record.delivered_at_epoch_ms = Some(now_epoch_ms());
+            record.updated_at_epoch_ms = now_epoch_ms();
+            Ok(true)
+        }
+        Ok(false) => {
+            record.status = "pending".to_string();
+            record.last_error = Some("target runtime is not currently routable".to_string());
+            Ok(false)
+        }
+        Err(error) => {
+            record.status = "pending".to_string();
+            record.last_error = Some(error.to_string());
+            Ok(false)
+        }
+    }
+}
+
+pub fn send_relay_message(options: RelayMessageSendOptions) -> anyhow::Result<RelayMessageRecord> {
+    ensure!(
+        !options.to_namespace.trim().is_empty(),
+        "--to-namespace must not be empty"
+    );
+    ensure!(
+        !options.body.trim().is_empty(),
+        "message body must not be empty"
+    );
+    let now = now_epoch_ms();
+    let mut record = RelayMessageRecord {
+        id: format!(
+            "msg-{}-{}-{}",
+            slugify(&options.to_namespace),
+            now,
+            std::process::id()
+        ),
+        created_at_epoch_ms: now,
+        updated_at_epoch_ms: now,
+        from_node: local_node_name().ok(),
+        from_namespace: options.from_namespace,
+        to_node: options.to_node,
+        to_namespace: options.to_namespace,
+        agent: options.agent,
+        mode: options.mode,
+        kind: options.kind,
+        status: "pending".to_string(),
+        body: options.body,
+        attempts: 0,
+        last_error: None,
+        delivered_at_epoch_ms: None,
+        acked_at_epoch_ms: None,
+        source_node: None,
+        remote: None,
+    };
+    let _ = try_deliver_relay_message(&mut record)?;
+    save_relay_message(&record)?;
+    Ok(record)
+}
+
+pub fn flush_relay_messages(
+    namespace: Option<&str>,
+    status: Option<&str>,
+) -> anyhow::Result<Vec<RelayMessageRecord>> {
+    let mut records = list_relay_messages(namespace, status.or(Some("pending")))?;
+    for record in &mut records {
+        let _ = try_deliver_relay_message(record)?;
+        save_relay_message(record)?;
+    }
+    Ok(records)
+}
+
+pub fn ack_relay_message(id: &str) -> anyhow::Result<RelayMessageRecord> {
+    let mut record = load_relay_message(id)?;
+    record.status = "acked".to_string();
+    record.acked_at_epoch_ms = Some(now_epoch_ms());
+    record.updated_at_epoch_ms = now_epoch_ms();
+    save_relay_message(&record)?;
+    Ok(record)
+}
+
+pub fn render_relay_message_output(
+    record: &RelayMessageRecord,
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(record).context("failed to encode relay message")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(record).context("failed to encode relay message")
+        }
+        ControlPlaneOutput::Table => Ok(format!(
+            "ID\tSTATUS\tTO\tAGENT\tATTEMPTS\tERROR\n{}\t{}\t{}\t{}\t{}\t{}",
+            record.id,
+            record.status,
+            record.to_namespace,
+            record.agent,
+            record.attempts,
+            record.last_error.as_deref().unwrap_or("-")
+        )),
+    }
+}
+
+pub fn render_relay_messages_output(
+    records: &[RelayMessageRecord],
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(records).context("failed to encode relay messages")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(records).context("failed to encode relay messages")
+        }
+        ControlPlaneOutput::Table => {
+            let mut lines = vec!["ID\tSTATUS\tFROM\tTO\tAGENT\tATTEMPTS\tERROR".to_string()];
+            for record in records {
+                lines.push(format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    record.id,
+                    record.status,
+                    record
+                        .from_namespace
+                        .as_deref()
+                        .or(record.source_node.as_deref())
+                        .unwrap_or("-"),
+                    record.to_namespace,
+                    record.agent,
+                    record.attempts,
+                    record.last_error.as_deref().unwrap_or("-")
+                ));
+            }
+            Ok(lines.join("\n"))
+        }
+    }
 }
 
 pub fn show_cluster_operator_request(id: &str) -> anyhow::Result<Option<OperatorRequestRecord>> {
