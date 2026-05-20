@@ -4542,6 +4542,7 @@ fn operator_request_command(command: OperatorRequestCommand) -> Result<(), Jarvi
                             error_for_request,
                         )
                         .map_err(JarvisError::from)?
+                            && !is_missing_runtime_response_error(&local_error)
                         {
                             return Err(JarvisError::from(local_error));
                         }
@@ -4597,6 +4598,11 @@ fn parse_optional_json(
         })
     })
     .transpose()
+}
+
+fn is_missing_runtime_response_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("runtime session") && message.contains("does not exist")
 }
 
 fn default_operator_request_response(
