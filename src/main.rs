@@ -63,36 +63,38 @@ use control_plane::{
     ControlPlaneOutput, ControlPlaneResourceKindArg, KubernetesRenderOutput, NodeBootstrapOptions,
     NodeFanoutOptions, NodeLinksOptions, NodePairSessionOptions, NodeRegisterOptions,
     NodeScheduleOptions, NodeStartSessionOptions, NodeSudoOptions, NodeVisitOptions,
-    RelayMessageSendOptions, RemoteOperatorRequestResolveOptions, WorkerDriftSmokeOptions,
-    WorkerDriftSmokeScheduleOptions, WorkerOffloadOptions, ack_cluster_relay_message,
-    ack_relay_message, apply_kubernetes_resources, apply_kustomization, apply_manifests,
-    attach_cluster_runtime_session, authorize_runtime_message, bootstrap_node, check_node_links,
-    cleanup_node, cluster_index, collect_node_task_note, configure_worker_drift_smoke_schedule,
-    delete_cluster_runtime_session, doctor_nodes, flush_cluster_relay_messages,
-    flush_relay_messages, heartbeat_node, inspect_node, install_node_heartbeat_user_service,
-    interrupt_cluster_runtime_session, list_cluster_operator_requests, list_cluster_relay_messages,
-    list_pair_ledgers, list_relay_messages, list_worker_run_records,
-    load_or_create_orchestration_policy, load_worker_run_record, mark_worker_run,
-    migrate_session_to_node, node_heartbeat_service_status, open_visit_capsule,
-    orchestration_policy_path, pause_deployment_rollout, preflight_nodes,
-    prune_cluster_relay_messages, prune_completed_runtime_sessions, prune_relay_messages,
-    prune_worker_runs, read_auth_audit_events, read_worker_run_artifact, reconcile_nodes,
-    register_node, render_describe_output, render_get_output, render_kubernetes_resources,
+    PairLedgerFinalizeOptions, RelayMessageSendOptions, RemoteOperatorRequestResolveOptions,
+    WorkerDriftSmokeOptions, WorkerDriftSmokeScheduleOptions, WorkerOffloadOptions,
+    ack_cluster_relay_message, ack_relay_message, apply_kubernetes_resources, apply_kustomization,
+    apply_manifests, attach_cluster_runtime_session, authorize_runtime_message, bootstrap_node,
+    check_node_links, cleanup_node, cluster_index, collect_node_task_note,
+    configure_worker_drift_smoke_schedule, delete_cluster_runtime_session, doctor_nodes,
+    finalize_pair_ledger, flush_cluster_relay_messages, flush_relay_messages, heartbeat_node,
+    inspect_node, install_node_heartbeat_user_service, interrupt_cluster_runtime_session,
+    list_cluster_operator_requests, list_cluster_relay_messages, list_pair_ledgers,
+    list_relay_messages, list_worker_run_records, load_or_create_orchestration_policy,
+    load_worker_run_record, mark_worker_run, migrate_session_to_node,
+    node_heartbeat_service_status, open_visit_capsule, orchestration_policy_path,
+    pause_deployment_rollout, preflight_nodes, prune_cluster_relay_messages,
+    prune_completed_runtime_sessions, prune_relay_messages, prune_worker_runs,
+    read_auth_audit_events, read_worker_run_artifact, reconcile_nodes, register_node,
+    render_describe_output, render_get_output, render_kubernetes_resources,
     render_node_heartbeat_service_install, render_node_heartbeat_service_status,
-    render_node_probe_output, render_node_sudo_output, render_pair_ledgers_output,
-    render_relay_message_output, render_relay_messages_output, render_relay_prune_output,
-    render_rollout_history_output, render_rollout_status_output, render_runtime_prune_output,
-    render_worker_drift_smoke_output, render_worker_drift_smoke_schedule_status,
-    render_worker_model_validation_output, render_worker_run_artifact_output,
-    render_worker_run_prune_output, render_worker_runs_output, render_worker_validation_output,
-    resolve_cluster_operator_request, resolve_service_target, resolve_service_target_for_message,
-    respond_cluster_runtime_server_request, restart_deployment_rollout, resume_deployment_rollout,
-    rotate_capsule_key, run_node_fanout, run_node_sudo, run_node_visit,
-    run_recurring_worker_drift_smoke, run_worker_drift_smoke, run_worker_offload, schedule_node,
-    send_relay_message, set_node_cordoned, show_cluster_operator_request, start_node_pair_session,
-    start_node_session, sync_codex_auth_to_node, tell_cluster_runtime_session,
-    tell_runtime_session_on_node, undo_deployment_rollout, validate_worker_models,
-    wait_for_rollout_status_output, worker_drift_smoke_schedule_status,
+    render_node_probe_output, render_node_sudo_output, render_pair_finalize_output,
+    render_pair_ledgers_output, render_relay_message_output, render_relay_messages_output,
+    render_relay_prune_output, render_rollout_history_output, render_rollout_status_output,
+    render_runtime_prune_output, render_worker_drift_smoke_output,
+    render_worker_drift_smoke_schedule_status, render_worker_model_validation_output,
+    render_worker_run_artifact_output, render_worker_run_prune_output, render_worker_runs_output,
+    render_worker_validation_output, resolve_cluster_operator_request, resolve_service_target,
+    resolve_service_target_for_message, respond_cluster_runtime_server_request,
+    restart_deployment_rollout, resume_deployment_rollout, rotate_capsule_key, run_node_fanout,
+    run_node_sudo, run_node_visit, run_recurring_worker_drift_smoke, run_worker_drift_smoke,
+    run_worker_offload, schedule_node, send_relay_message, set_node_cordoned,
+    show_cluster_operator_request, start_node_pair_session, start_node_session,
+    sync_codex_auth_to_node, tell_cluster_runtime_session, tell_runtime_session_on_node,
+    undo_deployment_rollout, validate_worker_models, wait_for_rollout_status_output,
+    worker_drift_smoke_schedule_status,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use mission::{
@@ -1011,6 +1013,23 @@ enum ProposalCommand {
 enum PairCommand {
     /// List paired runtime coordination ledgers
     Ledger {
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Collect evidence, close namespaces, mark reviewed, and archive a pair ledger
+    Finalize {
+        id: String,
+
+        #[arg(long = "skip-collect")]
+        skip_collect: bool,
+
+        #[arg(long = "skip-close")]
+        skip_close: bool,
+
+        #[arg(long = "skip-archive")]
+        skip_archive: bool,
+
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
@@ -4607,6 +4626,26 @@ fn pair_command(command: PairCommand) -> Result<(), JarvisError> {
             println!(
                 "{}",
                 render_pair_ledgers_output(&ledgers, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        PairCommand::Finalize {
+            id,
+            skip_collect,
+            skip_close,
+            skip_archive,
+            output,
+        } => {
+            let report = finalize_pair_ledger(PairLedgerFinalizeOptions {
+                id,
+                collect: !skip_collect,
+                close: !skip_close,
+                archive: !skip_archive,
+            })
+            .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_pair_finalize_output(&report, output).map_err(JarvisError::from)?
             );
             Ok(())
         }

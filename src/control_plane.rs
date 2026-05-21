@@ -363,6 +363,43 @@ pub struct PairLedgerRecord {
     pub stale: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct PairLedgerFinalizeOptions {
+    pub id: String,
+    pub collect: bool,
+    pub close: bool,
+    pub archive: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PairLedgerMemberFinalizeReport {
+    pub role: String,
+    pub node: String,
+    pub namespace: String,
+    pub task_note: String,
+    pub collected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collect_detail: Option<String>,
+    pub closed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PairLedgerFinalizeReport {
+    pub id: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_path: Option<String>,
+    pub reviewed: bool,
+    pub archived: bool,
+    pub collected_members: usize,
+    pub closed_members: usize,
+    pub members: Vec<PairLedgerMemberFinalizeReport>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NodePreflightResult {
     pub ok: bool,
@@ -3314,6 +3351,121 @@ pub fn render_pair_ledgers_output(
     }
 }
 
+pub fn finalize_pair_ledger(
+    options: PairLedgerFinalizeOptions,
+) -> anyhow::Result<PairLedgerFinalizeReport> {
+    let ledgers = list_pair_ledgers()?;
+    let ledger = ledgers
+        .into_iter()
+        .find(|ledger| ledger.id == options.id)
+        .ok_or_else(|| anyhow!("pair ledger '{}' does not exist", options.id))?;
+    let mut members = Vec::new();
+
+    for member in &ledger.members {
+        let mut report = PairLedgerMemberFinalizeReport {
+            role: member.role.clone(),
+            node: member.node.clone(),
+            namespace: member.namespace.clone(),
+            task_note: member.task_note.clone(),
+            collected: false,
+            collect_detail: None,
+            closed: false,
+            close_detail: None,
+            errors: Vec::new(),
+        };
+
+        if options.collect {
+            match collect_node_task_note(
+                &member.node,
+                &member.namespace,
+                Path::new(&member.task_note),
+                None,
+            ) {
+                Ok(collected) => {
+                    report.collected = collected.collected || collected.detail.contains("already");
+                    report.collect_detail = Some(collected.detail);
+                }
+                Err(error) => report.errors.push(format!("collect failed: {error}")),
+            }
+        }
+
+        if options.close {
+            match close_pair_member_session(member) {
+                Ok(detail) => {
+                    report.closed = detail != "no live session indexed";
+                    report.close_detail = Some(detail);
+                }
+                Err(error) => report.errors.push(format!("close failed: {error}")),
+            }
+        }
+
+        members.push(report);
+    }
+
+    mark_pair_ledger_reviewed(&ledger)?;
+    let archived_path = if options.archive {
+        Some(archive_pair_ledger(&ledger)?)
+    } else {
+        None
+    };
+
+    Ok(PairLedgerFinalizeReport {
+        id: ledger.id,
+        path: ledger.path,
+        archived_path,
+        reviewed: true,
+        archived: options.archive,
+        collected_members: members.iter().filter(|member| member.collected).count(),
+        closed_members: members.iter().filter(|member| member.closed).count(),
+        members,
+    })
+}
+
+pub fn render_pair_finalize_output(
+    report: &PairLedgerFinalizeReport,
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(report).context("failed to encode pair finalize report")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(report).context("failed to encode pair finalize report")
+        }
+        ControlPlaneOutput::Table => {
+            let mut lines = vec![
+                "PAIR\tREVIEWED\tARCHIVED\tCOLLECTED\tCLOSED\tARCHIVE_PATH".to_string(),
+                format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    report.id,
+                    report.reviewed,
+                    report.archived,
+                    report.collected_members,
+                    report.closed_members,
+                    report.archived_path.as_deref().unwrap_or("-")
+                ),
+                "ROLE\tNODE\tNAMESPACE\tCOLLECTED\tCLOSED\tERRORS".to_string(),
+            ];
+            for member in &report.members {
+                lines.push(format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    member.role,
+                    member.node,
+                    member.namespace,
+                    member.collected,
+                    member.closed,
+                    if member.errors.is_empty() {
+                        "-".to_string()
+                    } else {
+                        member.errors.join("; ")
+                    }
+                ));
+            }
+            Ok(lines.join("\n"))
+        }
+    }
+}
+
 fn read_pair_ledger(
     path: &Path,
     sessions: &[NativeSessionMetadata],
@@ -3377,6 +3529,59 @@ fn read_pair_ledger(
         live_members,
         stale: live_members == 0,
     }))
+}
+
+fn close_pair_member_session(member: &PairLedgerMember) -> anyhow::Result<String> {
+    if let Some(session) = collect_runtime_sessions()?
+        .into_iter()
+        .find(|session| session.namespace == member.namespace)
+    {
+        delete_runtime_session(&session)?;
+        return Ok("closed indexed runtime session".to_string());
+    }
+
+    let node = load_node_manifest(&member.node)?;
+    if node_is_local(&node) {
+        return Ok("no live session indexed".to_string());
+    }
+    delete_remote_runtime_session(&node, &member.namespace)?;
+    Ok("closed remote runtime session by namespace".to_string())
+}
+
+fn mark_pair_ledger_reviewed(ledger: &PairLedgerRecord) -> anyhow::Result<()> {
+    let path = Path::new(&ledger.path);
+    let marker = format!(
+        "\n## Review\n- reviewed_at_epoch_ms: {}\n- action: finalized\n",
+        now_epoch_ms()
+    );
+    fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open pair ledger '{}'", path.display()))?
+        .write_all(marker.as_bytes())
+        .with_context(|| format!("failed to mark pair ledger '{}' reviewed", path.display()))
+}
+
+fn archive_pair_ledger(ledger: &PairLedgerRecord) -> anyhow::Result<String> {
+    let path = Path::new(&ledger.path);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("pair ledger '{}' has no parent directory", path.display()))?;
+    let archive_dir = parent.join("archive");
+    fs::create_dir_all(&archive_dir)
+        .with_context(|| format!("failed to create '{}'", archive_dir.display()))?;
+    let mut archive_path = archive_dir.join(format!("{}.md", ledger.id));
+    if archive_path.exists() {
+        archive_path = archive_dir.join(format!("{}-{}.md", ledger.id, now_epoch_ms()));
+    }
+    fs::rename(path, &archive_path).with_context(|| {
+        format!(
+            "failed to archive pair ledger '{}' to '{}'",
+            path.display(),
+            archive_path.display()
+        )
+    })?;
+    Ok(archive_path.display().to_string())
 }
 
 fn pair_member_status(session: &NativeSessionMetadata) -> PairLedgerMemberStatus {
