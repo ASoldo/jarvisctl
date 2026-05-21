@@ -2,6 +2,7 @@
 
 use anyhow::{Context, bail, ensure};
 use clap::{Parser, Subcommand, ValueEnum, ValueHint};
+use serde::Serialize;
 use std::{
     env,
     ffi::OsStr,
@@ -11,7 +12,7 @@ use std::{
     path::PathBuf,
     process::{Child, Command as ProcessCommand, ExitCode, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use sysinfo::{Pid, System};
 use thiserror::Error;
@@ -63,27 +64,27 @@ use control_plane::{
     ControlPlaneOutput, ControlPlaneResourceKindArg, KubernetesRenderOutput, NodeBootstrapOptions,
     NodeFanoutOptions, NodeLinksOptions, NodePairSessionOptions, NodeRegisterOptions,
     NodeScheduleOptions, NodeStartSessionOptions, NodeSudoOptions, NodeVisitOptions,
-    PairLedgerFinalizeOptions, RelayMessageSendOptions, RemoteOperatorRequestResolveOptions,
-    WorkerDriftSmokeOptions, WorkerDriftSmokeScheduleOptions, WorkerOffloadOptions,
-    ack_cluster_relay_message, ack_relay_message, apply_kubernetes_resources, apply_kustomization,
-    apply_manifests, attach_cluster_runtime_session, authorize_runtime_message, bootstrap_node,
-    check_node_links, cleanup_node, cluster_index, collect_node_task_note,
-    configure_worker_drift_smoke_schedule, delete_cluster_runtime_session, doctor_nodes,
-    finalize_pair_ledger, flush_cluster_relay_messages, flush_relay_messages, heartbeat_node,
-    inspect_node, install_node_heartbeat_user_service, interrupt_cluster_runtime_session,
-    list_cluster_operator_requests, list_cluster_relay_messages, list_pair_ledgers,
-    list_relay_messages, list_worker_run_records, load_or_create_orchestration_policy,
-    load_worker_run_record, mark_worker_run, migrate_session_to_node,
-    node_heartbeat_service_status, open_visit_capsule, orchestration_policy_path,
-    pause_deployment_rollout, preflight_nodes, prune_cluster_relay_messages,
-    prune_completed_runtime_sessions, prune_relay_messages, prune_worker_runs,
-    read_auth_audit_events, read_worker_run_artifact, reconcile_nodes, register_node,
-    render_describe_output, render_get_output, render_kubernetes_resources,
+    PairDemoOptions, PairLedgerFinalizeOptions, RelayMessageSendOptions,
+    RemoteOperatorRequestResolveOptions, WorkerDriftSmokeOptions, WorkerDriftSmokeScheduleOptions,
+    WorkerOffloadOptions, ack_cluster_relay_message, ack_relay_message, apply_kubernetes_resources,
+    apply_kustomization, apply_manifests, attach_cluster_runtime_session,
+    authorize_runtime_message, bootstrap_node, check_node_links, cleanup_node, cluster_index,
+    collect_node_task_note, configure_worker_drift_smoke_schedule, delete_cluster_runtime_session,
+    doctor_nodes, export_pair_ledger, finalize_pair_ledger, flush_cluster_relay_messages,
+    flush_relay_messages, heartbeat_node, inspect_node, install_node_heartbeat_user_service,
+    interrupt_cluster_runtime_session, list_cluster_operator_requests, list_cluster_relay_messages,
+    list_pair_ledgers, list_relay_messages, list_worker_run_records,
+    load_or_create_orchestration_policy, load_worker_run_record, mark_worker_run,
+    migrate_session_to_node, node_heartbeat_service_status, open_visit_capsule,
+    orchestration_policy_path, pause_deployment_rollout, preflight_nodes,
+    prune_cluster_relay_messages, prune_completed_runtime_sessions, prune_relay_messages,
+    prune_worker_runs, read_auth_audit_events, read_worker_run_artifact, reconcile_nodes,
+    register_node, render_describe_output, render_get_output, render_kubernetes_resources,
     render_node_heartbeat_service_install, render_node_heartbeat_service_status,
-    render_node_probe_output, render_node_sudo_output, render_pair_finalize_output,
-    render_pair_ledgers_output, render_relay_message_output, render_relay_messages_output,
-    render_relay_prune_output, render_rollout_history_output, render_rollout_status_output,
-    render_runtime_prune_output, render_worker_drift_smoke_output,
+    render_node_probe_output, render_node_sudo_output, render_pair_export_output,
+    render_pair_finalize_output, render_pair_ledgers_output, render_relay_message_output,
+    render_relay_messages_output, render_relay_prune_output, render_rollout_history_output,
+    render_rollout_status_output, render_runtime_prune_output, render_worker_drift_smoke_output,
     render_worker_drift_smoke_schedule_status, render_worker_model_validation_output,
     render_worker_run_artifact_output, render_worker_run_prune_output, render_worker_runs_output,
     render_worker_validation_output, resolve_cluster_operator_request, resolve_service_target,
@@ -91,7 +92,7 @@ use control_plane::{
     restart_deployment_rollout, resume_deployment_rollout, rotate_capsule_key, run_node_fanout,
     run_node_sudo, run_node_visit, run_recurring_worker_drift_smoke, run_worker_drift_smoke,
     run_worker_offload, schedule_node, send_relay_message, set_node_cordoned,
-    show_cluster_operator_request, start_node_pair_session, start_node_session,
+    show_cluster_operator_request, start_node_pair_session, start_node_session, start_pair_demo,
     sync_codex_auth_to_node, tell_cluster_runtime_session, tell_runtime_session_on_node,
     undo_deployment_rollout, validate_worker_models, wait_for_rollout_status_output,
     worker_drift_smoke_schedule_status,
@@ -477,6 +478,12 @@ enum Command {
     Autonomy {
         #[command(subcommand)]
         command: AutonomyCommand,
+    },
+
+    /// Show production readiness across nodes, policy, queues, pairs, and capabilities
+    Health {
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
     },
 
     /// Manage durable operator/admin requests and notifications
@@ -1013,8 +1020,43 @@ enum ProposalCommand {
 enum PairCommand {
     /// List paired runtime coordination ledgers
     Ledger {
+        #[arg(long = "include-archived")]
+        include_archived: bool,
+
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
+    },
+
+    /// Export pair evidence as Markdown or structured JSON/YAML
+    Export {
+        id: String,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Create demo pair task notes and optionally launch both node sessions
+    Demo {
+        #[arg(long = "first-node", alias = "n1")]
+        first_node: Option<String>,
+
+        #[arg(long = "second-node", alias = "n2")]
+        second_node: Option<String>,
+
+        #[arg(long = "namespace-prefix", alias = "ns")]
+        namespace_prefix: Option<String>,
+
+        #[arg(long, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = true)]
+        execute: bool,
+
+        #[arg(long = "startup-delay-ms", default_value_t = 1500)]
+        startup_delay_ms: u64,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+
+        #[arg(last = true, value_hint = ValueHint::CommandString)]
+        command: Vec<String>,
     },
 
     /// Collect evidence, close namespaces, mark reviewed, and archive a pair ledger
@@ -1033,6 +1075,42 @@ enum PairCommand {
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
+}
+
+#[derive(Debug, Serialize)]
+struct ProductionHealthReport {
+    status: String,
+    generated_at_epoch_ms: u128,
+    nodes_ready: usize,
+    nodes_total: usize,
+    link_failures: usize,
+    runtime_sessions: usize,
+    active_pairs: usize,
+    archived_pairs: usize,
+    stale_pairs: usize,
+    pending_operator_requests: usize,
+    pending_proposals: usize,
+    capability_count: usize,
+    capability_failures: usize,
+    failed_worker_runs: usize,
+    policy_gates: Vec<HealthPolicyGate>,
+    autonomy_queue: Vec<HealthQueueItem>,
+    issues: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthPolicyGate {
+    id: String,
+    decision: String,
+    action_class: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthQueueItem {
+    kind: String,
+    status: String,
+    summary: String,
+    command: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2411,6 +2489,7 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         Command::Pair { command } => pair_command(command),
         Command::Capability { command } => capability_command(command),
         Command::Autonomy { command } => autonomy_command(command),
+        Command::Health { output } => health_command(output),
         Command::OperatorRequest { command } => operator_request_command(command),
         Command::Message { command } => message_command(command),
         Command::Rollout { command } => rollout_command(command),
@@ -4621,12 +4700,66 @@ fn proposal_command(command: ProposalCommand) -> Result<(), JarvisError> {
 
 fn pair_command(command: PairCommand) -> Result<(), JarvisError> {
     match command {
-        PairCommand::Ledger { output } => {
-            let ledgers = list_pair_ledgers().map_err(JarvisError::from)?;
+        PairCommand::Ledger {
+            include_archived,
+            output,
+        } => {
+            let ledgers = list_pair_ledgers(include_archived).map_err(JarvisError::from)?;
             println!(
                 "{}",
                 render_pair_ledgers_output(&ledgers, output).map_err(JarvisError::from)?
             );
+            Ok(())
+        }
+        PairCommand::Export { id, output } => {
+            let export = export_pair_ledger(&id).map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_pair_export_output(&export, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        PairCommand::Demo {
+            first_node,
+            second_node,
+            namespace_prefix,
+            execute,
+            startup_delay_ms,
+            output,
+            command,
+        } => {
+            let report = start_pair_demo(PairDemoOptions {
+                first_node,
+                second_node,
+                namespace_prefix,
+                execute,
+                startup_delay_ms,
+                command,
+            })
+            .map_err(JarvisError::from)?;
+            match output {
+                ControlPlaneOutput::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(anyhow::Error::from)?
+                ),
+                ControlPlaneOutput::Yaml => {
+                    println!(
+                        "{}",
+                        serde_yaml::to_string(&report).map_err(anyhow::Error::from)?
+                    )
+                }
+                ControlPlaneOutput::Table => {
+                    println!("PAIR\tEXECUTED\tFIRST_TASK\tSECOND_TASK\tCOMMAND");
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        report.id,
+                        report.executed,
+                        report.first_task_note,
+                        report.second_task_note,
+                        report.command
+                    );
+                }
+            }
             Ok(())
         }
         PairCommand::Finalize {
@@ -4650,6 +4783,158 @@ fn pair_command(command: PairCommand) -> Result<(), JarvisError> {
             Ok(())
         }
     }
+}
+
+fn health_command(output: ControlPlaneOutput) -> Result<(), JarvisError> {
+    let preflight = preflight_nodes().map_err(JarvisError::from)?;
+    let sessions = collect_runtime_sessions().map_err(JarvisError::from)?;
+    let pairs = list_pair_ledgers(true).map_err(JarvisError::from)?;
+    let active_pairs = pairs.iter().filter(|pair| !pair.archived).count();
+    let archived_pairs = pairs.iter().filter(|pair| pair.archived).count();
+    let stale_pairs = pairs
+        .iter()
+        .filter(|pair| !pair.archived && pair.stale)
+        .count();
+    let operator_requests = list_operator_requests().map_err(JarvisError::from)?;
+    let proposals = list_proposals().map_err(JarvisError::from)?;
+    let capabilities = list_capabilities().map_err(JarvisError::from)?;
+    let capability_validation = validate_capabilities().map_err(JarvisError::from)?;
+    let failed_worker_runs = list_worker_run_records(Some(50), true)
+        .map_err(JarvisError::from)?
+        .into_iter()
+        .filter(|run| {
+            run.phase.eq_ignore_ascii_case("failed")
+                || run
+                    .error
+                    .as_deref()
+                    .map(|value| !value.is_empty())
+                    .unwrap_or(false)
+        })
+        .count();
+    let autonomy = reconcile_autonomy(
+        &list_missions().map_err(JarvisError::from)?,
+        &proposals,
+        false,
+        true,
+    )
+    .map_err(JarvisError::from)?;
+    let mut issues = preflight.issues.clone();
+    if stale_pairs > 0 {
+        issues.push(format!("stale_pairs={stale_pairs}"));
+    }
+    let pending_operator_requests = operator_requests
+        .iter()
+        .filter(|request| request.status == "pending")
+        .count();
+    if pending_operator_requests > 0 {
+        issues.push(format!(
+            "pending_operator_requests={pending_operator_requests}"
+        ));
+    }
+    let pending_proposals = proposals
+        .iter()
+        .filter(|proposal| proposal.status == "pending")
+        .count();
+    if pending_proposals > 0 {
+        issues.push(format!("pending_proposals={pending_proposals}"));
+    }
+    let capability_failures = capability_validation
+        .iter()
+        .filter(|report| report.status != "passed")
+        .count();
+    if capability_failures > 0 {
+        issues.push(format!("capability_failures={capability_failures}"));
+    }
+    if failed_worker_runs > 0 {
+        issues.push(format!("recent_failed_worker_runs={failed_worker_runs}"));
+    }
+    let nodes_total = preflight.doctors.len();
+    let nodes_ready = preflight
+        .doctors
+        .iter()
+        .filter(|doctor| doctor.schedulable)
+        .count();
+    let link_failures = preflight.links.iter().filter(|link| !link.ok).count();
+    let report = ProductionHealthReport {
+        status: if issues.is_empty() {
+            "ready"
+        } else {
+            "attention"
+        }
+        .to_string(),
+        generated_at_epoch_ms: now_epoch_ms_local(),
+        nodes_ready,
+        nodes_total,
+        link_failures,
+        runtime_sessions: sessions.len(),
+        active_pairs,
+        archived_pairs,
+        stale_pairs,
+        pending_operator_requests,
+        pending_proposals,
+        capability_count: capabilities.len(),
+        capability_failures,
+        failed_worker_runs,
+        policy_gates: default_autonomy_policy()
+            .into_iter()
+            .map(|rule| HealthPolicyGate {
+                id: rule.id,
+                decision: rule.decision,
+                action_class: rule.action_class,
+            })
+            .collect(),
+        autonomy_queue: autonomy
+            .blocked_actions
+            .into_iter()
+            .chain(autonomy.safe_actions)
+            .map(|action| HealthQueueItem {
+                kind: action.kind,
+                status: action.status,
+                summary: action.summary,
+                command: action.command,
+            })
+            .collect(),
+        issues,
+    };
+    match output {
+        ControlPlaneOutput::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(anyhow::Error::from)?
+        ),
+        ControlPlaneOutput::Yaml => {
+            println!(
+                "{}",
+                serde_yaml::to_string(&report).map_err(anyhow::Error::from)?
+            )
+        }
+        ControlPlaneOutput::Table => {
+            println!(
+                "STATUS\tNODES\tLINK_FAILURES\tSESSIONS\tPAIRS\tARCHIVED\tSTALE\tAPPROVALS\tPROPOSALS\tCAPABILITIES\tWORKER_FAILURES"
+            );
+            println!(
+                "{}\t{}/{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}/{}\t{}",
+                report.status,
+                report.nodes_ready,
+                report.nodes_total,
+                report.link_failures,
+                report.runtime_sessions,
+                report.active_pairs,
+                report.archived_pairs,
+                report.stale_pairs,
+                report.pending_operator_requests,
+                report.pending_proposals,
+                report
+                    .capability_count
+                    .saturating_sub(report.capability_failures),
+                report.capability_count,
+                report.failed_worker_runs
+            );
+            if !report.issues.is_empty() {
+                println!("ISSUES\t{}", report.issues.join(","));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn operator_request_command(command: OperatorRequestCommand) -> Result<(), JarvisError> {
@@ -6386,6 +6671,13 @@ fn print_process_info(p: &sysinfo::Process) {
     println!("Cmd line:        {:?}", p.cmd());
     println!("Parent PID:      {:?}", p.parent());
     println!("------------------------------------");
+}
+
+fn now_epoch_ms_local() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

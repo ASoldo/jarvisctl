@@ -355,8 +355,11 @@ pub struct PairLedgerRecord {
     pub id: String,
     pub path: String,
     pub title: String,
+    pub archived: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at_epoch_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_at_epoch_ms: Option<u128>,
     pub coordination: String,
     pub members: Vec<PairLedgerMember>,
     pub live_members: usize,
@@ -398,6 +401,37 @@ pub struct PairLedgerFinalizeReport {
     pub collected_members: usize,
     pub closed_members: usize,
     pub members: Vec<PairLedgerMemberFinalizeReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PairLedgerEvidenceExport {
+    pub id: String,
+    pub generated_at_epoch_ms: u128,
+    pub ledger: PairLedgerRecord,
+    pub relay_messages: Vec<RelayMessageRecord>,
+    pub operator_requests: Vec<OperatorRequestRecord>,
+    pub markdown: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PairDemoOptions {
+    pub first_node: Option<String>,
+    pub second_node: Option<String>,
+    pub namespace_prefix: Option<String>,
+    pub execute: bool,
+    pub startup_delay_ms: u64,
+    pub command: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PairDemoReport {
+    pub id: String,
+    pub first_task_note: String,
+    pub second_task_note: String,
+    pub executed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair: Option<NodePairSessionResult>,
+    pub command: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3291,23 +3325,16 @@ pub fn start_node_pair_session(
     })
 }
 
-pub fn list_pair_ledgers() -> anyhow::Result<Vec<PairLedgerRecord>> {
+pub fn list_pair_ledgers(include_archived: bool) -> anyhow::Result<Vec<PairLedgerRecord>> {
     let dir = jarvis_codex_dir()?.join("pairs");
     if !dir.exists() {
         return Ok(Vec::new());
     }
     let sessions = collect_runtime_sessions().unwrap_or_default();
     let mut ledgers = Vec::new();
-    for entry in fs::read_dir(&dir)
-        .with_context(|| format!("failed to read pair ledger directory '{}'", dir.display()))?
-    {
-        let path = entry?.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("md") {
-            continue;
-        }
-        if let Some(ledger) = read_pair_ledger(&path, &sessions)? {
-            ledgers.push(ledger);
-        }
+    read_pair_ledger_dir(&dir, false, &sessions, &mut ledgers)?;
+    if include_archived {
+        read_pair_ledger_dir(&dir.join("archive"), true, &sessions, &mut ledgers)?;
     }
     ledgers.sort_by(|left, right| {
         right
@@ -3317,6 +3344,32 @@ pub fn list_pair_ledgers() -> anyhow::Result<Vec<PairLedgerRecord>> {
             .then_with(|| left.id.cmp(&right.id))
     });
     Ok(ledgers)
+}
+
+fn read_pair_ledger_dir(
+    dir: &Path,
+    archived: bool,
+    sessions: &[NativeSessionMetadata],
+    ledgers: &mut Vec<PairLedgerRecord>,
+) -> anyhow::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("failed to read pair ledger directory '{}'", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir()
+            || path.extension().and_then(|value| value.to_str()) != Some("md")
+        {
+            continue;
+        }
+        if let Some(ledger) = read_pair_ledger(&path, archived, sessions)? {
+            ledgers.push(ledger);
+        }
+    }
+    Ok(())
 }
 
 pub fn render_pair_ledgers_output(
@@ -3354,7 +3407,7 @@ pub fn render_pair_ledgers_output(
 pub fn finalize_pair_ledger(
     options: PairLedgerFinalizeOptions,
 ) -> anyhow::Result<PairLedgerFinalizeReport> {
-    let ledgers = list_pair_ledgers()?;
+    let ledgers = list_pair_ledgers(false)?;
     let ledger = ledgers
         .into_iter()
         .find(|ledger| ledger.id == options.id)
@@ -3421,6 +3474,135 @@ pub fn finalize_pair_ledger(
     })
 }
 
+pub fn export_pair_ledger(id: &str) -> anyhow::Result<PairLedgerEvidenceExport> {
+    let ledger = list_pair_ledgers(true)?
+        .into_iter()
+        .find(|ledger| ledger.id == id)
+        .ok_or_else(|| anyhow!("pair ledger '{}' does not exist", id))?;
+    let namespaces = ledger
+        .members
+        .iter()
+        .map(|member| member.namespace.clone())
+        .collect::<HashSet<_>>();
+    let relay_messages = list_relay_messages(None, None)?
+        .into_iter()
+        .filter(|message| {
+            message
+                .from_namespace
+                .as_ref()
+                .map(|namespace| namespaces.contains(namespace))
+                .unwrap_or(false)
+                || namespaces.contains(&message.to_namespace)
+        })
+        .collect::<Vec<_>>();
+    let operator_requests = list_cluster_operator_requests()?
+        .into_iter()
+        .filter(|request| {
+            request
+                .namespace
+                .as_ref()
+                .map(|namespace| namespaces.contains(namespace))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    let markdown = render_pair_export_markdown(&ledger, &relay_messages, &operator_requests);
+    Ok(PairLedgerEvidenceExport {
+        id: ledger.id.clone(),
+        generated_at_epoch_ms: now_epoch_ms(),
+        ledger,
+        relay_messages,
+        operator_requests,
+        markdown,
+    })
+}
+
+pub fn render_pair_export_output(
+    export: &PairLedgerEvidenceExport,
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(export).context("failed to encode pair export")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(export).context("failed to encode pair export")
+        }
+        ControlPlaneOutput::Table => Ok(export.markdown.clone()),
+    }
+}
+
+pub fn start_pair_demo(options: PairDemoOptions) -> anyhow::Result<PairDemoReport> {
+    let (first_node, second_node) = match (options.first_node, options.second_node) {
+        (Some(first), Some(second)) => (first, second),
+        (first, second) => {
+            let mut candidates = doctor_nodes()?
+                .into_iter()
+                .filter(|check| check.schedulable)
+                .map(|check| check.node)
+                .collect::<Vec<_>>();
+            candidates.sort();
+            let first_node = first
+                .or_else(|| candidates.first().cloned())
+                .ok_or_else(|| anyhow!("no schedulable node available for first demo member"))?;
+            let second_node = second
+                .or_else(|| candidates.iter().find(|node| **node != first_node).cloned())
+                .ok_or_else(|| anyhow!("no second schedulable node available for pair demo"))?;
+            (first_node, second_node)
+        }
+    };
+    ensure!(
+        first_node != second_node,
+        "pair demo requires two distinct nodes"
+    );
+    let id = options
+        .namespace_prefix
+        .clone()
+        .unwrap_or_else(|| format!("demo-pair-{}", now_epoch_ms()));
+    let dir = jarvis_codex_dir()?.join("demos").join(slugify(&id));
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create pair demo directory '{}'", dir.display()))?;
+    let first_task_note = dir.join(format!("{}.md", slugify(&first_node)));
+    let second_task_note = dir.join(format!("{}.md", slugify(&second_node)));
+    atomic_write_string(
+        &first_task_note,
+        &pair_demo_task_note(&id, &first_node, &second_node),
+    )?;
+    atomic_write_string(
+        &second_task_note,
+        &pair_demo_task_note(&id, &second_node, &first_node),
+    )?;
+    let command = format!(
+        "jarvisctl node pair-session --first-node {first_node} --second-node {second_node} --first-task-note {} --second-task-note {} --namespace-prefix {id}",
+        first_task_note.display(),
+        second_task_note.display()
+    );
+    let pair = if options.execute {
+        Some(start_node_pair_session(NodePairSessionOptions {
+            first_node: first_node.clone(),
+            second_node: second_node.clone(),
+            first_task_note: first_task_note.clone(),
+            second_task_note: second_task_note.clone(),
+            first_namespace: None,
+            second_namespace: None,
+            namespace_prefix: Some(id.clone()),
+            message: Some("Live demo: coordinate across nodes, exchange one concise status update, verify local readiness, and record final evidence in the task note.".to_string()),
+            startup_delay_ms: options.startup_delay_ms,
+            retries: 1,
+            command: options.command,
+        })?)
+    } else {
+        None
+    };
+    Ok(PairDemoReport {
+        id,
+        first_task_note: first_task_note.display().to_string(),
+        second_task_note: second_task_note.display().to_string(),
+        executed: pair.is_some(),
+        pair,
+        command,
+    })
+}
+
 pub fn render_pair_finalize_output(
     report: &PairLedgerFinalizeReport,
     output: ControlPlaneOutput,
@@ -3468,6 +3650,7 @@ pub fn render_pair_finalize_output(
 
 fn read_pair_ledger(
     path: &Path,
+    archived: bool,
     sessions: &[NativeSessionMetadata],
 ) -> anyhow::Result<Option<PairLedgerRecord>> {
     let raw = fs::read_to_string(path)
@@ -3514,6 +3697,10 @@ fn read_pair_ledger(
     let created_at_epoch_ms = fields
         .get("created_at_epoch_ms")
         .and_then(|value| value.parse::<u128>().ok());
+    let reviewed_at_epoch_ms = fields
+        .get("reviewed_at_epoch_ms")
+        .and_then(|value| value.parse::<u128>().ok())
+        .or_else(|| parse_pair_reviewed_at(&raw));
     let coordination = pair_coordination_body(&raw);
     Ok(Some(PairLedgerRecord {
         id: path
@@ -3523,12 +3710,110 @@ fn read_pair_ledger(
             .to_string(),
         path: path.display().to_string(),
         title,
+        archived,
         created_at_epoch_ms,
+        reviewed_at_epoch_ms,
         coordination,
         members,
         live_members,
         stale: live_members == 0,
     }))
+}
+
+fn parse_pair_reviewed_at(raw: &str) -> Option<u128> {
+    raw.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("- reviewed_at_epoch_ms:")
+            .and_then(|value| value.trim().parse::<u128>().ok())
+    })
+}
+
+fn render_pair_export_markdown(
+    ledger: &PairLedgerRecord,
+    relay_messages: &[RelayMessageRecord],
+    operator_requests: &[OperatorRequestRecord],
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# Pair Evidence: {}\n\n", ledger.title));
+    out.push_str(&format!("- id: {}\n", ledger.id));
+    out.push_str(&format!("- archived: {}\n", ledger.archived));
+    out.push_str(&format!("- stale: {}\n", ledger.stale));
+    out.push_str(&format!("- live_members: {}\n", ledger.live_members));
+    if let Some(created) = ledger.created_at_epoch_ms {
+        out.push_str(&format!("- created_at_epoch_ms: {created}\n"));
+    }
+    if let Some(reviewed) = ledger.reviewed_at_epoch_ms {
+        out.push_str(&format!("- reviewed_at_epoch_ms: {reviewed}\n"));
+    }
+    out.push_str("\n## Coordination\n\n");
+    out.push_str(if ledger.coordination.trim().is_empty() {
+        "n/a\n"
+    } else {
+        ledger.coordination.trim()
+    });
+    out.push_str("\n\n## Members\n\n");
+    out.push_str("| Role | Node | Namespace | Task Note | Live | Agents | Turn |\n");
+    out.push_str("| --- | --- | --- | --- | --- | --- | --- |\n");
+    for member in &ledger.members {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} |\n",
+            member.role,
+            member.node,
+            member.namespace,
+            member.task_note,
+            member.live,
+            member
+                .status
+                .as_ref()
+                .map(|status| status.running_agents.to_string())
+                .unwrap_or_else(|| "0".to_string()),
+            member
+                .status
+                .as_ref()
+                .and_then(|status| status.turn_status.as_deref())
+                .unwrap_or("n/a")
+        ));
+    }
+    out.push_str("\n## Relay Messages\n\n");
+    if relay_messages.is_empty() {
+        out.push_str("No relay messages indexed.\n");
+    } else {
+        out.push_str("| Status | From | To | Agent | Attempts |\n");
+        out.push_str("| --- | --- | --- | --- | --- |\n");
+        for message in relay_messages {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} |\n",
+                message.status,
+                message.from_namespace.as_deref().unwrap_or("-"),
+                message.to_namespace,
+                message.agent,
+                message.attempts
+            ));
+        }
+    }
+    out.push_str("\n## Operator Requests\n\n");
+    if operator_requests.is_empty() {
+        out.push_str("No operator requests indexed.\n");
+    } else {
+        out.push_str("| Status | Kind | Title | Namespace |\n");
+        out.push_str("| --- | --- | --- | --- |\n");
+        for request in operator_requests {
+            out.push_str(&format!(
+                "| {} | {} | {} | {} |\n",
+                request.status,
+                request.kind,
+                request.title.replace('|', "\\|"),
+                request.namespace.as_deref().unwrap_or("-")
+            ));
+        }
+    }
+    out
+}
+
+fn pair_demo_task_note(id: &str, node: &str, partner: &str) -> String {
+    format!(
+        "---\ntype: ticket\nstatus: ready_for_codex\npriority: medium\nowner: codex\nrepo_path: /home/rootster\nlabels:\n  - demo\n  - two-node\n  - pair\n---\n\n# Pair demo: {node}\n\n## Objective\nProve this node can participate in a cross-node Codex pair operation.\n\n## Protocol\n- Work only from node `{node}`.\n- Coordinate with partner node `{partner}` through Jarvis pair messaging.\n- Report local Jarvis/Codex readiness.\n- Exchange one concise status message with the partner.\n- Record final evidence and outcome in this note.\n\n## Demo\n- pair_id: {id}\n- node: {node}\n- partner: {partner}\n"
+    )
 }
 
 fn close_pair_member_session(member: &PairLedgerMember) -> anyhow::Result<String> {
