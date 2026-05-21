@@ -327,6 +327,43 @@ pub struct NodePairSessionResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct PairLedgerMemberStatus {
+    pub running_agents: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PairLedgerMember {
+    pub role: String,
+    pub node: String,
+    pub namespace: String,
+    pub task_note: String,
+    pub live: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<PairLedgerMemberStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PairLedgerRecord {
+    pub id: String,
+    pub path: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_epoch_ms: Option<u128>,
+    pub coordination: String,
+    pub members: Vec<PairLedgerMember>,
+    pub live_members: usize,
+    pub stale: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct NodePreflightResult {
     pub ok: bool,
     pub generated_at_epoch_ms: u128,
@@ -3215,6 +3252,152 @@ pub fn start_node_pair_session(
             },
         ],
     })
+}
+
+pub fn list_pair_ledgers() -> anyhow::Result<Vec<PairLedgerRecord>> {
+    let dir = jarvis_codex_dir()?.join("pairs");
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let sessions = collect_runtime_sessions().unwrap_or_default();
+    let mut ledgers = Vec::new();
+    for entry in fs::read_dir(&dir)
+        .with_context(|| format!("failed to read pair ledger directory '{}'", dir.display()))?
+    {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("md") {
+            continue;
+        }
+        if let Some(ledger) = read_pair_ledger(&path, &sessions)? {
+            ledgers.push(ledger);
+        }
+    }
+    ledgers.sort_by(|left, right| {
+        right
+            .created_at_epoch_ms
+            .unwrap_or_default()
+            .cmp(&left.created_at_epoch_ms.unwrap_or_default())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(ledgers)
+}
+
+pub fn render_pair_ledgers_output(
+    records: &[PairLedgerRecord],
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(records).context("failed to encode pair ledgers")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(records).context("failed to encode pair ledgers")
+        }
+        ControlPlaneOutput::Table => {
+            let mut lines = vec!["PAIR\tCREATED\tMEMBERS\tLIVE\tSTALE\tNOTE".to_string()];
+            for record in records {
+                lines.push(format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    record.id,
+                    record
+                        .created_at_epoch_ms
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    record.members.len(),
+                    record.live_members,
+                    record.stale,
+                    record.path
+                ));
+            }
+            Ok(lines.join("\n"))
+        }
+    }
+}
+
+fn read_pair_ledger(
+    path: &Path,
+    sessions: &[NativeSessionMetadata],
+) -> anyhow::Result<Option<PairLedgerRecord>> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read pair ledger '{}'", path.display()))?;
+    let fields = parse_pair_coordination_fields(&raw);
+    let title = raw
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("# ").map(str::trim))
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("pair")
+                .to_string()
+        });
+    let mut members = Vec::new();
+    for role in ["first", "second"] {
+        let Some(node) = fields.get(&format!("{role}_node")).cloned() else {
+            continue;
+        };
+        let Some(namespace) = fields.get(&format!("{role}_namespace")).cloned() else {
+            continue;
+        };
+        let Some(task_note) = fields.get(&format!("{role}_task_note")).cloned() else {
+            continue;
+        };
+        let session = sessions
+            .iter()
+            .find(|session| session.namespace == namespace);
+        members.push(PairLedgerMember {
+            role: role.to_string(),
+            node,
+            namespace,
+            task_note,
+            live: session.is_some(),
+            status: session.map(pair_member_status),
+        });
+    }
+    if members.is_empty() {
+        return Ok(None);
+    }
+    let live_members = members.iter().filter(|member| member.live).count();
+    let created_at_epoch_ms = fields
+        .get("created_at_epoch_ms")
+        .and_then(|value| value.parse::<u128>().ok());
+    let coordination = pair_coordination_body(&raw);
+    Ok(Some(PairLedgerRecord {
+        id: path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("pair")
+            .to_string(),
+        path: path.display().to_string(),
+        title,
+        created_at_epoch_ms,
+        coordination,
+        members,
+        live_members,
+        stale: live_members == 0,
+    }))
+}
+
+fn pair_member_status(session: &NativeSessionMetadata) -> PairLedgerMemberStatus {
+    let context = session.context.as_ref();
+    PairLedgerMemberStatus {
+        running_agents: session.agents.iter().filter(|agent| agent.running).count(),
+        backend: Some(session.backend.clone()),
+        thread_status: context.and_then(|context| context.thread_status.clone()),
+        turn_status: context.and_then(|context| context.turn_status.clone()),
+        last_activity: context.and_then(|context| context.last_activity.clone()),
+    }
+}
+
+fn pair_coordination_body(raw: &str) -> String {
+    let mut lines = raw.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() == "## Coordination" {
+            return lines.collect::<Vec<_>>().join("\n").trim().to_string();
+        }
+    }
+    String::new()
 }
 
 fn load_node_manifest(name: &str) -> anyhow::Result<ResourceEnvelope<NodeSpec>> {

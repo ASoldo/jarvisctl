@@ -71,28 +71,28 @@ use control_plane::{
     delete_cluster_runtime_session, doctor_nodes, flush_cluster_relay_messages,
     flush_relay_messages, heartbeat_node, inspect_node, install_node_heartbeat_user_service,
     interrupt_cluster_runtime_session, list_cluster_operator_requests, list_cluster_relay_messages,
-    list_relay_messages, list_worker_run_records, load_or_create_orchestration_policy,
-    load_worker_run_record, mark_worker_run, migrate_session_to_node,
-    node_heartbeat_service_status, open_visit_capsule, orchestration_policy_path,
-    pause_deployment_rollout, preflight_nodes, prune_cluster_relay_messages,
-    prune_completed_runtime_sessions, prune_relay_messages, prune_worker_runs,
-    read_auth_audit_events, read_worker_run_artifact, reconcile_nodes, register_node,
-    render_describe_output, render_get_output, render_kubernetes_resources,
+    list_pair_ledgers, list_relay_messages, list_worker_run_records,
+    load_or_create_orchestration_policy, load_worker_run_record, mark_worker_run,
+    migrate_session_to_node, node_heartbeat_service_status, open_visit_capsule,
+    orchestration_policy_path, pause_deployment_rollout, preflight_nodes,
+    prune_cluster_relay_messages, prune_completed_runtime_sessions, prune_relay_messages,
+    prune_worker_runs, read_auth_audit_events, read_worker_run_artifact, reconcile_nodes,
+    register_node, render_describe_output, render_get_output, render_kubernetes_resources,
     render_node_heartbeat_service_install, render_node_heartbeat_service_status,
-    render_node_probe_output, render_node_sudo_output, render_relay_message_output,
-    render_relay_messages_output, render_relay_prune_output, render_rollout_history_output,
-    render_rollout_status_output, render_runtime_prune_output, render_worker_drift_smoke_output,
-    render_worker_drift_smoke_schedule_status, render_worker_model_validation_output,
-    render_worker_run_artifact_output, render_worker_run_prune_output, render_worker_runs_output,
-    render_worker_validation_output, resolve_cluster_operator_request, resolve_service_target,
-    resolve_service_target_for_message, respond_cluster_runtime_server_request,
-    restart_deployment_rollout, resume_deployment_rollout, rotate_capsule_key, run_node_fanout,
-    run_node_sudo, run_node_visit, run_recurring_worker_drift_smoke, run_worker_drift_smoke,
-    run_worker_offload, schedule_node, send_relay_message, set_node_cordoned,
-    show_cluster_operator_request, start_node_pair_session, start_node_session,
-    sync_codex_auth_to_node, tell_cluster_runtime_session, tell_runtime_session_on_node,
-    undo_deployment_rollout, validate_worker_models, wait_for_rollout_status_output,
-    worker_drift_smoke_schedule_status,
+    render_node_probe_output, render_node_sudo_output, render_pair_ledgers_output,
+    render_relay_message_output, render_relay_messages_output, render_relay_prune_output,
+    render_rollout_history_output, render_rollout_status_output, render_runtime_prune_output,
+    render_worker_drift_smoke_output, render_worker_drift_smoke_schedule_status,
+    render_worker_model_validation_output, render_worker_run_artifact_output,
+    render_worker_run_prune_output, render_worker_runs_output, render_worker_validation_output,
+    resolve_cluster_operator_request, resolve_service_target, resolve_service_target_for_message,
+    respond_cluster_runtime_server_request, restart_deployment_rollout, resume_deployment_rollout,
+    rotate_capsule_key, run_node_fanout, run_node_sudo, run_node_visit,
+    run_recurring_worker_drift_smoke, run_worker_drift_smoke, run_worker_offload, schedule_node,
+    send_relay_message, set_node_cordoned, show_cluster_operator_request, start_node_pair_session,
+    start_node_session, sync_codex_auth_to_node, tell_cluster_runtime_session,
+    tell_runtime_session_on_node, undo_deployment_rollout, validate_worker_models,
+    wait_for_rollout_status_output, worker_drift_smoke_schedule_status,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use mission::{
@@ -457,6 +457,12 @@ enum Command {
     Proposal {
         #[command(subcommand)]
         command: ProposalCommand,
+    },
+
+    /// Inspect and manage paired runtime coordination ledgers
+    Pair {
+        #[command(subcommand)]
+        command: PairCommand,
     },
 
     /// Inspect and validate autonomous capability lanes
@@ -996,6 +1002,15 @@ enum ProposalCommand {
         #[arg(long = "decided-by", alias = "by")]
         decided_by: Option<String>,
 
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PairCommand {
+    /// List paired runtime coordination ledgers
+    Ledger {
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
     },
@@ -2374,6 +2389,7 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         Command::Worker { command } => worker_command(command),
         Command::Mission { command } => mission_command(command),
         Command::Proposal { command } => proposal_command(command),
+        Command::Pair { command } => pair_command(command),
         Command::Capability { command } => capability_command(command),
         Command::Autonomy { command } => autonomy_command(command),
         Command::OperatorRequest { command } => operator_request_command(command),
@@ -4578,6 +4594,19 @@ fn proposal_command(command: ProposalCommand) -> Result<(), JarvisError> {
             println!(
                 "{}",
                 render_proposal_output(&proposal, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+    }
+}
+
+fn pair_command(command: PairCommand) -> Result<(), JarvisError> {
+    match command {
+        PairCommand::Ledger { output } => {
+            let ledgers = list_pair_ledgers().map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_pair_ledgers_output(&ledgers, output).map_err(JarvisError::from)?
             );
             Ok(())
         }
