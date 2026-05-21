@@ -4,6 +4,7 @@ use anyhow::{Context, bail, ensure};
 use clap::{Parser, Subcommand, ValueEnum, ValueHint};
 use serde::Serialize;
 use std::{
+    collections::BTreeMap,
     env,
     ffi::OsStr,
     fs,
@@ -61,17 +62,18 @@ use codex_app::{
     tell_codex_app_with_mode_tcp,
 };
 use control_plane::{
-    ControlPlaneOutput, ControlPlaneResourceKindArg, KubernetesRenderOutput, NodeBootstrapOptions,
-    NodeFanoutOptions, NodeLinksOptions, NodePairSessionOptions, NodeRegisterOptions,
-    NodeScheduleOptions, NodeStartSessionOptions, NodeSudoOptions, NodeVisitOptions,
-    PairDemoOptions, PairLedgerFinalizeOptions, RelayMessageSendOptions,
-    RemoteOperatorRequestResolveOptions, WorkerDriftSmokeOptions, WorkerDriftSmokeScheduleOptions,
-    WorkerOffloadOptions, ack_cluster_relay_message, ack_relay_message, apply_kubernetes_resources,
-    apply_kustomization, apply_manifests, attach_cluster_runtime_session,
-    authorize_runtime_message, bootstrap_node, check_node_links, cleanup_node, cluster_index,
-    collect_node_task_note, configure_worker_drift_smoke_schedule, delete_cluster_runtime_session,
-    doctor_nodes, export_pair_ledger, finalize_pair_ledger, flush_cluster_relay_messages,
-    flush_relay_messages, heartbeat_node, inspect_node, install_node_heartbeat_user_service,
+    ControlPlaneOutput, ControlPlaneResourceKindArg, EvidenceBundleOptions, KubernetesRenderOutput,
+    NodeBootstrapOptions, NodeFanoutOptions, NodeLinksOptions, NodePairSessionOptions,
+    NodeRegisterOptions, NodeScheduleOptions, NodeStartSessionOptions, NodeSudoOptions,
+    NodeVisitOptions, PairDemoOptions, PairDemoSequenceOptions, PairLedgerFinalizeOptions,
+    RelayMessageSendOptions, RemoteOperatorRequestResolveOptions, WorkerDriftSmokeOptions,
+    WorkerDriftSmokeScheduleOptions, WorkerOffloadOptions, ack_cluster_relay_message,
+    ack_relay_message, apply_kubernetes_resources, apply_kustomization, apply_manifests,
+    attach_cluster_runtime_session, authorize_runtime_message, bootstrap_node, bundle_evidence,
+    check_node_links, cleanup_node, cleanup_pair_demos, cluster_index, collect_node_task_note,
+    configure_worker_drift_smoke_schedule, delete_cluster_runtime_session, doctor_nodes,
+    export_pair_ledger, finalize_pair_ledger, flush_cluster_relay_messages, flush_relay_messages,
+    heartbeat_node, inspect_node, install_node_heartbeat_user_service,
     interrupt_cluster_runtime_session, list_cluster_operator_requests, list_cluster_relay_messages,
     list_pair_ledgers, list_relay_messages, list_worker_run_records,
     load_or_create_orchestration_policy, load_worker_run_record, mark_worker_run,
@@ -79,18 +81,20 @@ use control_plane::{
     orchestration_policy_path, pause_deployment_rollout, preflight_nodes,
     prune_cluster_relay_messages, prune_completed_runtime_sessions, prune_relay_messages,
     prune_worker_runs, read_auth_audit_events, read_worker_run_artifact, reconcile_nodes,
-    register_node, render_describe_output, render_get_output, render_kubernetes_resources,
-    render_node_heartbeat_service_install, render_node_heartbeat_service_status,
-    render_node_probe_output, render_node_sudo_output, render_pair_export_output,
-    render_pair_finalize_output, render_pair_ledgers_output, render_relay_message_output,
-    render_relay_messages_output, render_relay_prune_output, render_rollout_history_output,
-    render_rollout_status_output, render_runtime_prune_output, render_worker_drift_smoke_output,
-    render_worker_drift_smoke_schedule_status, render_worker_model_validation_output,
-    render_worker_run_artifact_output, render_worker_run_prune_output, render_worker_runs_output,
-    render_worker_validation_output, resolve_cluster_operator_request, resolve_service_target,
-    resolve_service_target_for_message, respond_cluster_runtime_server_request,
-    restart_deployment_rollout, resume_deployment_rollout, rotate_capsule_key, run_node_fanout,
-    run_node_sudo, run_node_visit, run_recurring_worker_drift_smoke, run_worker_drift_smoke,
+    register_node, render_describe_output, render_evidence_bundle_output, render_get_output,
+    render_kubernetes_resources, render_node_heartbeat_service_install,
+    render_node_heartbeat_service_status, render_node_probe_output, render_node_sudo_output,
+    render_pair_demo_cleanup_output, render_pair_demo_sequence_output, render_pair_export_output,
+    render_pair_finalize_output, render_pair_ledgers_output, render_pair_stale_review_output,
+    render_relay_message_output, render_relay_messages_output, render_relay_prune_output,
+    render_rollout_history_output, render_rollout_status_output, render_runtime_prune_output,
+    render_worker_drift_smoke_output, render_worker_drift_smoke_schedule_status,
+    render_worker_model_validation_output, render_worker_run_artifact_output,
+    render_worker_run_prune_output, render_worker_runs_output, render_worker_validation_output,
+    resolve_cluster_operator_request, resolve_service_target, resolve_service_target_for_message,
+    respond_cluster_runtime_server_request, restart_deployment_rollout, resume_deployment_rollout,
+    review_stale_pair_ledgers, rotate_capsule_key, run_node_fanout, run_node_sudo, run_node_visit,
+    run_pair_demo_sequence, run_recurring_worker_drift_smoke, run_worker_drift_smoke,
     run_worker_offload, schedule_node, send_relay_message, set_node_cordoned,
     show_cluster_operator_request, start_node_pair_session, start_node_session, start_pair_demo,
     sync_codex_auth_to_node, tell_cluster_runtime_session, tell_runtime_session_on_node,
@@ -466,6 +470,12 @@ enum Command {
     Pair {
         #[command(subcommand)]
         command: PairCommand,
+    },
+
+    /// Build portable evidence bundles for pairs, namespaces, and missions
+    Evidence {
+        #[command(subcommand)]
+        command: EvidenceCommand,
     },
 
     /// Inspect and validate autonomous capability lanes
@@ -1059,6 +1069,57 @@ enum PairCommand {
         command: Vec<String>,
     },
 
+    /// Run the presentation-grade two-node demo sequence
+    RunDemo {
+        #[arg(long = "first-node", alias = "n1")]
+        first_node: Option<String>,
+
+        #[arg(long = "second-node", alias = "n2")]
+        second_node: Option<String>,
+
+        #[arg(long = "namespace-prefix", alias = "ns")]
+        namespace_prefix: Option<String>,
+
+        #[arg(long, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = true)]
+        execute: bool,
+
+        #[arg(long = "startup-delay-ms", default_value_t = 1500)]
+        startup_delay_ms: u64,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+
+        #[arg(last = true, value_hint = ValueHint::CommandString)]
+        command: Vec<String>,
+    },
+
+    /// Remove old generated pair demo task-note directories
+    CleanupDemos {
+        #[arg(long = "max-age-days", alias = "max-age", default_value_t = 7)]
+        max_age_days: u64,
+
+        #[arg(long, default_value_t = true)]
+        dry_run: bool,
+
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Review stale pair ledgers and optionally archive them
+    ReviewStale {
+        #[arg(long, default_value_t = true)]
+        dry_run: bool,
+
+        #[arg(long, default_value_t = false)]
+        archive: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
     /// Collect evidence, close namespaces, mark reviewed, and archive a pair ledger
     Finalize {
         id: String,
@@ -1071,6 +1132,24 @@ enum PairCommand {
 
         #[arg(long = "skip-archive")]
         skip_archive: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum EvidenceCommand {
+    /// Build a portable Markdown evidence bundle
+    Bundle {
+        #[arg(long = "pair-id", alias = "pair")]
+        pair_id: Option<String>,
+
+        #[arg(long = "namespace", alias = "ns")]
+        namespace: Option<String>,
+
+        #[arg(long = "output-dir", alias = "dir", value_hint = ValueHint::DirPath)]
+        output_dir: Option<PathBuf>,
 
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
@@ -1093,9 +1172,29 @@ struct ProductionHealthReport {
     capability_count: usize,
     capability_failures: usize,
     failed_worker_runs: usize,
+    node_admission: Vec<HealthNodeAdmission>,
+    worker_admission: Vec<HealthWorkerAdmission>,
     policy_gates: Vec<HealthPolicyGate>,
     autonomy_queue: Vec<HealthQueueItem>,
     issues: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthNodeAdmission {
+    node: String,
+    status: String,
+    schedulable: bool,
+    issues: Vec<String>,
+    recommendation: String,
+}
+
+#[derive(Debug, Serialize)]
+struct HealthWorkerAdmission {
+    worker: String,
+    namespace: String,
+    status: String,
+    recent_failures: usize,
+    recommendation: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1521,6 +1620,9 @@ enum OperatorRequestCommand {
 
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+
+        #[arg(long, default_value_t = false)]
+        cluster: bool,
 
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
@@ -2487,6 +2589,7 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         Command::Mission { command } => mission_command(command),
         Command::Proposal { command } => proposal_command(command),
         Command::Pair { command } => pair_command(command),
+        Command::Evidence { command } => evidence_command(command),
         Command::Capability { command } => capability_command(command),
         Command::Autonomy { command } => autonomy_command(command),
         Command::Health { output } => health_command(output),
@@ -4762,6 +4865,57 @@ fn pair_command(command: PairCommand) -> Result<(), JarvisError> {
             }
             Ok(())
         }
+        PairCommand::RunDemo {
+            first_node,
+            second_node,
+            namespace_prefix,
+            execute,
+            startup_delay_ms,
+            output,
+            command,
+        } => {
+            let report = run_pair_demo_sequence(PairDemoSequenceOptions {
+                first_node,
+                second_node,
+                namespace_prefix,
+                execute,
+                startup_delay_ms,
+                command,
+            })
+            .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_pair_demo_sequence_output(&report, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        PairCommand::CleanupDemos {
+            max_age_days,
+            dry_run,
+            apply,
+            output,
+        } => {
+            let report =
+                cleanup_pair_demos(max_age_days, dry_run && !apply).map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_pair_demo_cleanup_output(&report, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        PairCommand::ReviewStale {
+            dry_run,
+            archive,
+            output,
+        } => {
+            let report = review_stale_pair_ledgers(dry_run && !archive, archive)
+                .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_pair_stale_review_output(&report, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
         PairCommand::Finalize {
             id,
             skip_collect,
@@ -4785,6 +4939,29 @@ fn pair_command(command: PairCommand) -> Result<(), JarvisError> {
     }
 }
 
+fn evidence_command(command: EvidenceCommand) -> Result<(), JarvisError> {
+    match command {
+        EvidenceCommand::Bundle {
+            pair_id,
+            namespace,
+            output_dir,
+            output,
+        } => {
+            let report = bundle_evidence(EvidenceBundleOptions {
+                pair_id,
+                namespace,
+                output_dir,
+            })
+            .map_err(JarvisError::from)?;
+            println!(
+                "{}",
+                render_evidence_bundle_output(&report, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+    }
+}
+
 fn health_command(output: ControlPlaneOutput) -> Result<(), JarvisError> {
     let preflight = preflight_nodes().map_err(JarvisError::from)?;
     let sessions = collect_runtime_sessions().map_err(JarvisError::from)?;
@@ -4799,18 +4976,92 @@ fn health_command(output: ControlPlaneOutput) -> Result<(), JarvisError> {
     let proposals = list_proposals().map_err(JarvisError::from)?;
     let capabilities = list_capabilities().map_err(JarvisError::from)?;
     let capability_validation = validate_capabilities().map_err(JarvisError::from)?;
-    let failed_worker_runs = list_worker_run_records(Some(50), true)
-        .map_err(JarvisError::from)?
-        .into_iter()
-        .filter(|run| {
-            run.phase.eq_ignore_ascii_case("failed")
-                || run
-                    .error
-                    .as_deref()
-                    .map(|value| !value.is_empty())
-                    .unwrap_or(false)
-        })
+    let worker_runs = list_worker_run_records(Some(50), true).map_err(JarvisError::from)?;
+    let failed_worker_runs = worker_runs
+        .iter()
+        .filter(|run| worker_run_failed(run))
         .count();
+    let node_admission = preflight
+        .doctors
+        .iter()
+        .map(|doctor| {
+            let status = if doctor.schedulable {
+                "admit"
+            } else if doctor.available {
+                "degraded"
+            } else {
+                "deny"
+            };
+            HealthNodeAdmission {
+                node: doctor.node.clone(),
+                status: status.to_string(),
+                schedulable: doctor.schedulable,
+                issues: doctor.issues.clone(),
+                recommendation: if doctor.schedulable {
+                    "eligible for new work".to_string()
+                } else if doctor.available {
+                    "keep visible but avoid automatic placement until issues clear".to_string()
+                } else {
+                    "do not place work; node is unreachable".to_string()
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut worker_admission_by_key = BTreeMap::<String, HealthWorkerAdmission>::new();
+    if let Ok(model_validation) = validate_worker_models(false) {
+        for result in model_validation.results {
+            let key = format!("{}/{}", result.namespace, result.worker);
+            worker_admission_by_key.insert(
+                key,
+                HealthWorkerAdmission {
+                    worker: result.worker,
+                    namespace: result.namespace,
+                    status: if result.status == "available" {
+                        "admit".to_string()
+                    } else if result.status == "skipped" {
+                        "unknown".to_string()
+                    } else {
+                        "deny".to_string()
+                    },
+                    recent_failures: 0,
+                    recommendation: match result.status.as_str() {
+                        "available" => "eligible for bounded worker placement".to_string(),
+                        "skipped" => "keep manual until provider validation runs".to_string(),
+                        _ => format!("avoid worker until model check clears: {}", result.detail),
+                    },
+                },
+            );
+        }
+    }
+    for run in &worker_runs {
+        let worker = run
+            .worker
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&run.service_name);
+        let namespace = run
+            .worker_namespace
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .unwrap_or(&run.namespace);
+        let key = format!("{namespace}/{worker}");
+        let entry = worker_admission_by_key
+            .entry(key)
+            .or_insert_with(|| HealthWorkerAdmission {
+                worker: worker.to_string(),
+                namespace: namespace.to_string(),
+                status: "admit".to_string(),
+                recent_failures: 0,
+                recommendation: "eligible based on recent run history".to_string(),
+            });
+        if worker_run_failed(run) {
+            entry.recent_failures = entry.recent_failures.saturating_add(1);
+            entry.status = "degraded".to_string();
+            entry.recommendation =
+                "prefer another lane until recent failure is reviewed or remediated".to_string();
+        }
+    }
+    let worker_admission = worker_admission_by_key.into_values().collect::<Vec<_>>();
     let autonomy = reconcile_autonomy(
         &list_missions().map_err(JarvisError::from)?,
         &proposals,
@@ -4875,6 +5126,8 @@ fn health_command(output: ControlPlaneOutput) -> Result<(), JarvisError> {
         capability_count: capabilities.len(),
         capability_failures,
         failed_worker_runs,
+        node_admission,
+        worker_admission,
         policy_gates: default_autonomy_policy()
             .into_iter()
             .map(|rule| HealthPolicyGate {
@@ -4935,6 +5188,15 @@ fn health_command(output: ControlPlaneOutput) -> Result<(), JarvisError> {
         }
     }
     Ok(())
+}
+
+fn worker_run_failed(run: &control_plane::WorkerRunRecord) -> bool {
+    run.phase.eq_ignore_ascii_case("failed")
+        || run
+            .error
+            .as_deref()
+            .map(|value| !value.is_empty())
+            .unwrap_or(false)
 }
 
 fn operator_request_command(command: OperatorRequestCommand) -> Result<(), JarvisError> {
@@ -5073,10 +5335,14 @@ fn operator_request_command(command: OperatorRequestCommand) -> Result<(), Jarvi
             status,
             persistent,
             dry_run,
+            cluster,
             output,
         } => {
             let wanted = status.unwrap_or_else(|| "pending".to_string());
             let mut records = list_operator_requests().map_err(JarvisError::from)?;
+            if cluster {
+                records.extend(list_cluster_operator_requests().map_err(JarvisError::from)?);
+            }
             records.retain(|record| record.status == wanted);
             let report = notify_operator_requests(&records, persistent, dry_run)
                 .map_err(JarvisError::from)?;

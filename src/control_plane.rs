@@ -434,6 +434,70 @@ pub struct PairDemoReport {
     pub command: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct PairDemoSequenceOptions {
+    pub first_node: Option<String>,
+    pub second_node: Option<String>,
+    pub namespace_prefix: Option<String>,
+    pub execute: bool,
+    pub startup_delay_ms: u64,
+    pub command: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PairDemoSequenceReport {
+    pub id: String,
+    pub preflight_ok: bool,
+    pub nodes_ready: usize,
+    pub nodes_total: usize,
+    pub dry_run: PairDemoReport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live: Option<PairDemoReport>,
+    pub next_commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PairDemoCleanupReport {
+    pub dry_run: bool,
+    pub max_age_days: u64,
+    pub scanned: usize,
+    pub removed: usize,
+    pub retained: usize,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PairStaleReviewItem {
+    pub id: String,
+    pub path: String,
+    pub archived: bool,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PairStaleReviewReport {
+    pub dry_run: bool,
+    pub stale: usize,
+    pub archived: usize,
+    pub items: Vec<PairStaleReviewItem>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EvidenceBundleOptions {
+    pub pair_id: Option<String>,
+    pub namespace: Option<String>,
+    pub output_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EvidenceBundleReport {
+    pub id: String,
+    pub path: String,
+    pub kind: String,
+    pub markdown: String,
+    pub included_paths: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NodePreflightResult {
     pub ok: bool,
@@ -3531,6 +3595,98 @@ pub fn render_pair_export_output(
     }
 }
 
+pub fn run_pair_demo_sequence(
+    options: PairDemoSequenceOptions,
+) -> anyhow::Result<PairDemoSequenceReport> {
+    let id = options
+        .namespace_prefix
+        .clone()
+        .unwrap_or_else(|| format!("pair-demo-{}", now_epoch_ms()));
+    let preflight = preflight_nodes()?;
+    let nodes_total = preflight.doctors.len();
+    let nodes_ready = preflight
+        .doctors
+        .iter()
+        .filter(|doctor| doctor.schedulable)
+        .count();
+    let dry_run = start_pair_demo(PairDemoOptions {
+        first_node: options.first_node.clone(),
+        second_node: options.second_node.clone(),
+        namespace_prefix: Some(format!("{id}-dry")),
+        execute: false,
+        startup_delay_ms: options.startup_delay_ms,
+        command: options.command.clone(),
+    })?;
+    let live = if options.execute {
+        Some(start_pair_demo(PairDemoOptions {
+            first_node: options.first_node,
+            second_node: options.second_node,
+            namespace_prefix: Some(id.clone()),
+            execute: true,
+            startup_delay_ms: options.startup_delay_ms,
+            command: options.command,
+        })?)
+    } else {
+        None
+    };
+    let mut next_commands = vec![
+        "jarvisctl health --output json".to_string(),
+        "jarvisctl pair ledger --include-archived --output json".to_string(),
+    ];
+    if live.is_some() {
+        next_commands.push(format!("jarvisctl pair export {id} --output table"));
+        next_commands.push(format!("jarvisctl pair finalize {id}"));
+    } else {
+        next_commands.push(format!(
+            "jarvisctl pair run-demo --namespace-prefix {id} --execute"
+        ));
+    }
+    Ok(PairDemoSequenceReport {
+        id,
+        preflight_ok: preflight.ok,
+        nodes_ready,
+        nodes_total,
+        dry_run,
+        live,
+        next_commands,
+    })
+}
+
+pub fn render_pair_demo_sequence_output(
+    report: &PairDemoSequenceReport,
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(report).context("failed to encode pair demo sequence")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(report).context("failed to encode pair demo sequence")
+        }
+        ControlPlaneOutput::Table => {
+            let mut lines = vec![
+                "PAIR\tPREFLIGHT\tNODES\tDRY_RUN\tLIVE".to_string(),
+                format!(
+                    "{}\t{}\t{}/{}\t{}\t{}",
+                    report.id,
+                    report.preflight_ok,
+                    report.nodes_ready,
+                    report.nodes_total,
+                    report.dry_run.id,
+                    report
+                        .live
+                        .as_ref()
+                        .map(|live| live.id.as_str())
+                        .unwrap_or("-")
+                ),
+                "NEXT".to_string(),
+            ];
+            lines.extend(report.next_commands.iter().cloned());
+            Ok(lines.join("\n"))
+        }
+    }
+}
+
 pub fn start_pair_demo(options: PairDemoOptions) -> anyhow::Result<PairDemoReport> {
     let (first_node, second_node) = match (options.first_node, options.second_node) {
         (Some(first), Some(second)) => (first, second),
@@ -3601,6 +3757,175 @@ pub fn start_pair_demo(options: PairDemoOptions) -> anyhow::Result<PairDemoRepor
         pair,
         command,
     })
+}
+
+pub fn cleanup_pair_demos(
+    max_age_days: u64,
+    dry_run: bool,
+) -> anyhow::Result<PairDemoCleanupReport> {
+    let dir = jarvis_codex_dir()?.join("demos");
+    let mut report = PairDemoCleanupReport {
+        dry_run,
+        max_age_days,
+        scanned: 0,
+        removed: 0,
+        retained: 0,
+        paths: Vec::new(),
+    };
+    if !dir.exists() {
+        return Ok(report);
+    }
+    let cutoff = Duration::from_secs(max_age_days.saturating_mul(24 * 60 * 60));
+    for entry in fs::read_dir(&dir)
+        .with_context(|| format!("failed to read demo directory '{}'", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        report.scanned += 1;
+        let age = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .unwrap_or_default();
+        if age >= cutoff {
+            report.paths.push(path.display().to_string());
+            if !dry_run {
+                fs::remove_dir_all(&path).with_context(|| {
+                    format!("failed to remove demo directory '{}'", path.display())
+                })?;
+            }
+            report.removed += 1;
+        } else {
+            report.retained += 1;
+        }
+    }
+    Ok(report)
+}
+
+pub fn render_pair_demo_cleanup_output(
+    report: &PairDemoCleanupReport,
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(report).context("failed to encode pair demo cleanup")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(report).context("failed to encode pair demo cleanup")
+        }
+        ControlPlaneOutput::Table => {
+            let mut lines = vec![
+                "DRY_RUN\tMAX_AGE_DAYS\tSCANNED\tREMOVED\tRETAINED".to_string(),
+                format!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    report.dry_run,
+                    report.max_age_days,
+                    report.scanned,
+                    report.removed,
+                    report.retained
+                ),
+            ];
+            lines.extend(report.paths.iter().map(|path| format!("PATH\t{path}")));
+            Ok(lines.join("\n"))
+        }
+    }
+}
+
+pub fn review_stale_pair_ledgers(
+    dry_run: bool,
+    archive: bool,
+) -> anyhow::Result<PairStaleReviewReport> {
+    let ledgers = list_pair_ledgers(false)?;
+    let stale = ledgers
+        .into_iter()
+        .filter(|ledger| ledger.stale)
+        .collect::<Vec<_>>();
+    let mut items = Vec::new();
+    let mut archived = 0;
+    for ledger in stale {
+        let action = if archive { "archive" } else { "review" }.to_string();
+        let mut archived_now = false;
+        if archive && !dry_run {
+            mark_pair_ledger_reviewed(&ledger)?;
+            archive_pair_ledger(&ledger)?;
+            archived += 1;
+            archived_now = true;
+        }
+        items.push(PairStaleReviewItem {
+            id: ledger.id,
+            path: ledger.path,
+            archived: archived_now,
+            action,
+        });
+    }
+    Ok(PairStaleReviewReport {
+        dry_run,
+        stale: items.len(),
+        archived,
+        items,
+    })
+}
+
+pub fn render_pair_stale_review_output(
+    report: &PairStaleReviewReport,
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(report).context("failed to encode stale pair review")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(report).context("failed to encode stale pair review")
+        }
+        ControlPlaneOutput::Table => {
+            let mut lines = vec![
+                "DRY_RUN\tSTALE\tARCHIVED".to_string(),
+                format!("{}\t{}\t{}", report.dry_run, report.stale, report.archived),
+                "PAIR\tACTION\tARCHIVED\tPATH".to_string(),
+            ];
+            for item in &report.items {
+                lines.push(format!(
+                    "{}\t{}\t{}\t{}",
+                    item.id, item.action, item.archived, item.path
+                ));
+            }
+            Ok(lines.join("\n"))
+        }
+    }
+}
+
+pub fn bundle_evidence(options: EvidenceBundleOptions) -> anyhow::Result<EvidenceBundleReport> {
+    match (options.pair_id, options.namespace) {
+        (Some(pair_id), None) => bundle_pair_evidence(&pair_id, options.output_dir),
+        (None, Some(namespace)) => bundle_namespace_evidence(&namespace, options.output_dir),
+        (Some(_), Some(_)) => bail!("choose either --pair-id or --namespace, not both"),
+        (None, None) => bail!("evidence bundle requires --pair-id or --namespace"),
+    }
+}
+
+pub fn render_evidence_bundle_output(
+    report: &EvidenceBundleReport,
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(report).context("failed to encode evidence bundle")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(report).context("failed to encode evidence bundle")
+        }
+        ControlPlaneOutput::Table => Ok(format!(
+            "BUNDLE\tKIND\tPATH\tFILES\n{}\t{}\t{}\t{}",
+            report.id,
+            report.kind,
+            report.path,
+            report.included_paths.len()
+        )),
+    }
 }
 
 pub fn render_pair_finalize_output(
@@ -3814,6 +4139,102 @@ fn pair_demo_task_note(id: &str, node: &str, partner: &str) -> String {
     format!(
         "---\ntype: ticket\nstatus: ready_for_codex\npriority: medium\nowner: codex\nrepo_path: /home/rootster\nlabels:\n  - demo\n  - two-node\n  - pair\n---\n\n# Pair demo: {node}\n\n## Objective\nProve this node can participate in a cross-node Codex pair operation.\n\n## Protocol\n- Work only from node `{node}`.\n- Coordinate with partner node `{partner}` through Jarvis pair messaging.\n- Report local Jarvis/Codex readiness.\n- Exchange one concise status message with the partner.\n- Record final evidence and outcome in this note.\n\n## Demo\n- pair_id: {id}\n- node: {node}\n- partner: {partner}\n"
     )
+}
+
+fn bundle_pair_evidence(
+    pair_id: &str,
+    output_dir: Option<PathBuf>,
+) -> anyhow::Result<EvidenceBundleReport> {
+    let export = export_pair_ledger(pair_id)?;
+    let id = format!("pair-{}-{}", slugify(pair_id), now_epoch_ms());
+    let dir = output_dir.unwrap_or(jarvis_codex_dir()?.join("evidence"));
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create evidence directory '{}'", dir.display()))?;
+    let path = dir.join(format!("{id}.md"));
+    let mut markdown = export.markdown.clone();
+    markdown.push_str("\n\n## Bundle Metadata\n\n");
+    markdown.push_str(&format!(
+        "- generated_at_epoch_ms: {}\n",
+        export.generated_at_epoch_ms
+    ));
+    markdown.push_str("- kind: pair\n");
+    let included_paths = export
+        .ledger
+        .members
+        .iter()
+        .map(|member| member.task_note.clone())
+        .chain(std::iter::once(export.ledger.path.clone()))
+        .collect::<Vec<_>>();
+    atomic_write_string(&path, &markdown)?;
+    Ok(EvidenceBundleReport {
+        id,
+        path: path.display().to_string(),
+        kind: "pair".to_string(),
+        markdown,
+        included_paths,
+    })
+}
+
+fn bundle_namespace_evidence(
+    namespace: &str,
+    output_dir: Option<PathBuf>,
+) -> anyhow::Result<EvidenceBundleReport> {
+    let session = collect_runtime_sessions()?
+        .into_iter()
+        .find(|session| session.namespace == namespace)
+        .ok_or_else(|| anyhow!("namespace '{}' is not indexed", namespace))?;
+    let id = format!("namespace-{}-{}", slugify(namespace), now_epoch_ms());
+    let dir = output_dir.unwrap_or(jarvis_codex_dir()?.join("evidence"));
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create evidence directory '{}'", dir.display()))?;
+    let path = dir.join(format!("{id}.md"));
+    let mut included_paths = Vec::new();
+    let mut markdown = String::new();
+    markdown.push_str(&format!("# Namespace Evidence: {namespace}\n\n"));
+    markdown.push_str(&format!("- backend: {}\n", session.backend));
+    markdown.push_str(&format!(
+        "- created_at_epoch_ms: {}\n",
+        session.created_at_epoch_ms
+    ));
+    markdown.push_str(&format!(
+        "- working_directory: {}\n",
+        session.working_directory.as_deref().unwrap_or("-")
+    ));
+    if let Some(context) = session.context.as_ref() {
+        for (label, value) in [
+            ("task_note", context.task_note.as_deref()),
+            ("transcript_path", context.transcript_path.as_deref()),
+            ("event_log_path", context.event_log_path.as_deref()),
+            ("record_file", context.record_file.as_deref()),
+        ] {
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                markdown.push_str(&format!("- {label}: {value}\n"));
+                included_paths.push(value.to_string());
+            }
+        }
+        markdown.push_str("\n## Runtime State\n\n");
+        markdown.push_str(&format!(
+            "- thread_status: {}\n- turn_status: {}\n- last_activity: {}\n",
+            context.thread_status.as_deref().unwrap_or("-"),
+            context.turn_status.as_deref().unwrap_or("-"),
+            context.last_activity.as_deref().unwrap_or("-")
+        ));
+    }
+    markdown.push_str("\n## Agents\n\n");
+    for agent in &session.agents {
+        markdown.push_str(&format!(
+            "- {} pid={} running={}\n",
+            agent.name, agent.pid, agent.running
+        ));
+    }
+    atomic_write_string(&path, &markdown)?;
+    Ok(EvidenceBundleReport {
+        id,
+        path: path.display().to_string(),
+        kind: "namespace".to_string(),
+        markdown,
+        included_paths,
+    })
 }
 
 fn close_pair_member_session(member: &PairLedgerMember) -> anyhow::Result<String> {
