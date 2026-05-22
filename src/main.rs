@@ -62,18 +62,19 @@ use codex_app::{
     tell_codex_app_with_mode_tcp,
 };
 use control_plane::{
-    ControlPlaneOutput, ControlPlaneResourceKindArg, EvidenceBundleOptions, KubernetesRenderOutput,
-    NodeBootstrapOptions, NodeFanoutOptions, NodeLinksOptions, NodePairSessionOptions,
-    NodeRegisterOptions, NodeScheduleOptions, NodeStartSessionOptions, NodeSudoOptions,
-    NodeVisitOptions, PairDemoOptions, PairDemoSequenceOptions, PairLedgerFinalizeOptions,
-    RelayMessageSendOptions, RemoteOperatorRequestResolveOptions, WorkerDriftSmokeOptions,
-    WorkerDriftSmokeScheduleOptions, WorkerOffloadOptions, ack_cluster_relay_message,
-    ack_relay_message, apply_kubernetes_resources, apply_kustomization, apply_manifests,
-    attach_cluster_runtime_session, authorize_runtime_message, bootstrap_node, bundle_evidence,
-    check_node_links, cleanup_node, cleanup_pair_demos, cluster_index, collect_node_task_note,
-    configure_worker_drift_smoke_schedule, delete_cluster_runtime_session, doctor_nodes,
-    export_pair_ledger, finalize_pair_ledger, flush_cluster_relay_messages, flush_relay_messages,
-    heartbeat_node, inspect_node, install_node_heartbeat_user_service,
+    ControlPlaneOutput, ControlPlaneResourceKindArg, EvidenceBundleOptions, EvidenceBundleReport,
+    KubernetesRenderOutput, NodeBootstrapOptions, NodeFanoutOptions, NodeLinksOptions,
+    NodePairSessionOptions, NodeRegisterOptions, NodeScheduleOptions, NodeStartSessionOptions,
+    NodeSudoOptions, NodeVisitOptions, PairDemoCleanupReport, PairDemoOptions,
+    PairDemoSequenceOptions, PairDemoSequenceReport, PairLedgerFinalizeOptions,
+    PairLedgerFinalizeReport, RelayMessageSendOptions, RemoteOperatorRequestResolveOptions,
+    WorkerDriftSmokeOptions, WorkerDriftSmokeScheduleOptions, WorkerOffloadOptions,
+    ack_cluster_relay_message, ack_relay_message, apply_kubernetes_resources, apply_kustomization,
+    apply_manifests, attach_cluster_runtime_session, authorize_runtime_message, bootstrap_node,
+    bundle_evidence, check_node_links, cleanup_node, cleanup_pair_demos, cluster_index,
+    collect_node_task_note, configure_worker_drift_smoke_schedule, delete_cluster_runtime_session,
+    doctor_nodes, export_pair_ledger, finalize_pair_ledger, flush_cluster_relay_messages,
+    flush_relay_messages, heartbeat_node, inspect_node, install_node_heartbeat_user_service,
     interrupt_cluster_runtime_session, list_cluster_operator_requests, list_cluster_relay_messages,
     list_pair_ledgers, list_relay_messages, list_worker_run_records,
     load_or_create_orchestration_policy, load_worker_run_record, mark_worker_run,
@@ -508,6 +509,15 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
 
+        #[arg(long = "prune-history", default_value_t = false)]
+        prune_history: bool,
+
+        #[arg(long = "max-age-days", default_value_t = 30)]
+        max_age_days: u64,
+
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+
         #[arg(long = "no-record", default_value_t = false)]
         no_record: bool,
 
@@ -516,6 +526,24 @@ enum Command {
 
         #[arg(long, default_value_t = false)]
         skip_evidence: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Run the operator presentation flow: health smoke, pair demo sequence, evidence, and next commands
+    Presentation {
+        #[arg(long = "namespace-prefix", alias = "ns")]
+        namespace_prefix: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        execute: bool,
+
+        #[arg(long, default_value_t = false)]
+        finalize: bool,
+
+        #[arg(long, default_value_t = false)]
+        cleanup: bool,
 
         #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
         output: ControlPlaneOutput,
@@ -1235,6 +1263,29 @@ struct ProductionSmokeCheck {
     name: String,
     status: String,
     detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProductionSmokePruneReport {
+    dry_run: bool,
+    max_age_days: u64,
+    scanned: usize,
+    removed: usize,
+    retained: usize,
+    paths: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PresentationReport {
+    id: String,
+    status: String,
+    generated_at_epoch_ms: u128,
+    smoke: ProductionSmokeReport,
+    demo_sequence: PairDemoSequenceReport,
+    evidence_bundle: Option<EvidenceBundleReport>,
+    finalize_report: Option<PairLedgerFinalizeReport>,
+    cleanup_report: Option<PairDemoCleanupReport>,
+    next_commands: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2662,6 +2713,9 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             namespace_prefix,
             history,
             limit,
+            prune_history,
+            max_age_days,
+            apply,
             no_record,
             skip_worker_models,
             skip_evidence,
@@ -2670,11 +2724,21 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             namespace_prefix,
             history,
             limit,
+            prune_history,
+            max_age_days,
+            apply,
             !no_record,
             skip_worker_models,
             skip_evidence,
             output,
         ),
+        Command::Presentation {
+            namespace_prefix,
+            execute,
+            finalize,
+            cleanup,
+            output,
+        } => presentation_command(namespace_prefix, execute, finalize, cleanup, output),
         Command::OperatorRequest { command } => operator_request_command(command),
         Command::Message { command } => message_command(command),
         Command::Rollout { command } => rollout_command(command),
@@ -5276,6 +5340,9 @@ fn production_smoke_command(
     namespace_prefix: Option<String>,
     history: bool,
     limit: usize,
+    prune_history: bool,
+    max_age_days: u64,
+    apply: bool,
     record: bool,
     skip_worker_models: bool,
     skip_evidence: bool,
@@ -5290,6 +5357,27 @@ fn production_smoke_command(
         return Ok(());
     }
 
+    if prune_history {
+        let report =
+            prune_production_smoke_history(max_age_days, !apply).map_err(JarvisError::from)?;
+        println!("{}", render_production_smoke_prune_output(&report, output)?);
+        return Ok(());
+    }
+
+    let report =
+        build_production_smoke_report(namespace_prefix, skip_worker_models, skip_evidence)?;
+    if record {
+        save_production_smoke_report(&report).map_err(JarvisError::from)?;
+    }
+    println!("{}", render_production_smoke_output(&report, output)?);
+    Ok(())
+}
+
+fn build_production_smoke_report(
+    namespace_prefix: Option<String>,
+    skip_worker_models: bool,
+    skip_evidence: bool,
+) -> Result<ProductionSmokeReport, JarvisError> {
     let mut checks = Vec::new();
 
     match preflight_nodes() {
@@ -5501,11 +5589,7 @@ fn production_smoke_command(
         generated_at_epoch_ms,
         checks,
     };
-    if record {
-        save_production_smoke_report(&report).map_err(JarvisError::from)?;
-    }
-    println!("{}", render_production_smoke_output(&report, output)?);
-    Ok(())
+    Ok(report)
 }
 
 fn production_smoke_history_dir() -> anyhow::Result<PathBuf> {
@@ -5558,6 +5642,76 @@ fn list_production_smoke_history(limit: usize) -> anyhow::Result<Vec<ProductionS
     reports.sort_by(|left, right| right.generated_at_epoch_ms.cmp(&left.generated_at_epoch_ms));
     reports.truncate(limit);
     Ok(reports)
+}
+
+fn prune_production_smoke_history(
+    max_age_days: u64,
+    dry_run: bool,
+) -> anyhow::Result<ProductionSmokePruneReport> {
+    let dir = production_smoke_history_dir()?;
+    let mut report = ProductionSmokePruneReport {
+        dry_run,
+        max_age_days,
+        scanned: 0,
+        removed: 0,
+        retained: 0,
+        paths: Vec::new(),
+    };
+    if !dir.exists() {
+        return Ok(report);
+    }
+
+    let cutoff = Duration::from_secs(max_age_days.saturating_mul(24 * 60 * 60));
+    for entry in
+        fs::read_dir(&dir).with_context(|| format!("failed to read '{}'", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        report.scanned += 1;
+        let age = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .unwrap_or_default();
+        if age >= cutoff {
+            report.paths.push(path.display().to_string());
+            if !dry_run {
+                fs::remove_file(&path).with_context(|| {
+                    format!(
+                        "failed to remove production smoke report '{}'",
+                        path.display()
+                    )
+                })?;
+            }
+            report.removed += 1;
+        } else {
+            report.retained += 1;
+        }
+    }
+    report.paths.sort();
+    Ok(report)
+}
+
+fn render_production_smoke_prune_output(
+    report: &ProductionSmokePruneReport,
+    output: ControlPlaneOutput,
+) -> Result<String, JarvisError> {
+    match output {
+        ControlPlaneOutput::Json => serde_json::to_string_pretty(report)
+            .map_err(anyhow::Error::from)
+            .map_err(JarvisError::from),
+        ControlPlaneOutput::Yaml => serde_yaml::to_string(report)
+            .map_err(anyhow::Error::from)
+            .map_err(JarvisError::from),
+        ControlPlaneOutput::Table => Ok(format!(
+            "DRY_RUN\tMAX_AGE_DAYS\tSCANNED\tREMOVED\tRETAINED\n{}\t{}\t{}\t{}\t{}",
+            report.dry_run, report.max_age_days, report.scanned, report.removed, report.retained
+        )),
+    }
 }
 
 fn render_production_smoke_history_output(
@@ -5614,6 +5768,143 @@ fn render_production_smoke_output(
                     .iter()
                     .map(|check| format!("{}\t{}\t{}", check.name, check.status, check.detail)),
             );
+            Ok(lines.join("\n"))
+        }
+    }
+}
+
+fn presentation_command(
+    namespace_prefix: Option<String>,
+    execute: bool,
+    finalize: bool,
+    cleanup: bool,
+    output: ControlPlaneOutput,
+) -> Result<(), JarvisError> {
+    let report = build_presentation_report(namespace_prefix, execute, finalize, cleanup)?;
+    println!("{}", render_presentation_output(&report, output)?);
+    Ok(())
+}
+
+fn build_presentation_report(
+    namespace_prefix: Option<String>,
+    execute: bool,
+    finalize: bool,
+    cleanup: bool,
+) -> Result<PresentationReport, JarvisError> {
+    let generated_at_epoch_ms = now_epoch_ms_local();
+    let id = namespace_prefix.unwrap_or_else(|| format!("presentation-{}", generated_at_epoch_ms));
+    let smoke = build_production_smoke_report(Some(format!("{id}-smoke")), false, false)?;
+    save_production_smoke_report(&smoke).map_err(JarvisError::from)?;
+
+    let demo_sequence = run_pair_demo_sequence(PairDemoSequenceOptions {
+        first_node: None,
+        second_node: None,
+        namespace_prefix: Some(id.clone()),
+        execute,
+        startup_delay_ms: 250,
+        command: Vec::new(),
+    })
+    .map_err(JarvisError::from)?;
+
+    let evidence_bundle = if execute {
+        bundle_evidence(EvidenceBundleOptions {
+            pair_id: Some(id.clone()),
+            namespace: None,
+            output_dir: None,
+        })
+        .ok()
+    } else {
+        None
+    };
+
+    let finalize_report = if execute && finalize {
+        Some(
+            finalize_pair_ledger(PairLedgerFinalizeOptions {
+                id: id.clone(),
+                collect: true,
+                close: true,
+                archive: false,
+            })
+            .map_err(JarvisError::from)?,
+        )
+    } else {
+        None
+    };
+
+    let cleanup_report = if cleanup {
+        Some(cleanup_pair_demos(7, false).map_err(JarvisError::from)?)
+    } else {
+        None
+    };
+
+    let mut next_commands = vec![
+        "jarvisctl health --output json".to_string(),
+        "jarvisctl production-smoke --history --limit 5 --output table".to_string(),
+    ];
+    if !execute {
+        next_commands.push(format!(
+            "jarvisctl presentation --namespace-prefix {id} --execute"
+        ));
+    } else {
+        next_commands.push(format!("jarvisctl pair export {id} --output table"));
+        next_commands.push(format!("jarvisctl pair finalize {id} --collect --close"));
+    }
+    next_commands.extend(demo_sequence.next_commands.iter().cloned());
+
+    let status = if smoke.status == "failed" {
+        "failed"
+    } else if !demo_sequence.preflight_ok {
+        "attention"
+    } else if execute && evidence_bundle.is_none() {
+        "attention"
+    } else {
+        "ready"
+    }
+    .to_string();
+
+    Ok(PresentationReport {
+        id,
+        status,
+        generated_at_epoch_ms,
+        smoke,
+        demo_sequence,
+        evidence_bundle,
+        finalize_report,
+        cleanup_report,
+        next_commands,
+    })
+}
+
+fn render_presentation_output(
+    report: &PresentationReport,
+    output: ControlPlaneOutput,
+) -> Result<String, JarvisError> {
+    match output {
+        ControlPlaneOutput::Json => serde_json::to_string_pretty(report)
+            .map_err(anyhow::Error::from)
+            .map_err(JarvisError::from),
+        ControlPlaneOutput::Yaml => serde_yaml::to_string(report)
+            .map_err(anyhow::Error::from)
+            .map_err(JarvisError::from),
+        ControlPlaneOutput::Table => {
+            let mut lines = vec![
+                format!("PRESENTATION\tSTATUS\tSMOKE\tPREFLIGHT\tLIVE\tEVIDENCE"),
+                format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    report.id,
+                    report.status,
+                    report.smoke.status,
+                    report.demo_sequence.preflight_ok,
+                    report.demo_sequence.live.is_some(),
+                    report
+                        .evidence_bundle
+                        .as_ref()
+                        .map(|bundle| bundle.path.as_str())
+                        .unwrap_or("-")
+                ),
+                "NEXT".to_string(),
+            ];
+            lines.extend(report.next_commands.iter().cloned());
             Ok(lines.join("\n"))
         }
     }
