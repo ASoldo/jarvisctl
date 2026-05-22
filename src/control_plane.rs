@@ -2476,6 +2476,16 @@ pub fn doctor_nodes() -> anyhow::Result<Vec<NodeDoctorCheck>> {
             if facts.get("codex_cli").is_none() {
                 issues.push("codex_missing".to_string());
             }
+            for (key, label) in [
+                ("codex_app_server_ws_auth", "app_server_ws_auth"),
+                ("codex_remote_control", "remote_control"),
+                ("codex_exec_server", "exec_server"),
+                ("codex_features", "features"),
+            ] {
+                if facts.get(key).map(String::as_str) != Some("supported") {
+                    issues.push(format!("codex_{label}_unsupported"));
+                }
+            }
             if facts.get("jarvisctl").is_none() {
                 issues.push("jarvisctl_missing".to_string());
             }
@@ -6550,6 +6560,30 @@ printf 'arch='
 uname -m 2>/dev/null || true
 printf '\ncodex_cli='
 (codex --version 2>/dev/null || command -v codex 2>/dev/null || true) | head -n 1
+printf 'codex_app_server_ws_auth='
+if codex app-server --help 2>/dev/null | grep -q -- '--ws-auth'; then echo supported; else echo missing; fi
+printf 'codex_remote_control='
+if codex remote-control --help 2>/dev/null | grep -q 'Commands:'; then echo supported; else echo missing; fi
+printf 'codex_exec_server='
+if codex exec-server --help 2>/dev/null | grep -q -- '--listen'; then echo supported; else echo missing; fi
+codex_features_output="$(codex features list 2>/dev/null || true)"
+printf 'codex_features='
+if [ -n "$codex_features_output" ]; then echo supported; else echo missing; fi
+printf 'codex_feature_multi_agent='
+feature_value="$(printf '%s\n' "$codex_features_output" | awk '$1=="multi_agent"{print $3}' | head -n 1)"
+printf '%s\n' "${feature_value:-unknown}"
+printf 'codex_feature_auth_elicitation='
+feature_value="$(printf '%s\n' "$codex_features_output" | awk '$1=="auth_elicitation"{print $3}' | head -n 1)"
+printf '%s\n' "${feature_value:-unknown}"
+printf 'codex_feature_exec_permission_approvals='
+feature_value="$(printf '%s\n' "$codex_features_output" | awk '$1=="exec_permission_approvals"{print $3}' | head -n 1)"
+printf '%s\n' "${feature_value:-unknown}"
+printf 'codex_feature_tool_call_mcp_elicitation='
+feature_value="$(printf '%s\n' "$codex_features_output" | awk '$1=="tool_call_mcp_elicitation"{print $3}' | head -n 1)"
+printf '%s\n' "${feature_value:-unknown}"
+printf 'codex_feature_remote_compaction_v2='
+feature_value="$(printf '%s\n' "$codex_features_output" | awk '$1=="remote_compaction_v2"{print $3}' | head -n 1)"
+printf '%s\n' "${feature_value:-unknown}"
 printf 'jarvisctl='
 (jarvisctl --version 2>/dev/null || command -v jarvisctl 2>/dev/null || true) | head -n 1
 printf 'active_sessions='
