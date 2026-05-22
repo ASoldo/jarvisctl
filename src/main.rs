@@ -496,6 +496,21 @@ enum Command {
         output: ControlPlaneOutput,
     },
 
+    /// Run a production smoke suite across Codex, nodes, workers, pair demos, approvals, and evidence
+    ProductionSmoke {
+        #[arg(long = "namespace-prefix", alias = "ns")]
+        namespace_prefix: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        skip_worker_models: bool,
+
+        #[arg(long, default_value_t = false)]
+        skip_evidence: bool,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
     /// Manage durable operator/admin requests and notifications
     #[command(alias = "notify", alias = "operator-requests")]
     OperatorRequest {
@@ -1195,6 +1210,20 @@ struct HealthWorkerAdmission {
     status: String,
     recent_failures: usize,
     recommendation: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProductionSmokeReport {
+    status: String,
+    generated_at_epoch_ms: u128,
+    checks: Vec<ProductionSmokeCheck>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProductionSmokeCheck {
+    name: String,
+    status: String,
+    detail: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2593,6 +2622,12 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         Command::Capability { command } => capability_command(command),
         Command::Autonomy { command } => autonomy_command(command),
         Command::Health { output } => health_command(output),
+        Command::ProductionSmoke {
+            namespace_prefix,
+            skip_worker_models,
+            skip_evidence,
+            output,
+        } => production_smoke_command(namespace_prefix, skip_worker_models, skip_evidence, output),
         Command::OperatorRequest { command } => operator_request_command(command),
         Command::Message { command } => message_command(command),
         Command::Rollout { command } => rollout_command(command),
@@ -5190,7 +5225,264 @@ fn health_command(output: ControlPlaneOutput) -> Result<(), JarvisError> {
     Ok(())
 }
 
+fn production_smoke_command(
+    namespace_prefix: Option<String>,
+    skip_worker_models: bool,
+    skip_evidence: bool,
+    output: ControlPlaneOutput,
+) -> Result<(), JarvisError> {
+    let mut checks = Vec::new();
+
+    match preflight_nodes() {
+        Ok(preflight) => {
+            let nodes_ready = preflight
+                .doctors
+                .iter()
+                .filter(|doctor| doctor.schedulable)
+                .count();
+            checks.push(ProductionSmokeCheck {
+                name: "node_preflight".to_string(),
+                status: if preflight.ok { "pass" } else { "fail" }.to_string(),
+                detail: format!(
+                    "nodes={nodes_ready}/{} links_failed={} issues={}",
+                    preflight.doctors.len(),
+                    preflight.links.iter().filter(|link| !link.ok).count(),
+                    preflight.issues.join(";")
+                ),
+            });
+
+            let missing_capability_nodes = preflight
+                .doctors
+                .iter()
+                .filter(|doctor| {
+                    doctor
+                        .facts
+                        .get("codex_app_server_ws_auth")
+                        .map(String::as_str)
+                        != Some("supported")
+                        || doctor.facts.get("codex_remote_control").map(String::as_str)
+                            != Some("supported")
+                        || doctor.facts.get("codex_exec_server").map(String::as_str)
+                            != Some("supported")
+                        || doctor
+                            .facts
+                            .get("codex_feature_multi_agent")
+                            .map(String::as_str)
+                            != Some("true")
+                })
+                .map(|doctor| doctor.node.clone())
+                .collect::<Vec<_>>();
+            checks.push(ProductionSmokeCheck {
+                name: "codex_0133_capabilities".to_string(),
+                status: if missing_capability_nodes.is_empty() {
+                    "pass"
+                } else {
+                    "fail"
+                }
+                .to_string(),
+                detail: if missing_capability_nodes.is_empty() {
+                    "all nodes report app-server ws auth, remote-control, exec-server, and multi-agent".to_string()
+                } else {
+                    format!("missing required Codex capabilities on {}", missing_capability_nodes.join(","))
+                },
+            });
+        }
+        Err(error) => checks.push(ProductionSmokeCheck {
+            name: "node_preflight".to_string(),
+            status: "fail".to_string(),
+            detail: error.to_string(),
+        }),
+    }
+
+    match validate_capabilities() {
+        Ok(reports) => {
+            let failures = reports
+                .iter()
+                .filter(|report| report.status != "passed")
+                .count();
+            checks.push(ProductionSmokeCheck {
+                name: "capability_validation".to_string(),
+                status: if failures == 0 { "pass" } else { "fail" }.to_string(),
+                detail: format!("{} checked, {failures} failing", reports.len()),
+            });
+        }
+        Err(error) => checks.push(ProductionSmokeCheck {
+            name: "capability_validation".to_string(),
+            status: "fail".to_string(),
+            detail: error.to_string(),
+        }),
+    }
+
+    if skip_worker_models {
+        checks.push(ProductionSmokeCheck {
+            name: "worker_model_validation".to_string(),
+            status: "skip".to_string(),
+            detail: "skipped by operator".to_string(),
+        });
+    } else {
+        match validate_worker_models(true) {
+            Ok(report) => checks.push(ProductionSmokeCheck {
+                name: "worker_model_validation".to_string(),
+                status: if report.status == "passed" {
+                    "pass"
+                } else {
+                    "fail"
+                }
+                .to_string(),
+                detail: format!(
+                    "workers={} checked={} available={} unavailable={} skipped={}",
+                    report.workers,
+                    report.checked,
+                    report.available,
+                    report.unavailable,
+                    report.skipped
+                ),
+            }),
+            Err(error) => checks.push(ProductionSmokeCheck {
+                name: "worker_model_validation".to_string(),
+                status: "fail".to_string(),
+                detail: error.to_string(),
+            }),
+        }
+    }
+
+    let smoke_id =
+        namespace_prefix.unwrap_or_else(|| format!("production-smoke-{}", now_epoch_ms_local()));
+    match run_pair_demo_sequence(PairDemoSequenceOptions {
+        first_node: None,
+        second_node: None,
+        namespace_prefix: Some(smoke_id),
+        execute: false,
+        startup_delay_ms: 250,
+        command: Vec::new(),
+    }) {
+        Ok(report) => checks.push(ProductionSmokeCheck {
+            name: "pair_demo_dry_run".to_string(),
+            status: if report.preflight_ok { "pass" } else { "fail" }.to_string(),
+            detail: format!(
+                "id={} nodes={}/{} dry={}",
+                report.id, report.nodes_ready, report.nodes_total, report.dry_run.id
+            ),
+        }),
+        Err(error) => checks.push(ProductionSmokeCheck {
+            name: "pair_demo_dry_run".to_string(),
+            status: "fail".to_string(),
+            detail: error.to_string(),
+        }),
+    }
+
+    match notify_operator_requests(
+        &list_operator_requests().map_err(JarvisError::from)?,
+        true,
+        true,
+    ) {
+        Ok(report) => checks.push(ProductionSmokeCheck {
+            name: "operator_request_dry_run".to_string(),
+            status: "pass".to_string(),
+            detail: format!(
+                "attempted={} delivered={} persistent={} dry_run={}",
+                report.attempted, report.delivered, report.persistent, report.dry_run
+            ),
+        }),
+        Err(error) => checks.push(ProductionSmokeCheck {
+            name: "operator_request_dry_run".to_string(),
+            status: "fail".to_string(),
+            detail: error.to_string(),
+        }),
+    }
+
+    if skip_evidence {
+        checks.push(ProductionSmokeCheck {
+            name: "evidence_bundle".to_string(),
+            status: "skip".to_string(),
+            detail: "skipped by operator".to_string(),
+        });
+    } else {
+        let evidence_pair = list_pair_ledgers(true)
+            .map_err(JarvisError::from)?
+            .into_iter()
+            .find(|pair| !pair.members.is_empty());
+        match evidence_pair {
+            Some(pair) => match bundle_evidence(EvidenceBundleOptions {
+                pair_id: Some(pair.id.clone()),
+                namespace: None,
+                output_dir: None,
+            }) {
+                Ok(report) => checks.push(ProductionSmokeCheck {
+                    name: "evidence_bundle".to_string(),
+                    status: "pass".to_string(),
+                    detail: format!("pair={} path={}", pair.id, report.path),
+                }),
+                Err(error) => checks.push(ProductionSmokeCheck {
+                    name: "evidence_bundle".to_string(),
+                    status: "fail".to_string(),
+                    detail: error.to_string(),
+                }),
+            },
+            None => checks.push(ProductionSmokeCheck {
+                name: "evidence_bundle".to_string(),
+                status: "skip".to_string(),
+                detail: "no pair ledger exists yet".to_string(),
+            }),
+        }
+    }
+
+    let status = if checks.iter().any(|check| check.status == "fail") {
+        "failed"
+    } else if checks.iter().any(|check| check.status == "warn") {
+        "attention"
+    } else {
+        "passed"
+    }
+    .to_string();
+    let report = ProductionSmokeReport {
+        status,
+        generated_at_epoch_ms: now_epoch_ms_local(),
+        checks,
+    };
+    println!("{}", render_production_smoke_output(&report, output)?);
+    Ok(())
+}
+
+fn render_production_smoke_output(
+    report: &ProductionSmokeReport,
+    output: ControlPlaneOutput,
+) -> Result<String, JarvisError> {
+    match output {
+        ControlPlaneOutput::Json => serde_json::to_string_pretty(report)
+            .map_err(anyhow::Error::from)
+            .map_err(JarvisError::from),
+        ControlPlaneOutput::Yaml => serde_yaml::to_string(report)
+            .map_err(anyhow::Error::from)
+            .map_err(JarvisError::from),
+        ControlPlaneOutput::Table => {
+            let mut lines = vec![
+                format!("STATUS\t{}", report.status),
+                "CHECK\tSTATUS\tDETAIL".to_string(),
+            ];
+            lines.extend(
+                report
+                    .checks
+                    .iter()
+                    .map(|check| format!("{}\t{}\t{}", check.name, check.status, check.detail)),
+            );
+            Ok(lines.join("\n"))
+        }
+    }
+}
+
 fn worker_run_failed(run: &control_plane::WorkerRunRecord) -> bool {
+    let remediation_status = run
+        .remediation_status
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        remediation_status.as_str(),
+        "reviewed" | "remediated" | "acknowledged"
+    ) {
+        return false;
+    }
     run.phase.eq_ignore_ascii_case("failed")
         || run
             .error

@@ -5107,12 +5107,28 @@ pub fn ack_cluster_relay_message(
 fn try_deliver_relay_message(record: &mut RelayMessageRecord) -> anyhow::Result<bool> {
     record.attempts = record.attempts.saturating_add(1);
     record.updated_at_epoch_ms = now_epoch_ms();
-    match tell_cluster_runtime_session(
-        &record.to_namespace,
-        &record.agent,
-        &record.body,
-        &record.mode,
-    ) {
+    let delivery_result = if let Some(to_node) = record
+        .to_node
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        tell_runtime_session_on_specific_node(
+            to_node,
+            &record.to_namespace,
+            &record.agent,
+            &record.body,
+            &record.mode,
+        )
+    } else {
+        tell_cluster_runtime_session(
+            &record.to_namespace,
+            &record.agent,
+            &record.body,
+            &record.mode,
+        )
+    };
+    match delivery_result {
         Ok(true) => {
             record.status = "delivered".to_string();
             record.last_error = None;
@@ -5131,6 +5147,30 @@ fn try_deliver_relay_message(record: &mut RelayMessageRecord) -> anyhow::Result<
             Ok(false)
         }
     }
+}
+
+fn tell_runtime_session_on_specific_node(
+    node_name: &str,
+    namespace: &str,
+    agent: &str,
+    contents: &str,
+    mode: &str,
+) -> anyhow::Result<bool> {
+    let manifest = load_manifest(ResourceKind::Node, node_name, None)
+        .with_context(|| format!("failed to load Node '{}'", node_name))?;
+    let ResourceManifest::Node(node) = manifest else {
+        bail!("resource '{}' is not a Node", node_name);
+    };
+    if node_is_local(&node) {
+        tell_codex_app_with_mode(namespace, contents, codex_app_input_mode_from_str(mode)?)?;
+        return Ok(true);
+    }
+    tell_runtime_session_on_node(node_name, namespace, agent, contents, mode)
+}
+
+fn codex_app_input_mode_from_str(mode: &str) -> anyhow::Result<CodexAppInputMode> {
+    CodexAppInputMode::from_str(mode, true)
+        .map_err(|error| anyhow!("invalid Codex app input mode '{}': {}", mode, error))
 }
 
 pub fn send_relay_message(options: RelayMessageSendOptions) -> anyhow::Result<RelayMessageRecord> {
