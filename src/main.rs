@@ -2,7 +2,7 @@
 
 use anyhow::{Context, bail, ensure};
 use clap::{Parser, Subcommand, ValueEnum, ValueHint};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     env,
@@ -93,10 +93,11 @@ use control_plane::{
     render_worker_run_prune_output, render_worker_runs_output, render_worker_validation_output,
     resolve_cluster_operator_request, resolve_service_target, resolve_service_target_for_message,
     respond_cluster_runtime_server_request, restart_deployment_rollout, resume_deployment_rollout,
-    review_stale_pair_ledgers, rotate_capsule_key, run_node_fanout, run_node_sudo, run_node_visit,
-    run_pair_demo_sequence, run_recurring_worker_drift_smoke, run_worker_drift_smoke,
-    run_worker_offload, schedule_node, send_relay_message, set_node_cordoned,
-    show_cluster_operator_request, start_node_pair_session, start_node_session, start_pair_demo,
+    retry_cluster_relay_message, retry_relay_message, review_stale_pair_ledgers,
+    rotate_capsule_key, run_node_fanout, run_node_sudo, run_node_visit, run_pair_demo_sequence,
+    run_recurring_worker_drift_smoke, run_worker_drift_smoke, run_worker_offload, schedule_node,
+    send_relay_message, set_node_cordoned, show_cluster_operator_request, start_node_pair_session,
+    start_node_session, start_pair_demo, supersede_cluster_relay_message, supersede_relay_message,
     sync_codex_auth_to_node, tell_cluster_runtime_session, tell_runtime_session_on_node,
     undo_deployment_rollout, validate_worker_models, wait_for_rollout_status_output,
     worker_drift_smoke_schedule_status,
@@ -500,6 +501,15 @@ enum Command {
     ProductionSmoke {
         #[arg(long = "namespace-prefix", alias = "ns")]
         namespace_prefix: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        history: bool,
+
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+
+        #[arg(long = "no-record", default_value_t = false)]
+        no_record: bool,
 
         #[arg(long, default_value_t = false)]
         skip_worker_models: bool,
@@ -1212,14 +1222,15 @@ struct HealthWorkerAdmission {
     recommendation: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProductionSmokeReport {
+    id: String,
     status: String,
     generated_at_epoch_ms: u128,
     checks: Vec<ProductionSmokeCheck>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProductionSmokeCheck {
     name: String,
     status: String,
@@ -1755,6 +1766,31 @@ enum MessageCommand {
     /// Mark a relay message as acknowledged
     Ack {
         id: String,
+
+        #[arg(long)]
+        node: Option<String>,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Retry one relay message now
+    Retry {
+        id: String,
+
+        #[arg(long)]
+        node: Option<String>,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Mark a relay message superseded without retrying it again
+    Supersede {
+        id: String,
+
+        #[arg(long)]
+        reason: String,
 
         #[arg(long)]
         node: Option<String>,
@@ -2624,10 +2660,21 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
         Command::Health { output } => health_command(output),
         Command::ProductionSmoke {
             namespace_prefix,
+            history,
+            limit,
+            no_record,
             skip_worker_models,
             skip_evidence,
             output,
-        } => production_smoke_command(namespace_prefix, skip_worker_models, skip_evidence, output),
+        } => production_smoke_command(
+            namespace_prefix,
+            history,
+            limit,
+            !no_record,
+            skip_worker_models,
+            skip_evidence,
+            output,
+        ),
         Command::OperatorRequest { command } => operator_request_command(command),
         Command::Message { command } => message_command(command),
         Command::Rollout { command } => rollout_command(command),
@@ -5227,10 +5274,22 @@ fn health_command(output: ControlPlaneOutput) -> Result<(), JarvisError> {
 
 fn production_smoke_command(
     namespace_prefix: Option<String>,
+    history: bool,
+    limit: usize,
+    record: bool,
     skip_worker_models: bool,
     skip_evidence: bool,
     output: ControlPlaneOutput,
 ) -> Result<(), JarvisError> {
+    if history {
+        let reports = list_production_smoke_history(limit).map_err(JarvisError::from)?;
+        println!(
+            "{}",
+            render_production_smoke_history_output(&reports, output)?
+        );
+        return Ok(());
+    }
+
     let mut checks = Vec::new();
 
     match preflight_nodes() {
@@ -5435,13 +5494,102 @@ fn production_smoke_command(
         "passed"
     }
     .to_string();
+    let generated_at_epoch_ms = now_epoch_ms_local();
     let report = ProductionSmokeReport {
+        id: format!("production-smoke-{}", generated_at_epoch_ms),
         status,
-        generated_at_epoch_ms: now_epoch_ms_local(),
+        generated_at_epoch_ms,
         checks,
     };
+    if record {
+        save_production_smoke_report(&report).map_err(JarvisError::from)?;
+    }
     println!("{}", render_production_smoke_output(&report, output)?);
     Ok(())
+}
+
+fn production_smoke_history_dir() -> anyhow::Result<PathBuf> {
+    if let Some(path) = env::var_os("JARVIS_CODEX_DIR") {
+        return Ok(PathBuf::from(path).join("production-smoke"));
+    }
+    let home = env::var_os("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home)
+        .join(".jarvis")
+        .join("codex")
+        .join("production-smoke"))
+}
+
+fn save_production_smoke_report(report: &ProductionSmokeReport) -> anyhow::Result<()> {
+    let dir = production_smoke_history_dir()?;
+    fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.json", slugify(&report.id)));
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_string_pretty(report)?)
+        .with_context(|| format!("failed to write '{}'", tmp.display()))?;
+    fs::rename(&tmp, &path).with_context(|| {
+        format!(
+            "failed to replace production smoke report '{}'",
+            path.display()
+        )
+    })
+}
+
+fn list_production_smoke_history(limit: usize) -> anyhow::Result<Vec<ProductionSmokeReport>> {
+    let dir = production_smoke_history_dir()?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut reports = Vec::new();
+    for entry in
+        fs::read_dir(&dir).with_context(|| format!("failed to read '{}'", dir.display()))?
+    {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(report) = serde_json::from_str::<ProductionSmokeReport>(&raw) else {
+            continue;
+        };
+        reports.push(report);
+    }
+    reports.sort_by(|left, right| right.generated_at_epoch_ms.cmp(&left.generated_at_epoch_ms));
+    reports.truncate(limit);
+    Ok(reports)
+}
+
+fn render_production_smoke_history_output(
+    reports: &[ProductionSmokeReport],
+    output: ControlPlaneOutput,
+) -> Result<String, JarvisError> {
+    match output {
+        ControlPlaneOutput::Json => serde_json::to_string_pretty(reports)
+            .map_err(anyhow::Error::from)
+            .map_err(JarvisError::from),
+        ControlPlaneOutput::Yaml => serde_yaml::to_string(reports)
+            .map_err(anyhow::Error::from)
+            .map_err(JarvisError::from),
+        ControlPlaneOutput::Table => {
+            let mut lines = vec!["ID\tSTATUS\tCHECKS\tFAILED".to_string()];
+            lines.extend(reports.iter().map(|report| {
+                let failed = report
+                    .checks
+                    .iter()
+                    .filter(|check| check.status == "fail")
+                    .count();
+                format!(
+                    "{}\t{}\t{}\t{}",
+                    report.id,
+                    report.status,
+                    report.checks.len(),
+                    failed
+                )
+            }));
+            Ok(lines.join("\n"))
+        }
+    }
 }
 
 fn render_production_smoke_output(
@@ -5869,6 +6017,49 @@ fn message_command(command: MessageCommand) -> Result<(), JarvisError> {
                     })?
             } else {
                 ack_relay_message(&id).map_err(JarvisError::from)?
+            };
+            println!(
+                "{}",
+                render_relay_message_output(&record, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        MessageCommand::Retry { id, node, output } => {
+            let record = if node.is_some() {
+                retry_cluster_relay_message(node.as_deref(), &id)
+                    .map_err(JarvisError::from)?
+                    .ok_or_else(|| {
+                        JarvisError::Other(anyhow::anyhow!(
+                            "relay message '{}' does not exist on remote nodes",
+                            id
+                        ))
+                    })?
+            } else {
+                retry_relay_message(&id).map_err(JarvisError::from)?
+            };
+            println!(
+                "{}",
+                render_relay_message_output(&record, output).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        MessageCommand::Supersede {
+            id,
+            reason,
+            node,
+            output,
+        } => {
+            let record = if node.is_some() {
+                supersede_cluster_relay_message(node.as_deref(), &id, &reason)
+                    .map_err(JarvisError::from)?
+                    .ok_or_else(|| {
+                        JarvisError::Other(anyhow::anyhow!(
+                            "relay message '{}' does not exist on remote nodes",
+                            id
+                        ))
+                    })?
+            } else {
+                supersede_relay_message(&id, &reason).map_err(JarvisError::from)?
             };
             println!(
                 "{}",

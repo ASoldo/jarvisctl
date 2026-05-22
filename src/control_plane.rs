@@ -5104,6 +5104,89 @@ pub fn ack_cluster_relay_message(
     Ok(None)
 }
 
+pub fn retry_cluster_relay_message(
+    node_name: Option<&str>,
+    id: &str,
+) -> anyhow::Result<Option<RelayMessageRecord>> {
+    let nodes = match node_name.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(node_name) => {
+            let manifest = load_manifest(ResourceKind::Node, node_name, None)?;
+            match manifest {
+                ResourceManifest::Node(node) if !node_is_local(&node) => vec![node],
+                ResourceManifest::Node(_) => Vec::new(),
+                _ => bail!("resource '{}' is not a Node", node_name),
+            }
+        }
+        None => remote_nodes()?,
+    };
+    for node in nodes {
+        let Ok(stdout) = run_remote_runtime_command_output(
+            &node,
+            vec![
+                "jarvisctl".to_string(),
+                "message".to_string(),
+                "retry".to_string(),
+                id.to_string(),
+                "--output".to_string(),
+                "json".to_string(),
+            ],
+            30,
+        ) else {
+            continue;
+        };
+        let Ok(mut record) = serde_json::from_str::<RelayMessageRecord>(stdout.trim()) else {
+            continue;
+        };
+        record.source_node = Some(node.metadata.name.clone());
+        record.remote = Some(true);
+        return Ok(Some(record));
+    }
+    Ok(None)
+}
+
+pub fn supersede_cluster_relay_message(
+    node_name: Option<&str>,
+    id: &str,
+    reason: &str,
+) -> anyhow::Result<Option<RelayMessageRecord>> {
+    let nodes = match node_name.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(node_name) => {
+            let manifest = load_manifest(ResourceKind::Node, node_name, None)?;
+            match manifest {
+                ResourceManifest::Node(node) if !node_is_local(&node) => vec![node],
+                ResourceManifest::Node(_) => Vec::new(),
+                _ => bail!("resource '{}' is not a Node", node_name),
+            }
+        }
+        None => remote_nodes()?,
+    };
+    for node in nodes {
+        let Ok(stdout) = run_remote_runtime_command_output(
+            &node,
+            vec![
+                "jarvisctl".to_string(),
+                "message".to_string(),
+                "supersede".to_string(),
+                id.to_string(),
+                "--reason".to_string(),
+                reason.to_string(),
+                "--output".to_string(),
+                "json".to_string(),
+            ],
+            20,
+        ) else {
+            continue;
+        };
+        let Ok(mut record) = serde_json::from_str::<RelayMessageRecord>(stdout.trim()) else {
+            continue;
+        };
+        record.source_node = Some(node.metadata.name.clone());
+        record.remote = Some(true);
+        return Ok(Some(record));
+    }
+    Ok(None)
+}
+
 fn try_deliver_relay_message(record: &mut RelayMessageRecord) -> anyhow::Result<bool> {
     record.attempts = record.attempts.saturating_add(1);
     record.updated_at_epoch_ms = now_epoch_ms();
@@ -5234,6 +5317,24 @@ pub fn ack_relay_message(id: &str) -> anyhow::Result<RelayMessageRecord> {
     Ok(record)
 }
 
+pub fn retry_relay_message(id: &str) -> anyhow::Result<RelayMessageRecord> {
+    let mut record = load_relay_message(id)?;
+    record.status = "pending".to_string();
+    record.last_error = None;
+    let _ = try_deliver_relay_message(&mut record)?;
+    save_relay_message(&record)?;
+    Ok(record)
+}
+
+pub fn supersede_relay_message(id: &str, reason: &str) -> anyhow::Result<RelayMessageRecord> {
+    let mut record = load_relay_message(id)?;
+    record.status = "superseded".to_string();
+    record.last_error = Some(reason.trim().to_string());
+    record.updated_at_epoch_ms = now_epoch_ms();
+    save_relay_message(&record)?;
+    Ok(record)
+}
+
 pub fn prune_relay_messages(max_age_days: u64, dry_run: bool) -> anyhow::Result<RelayPruneReport> {
     let records = list_relay_messages(None, None)?;
     let cutoff = now_epoch_ms().saturating_sub(max_age_days as u128 * 86_400_000);
@@ -5248,7 +5349,7 @@ pub fn prune_relay_messages(max_age_days: u64, dry_run: bool) -> anyhow::Result<
     for record in records {
         let terminal = matches!(
             record.status.as_str(),
-            "acked" | "delivered" | "failed" | "denied" | "expired"
+            "acked" | "delivered" | "failed" | "denied" | "expired" | "superseded"
         );
         if !terminal {
             report.kept_pending += 1;
