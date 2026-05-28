@@ -130,6 +130,11 @@ enum ClientMessage {
     ReadThread {
         include_turns: bool,
     },
+    SearchThreads {
+        search_term: String,
+        limit: Option<u32>,
+        archived: Option<bool>,
+    },
     Attach {
         agent: String,
     },
@@ -153,6 +158,7 @@ enum ServerMessage {
     Error { message: String },
     Metadata(NativeSessionMetadata),
     ThreadHistory(Value),
+    ThreadSearch(Value),
     Attached { namespace: String, agent: String },
     Output { data_base64: String },
     Exited { agent: String },
@@ -1304,6 +1310,24 @@ impl CodexAppSession {
         )
     }
 
+    fn search_threads(
+        &self,
+        search_term: &str,
+        limit: Option<u32>,
+        archived: Option<bool>,
+    ) -> anyhow::Result<Value> {
+        let mut params = json!({
+            "searchTerm": search_term,
+        });
+        if let Some(limit) = limit {
+            params["limit"] = json!(limit);
+        }
+        if let Some(archived) = archived {
+            params["archived"] = json!(archived);
+        }
+        self.call("thread/search", params)
+    }
+
     fn send_operator_message(&self, text: &str, mode: CodexAppInputMode) -> anyhow::Result<()> {
         let (thread_id, turn_id, active) = {
             let metadata = self.metadata();
@@ -2045,6 +2069,30 @@ pub fn read_codex_app_thread(namespace: &str, include_turns: bool) -> anyhow::Re
     }
 }
 
+pub fn search_codex_app_threads(
+    namespace: &str,
+    search_term: &str,
+    limit: Option<u32>,
+    archived: Option<bool>,
+) -> anyhow::Result<Value> {
+    match request(
+        namespace,
+        &ClientMessage::SearchThreads {
+            search_term: search_term.to_string(),
+            limit,
+            archived,
+        },
+    )? {
+        ServerMessage::ThreadSearch(value) => Ok(value),
+        ServerMessage::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected search response from codex app session '{}': {:?}",
+            namespace,
+            other
+        )),
+    }
+}
+
 pub fn attach_codex_app(namespace: &str) -> anyhow::Result<()> {
     let socket_path = socket_path_for(namespace)?;
     let mut stream = UnixStream::connect(&socket_path)
@@ -2106,7 +2154,8 @@ pub fn attach_codex_app(namespace: &str) -> anyhow::Result<()> {
                 }
                 ServerMessage::Ok
                 | ServerMessage::Metadata(..)
-                | ServerMessage::ThreadHistory(..) => {}
+                | ServerMessage::ThreadHistory(..)
+                | ServerMessage::ThreadSearch(..) => {}
             }
         }
     });
@@ -2186,6 +2235,15 @@ fn handle_client_message(
         ClientMessage::ReadThread { include_turns } => Ok(ServerMessage::ThreadHistory(
             session.read_thread(include_turns)?,
         )),
+        ClientMessage::SearchThreads {
+            search_term,
+            limit,
+            archived,
+        } => Ok(ServerMessage::ThreadSearch(session.search_threads(
+            &search_term,
+            limit,
+            archived,
+        )?)),
         ClientMessage::Attach { .. } => {
             bail!("attach is not supported over the filesystem control queue")
         }
@@ -2374,7 +2432,8 @@ pub fn attach_codex_app_tcp(host: &str, port: u16, namespace: &str) -> anyhow::R
                 }
                 ServerMessage::Ok
                 | ServerMessage::Metadata(..)
-                | ServerMessage::ThreadHistory(..) => {}
+                | ServerMessage::ThreadHistory(..)
+                | ServerMessage::ThreadSearch(..) => {}
             }
         }
     });

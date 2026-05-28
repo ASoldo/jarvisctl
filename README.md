@@ -117,6 +117,7 @@ Supported ticket frontmatter for Codex runtime overrides:
 repo_path: /home/rootster/work/jarvisctl
 codex_sandbox_mode: danger-full-access
 codex_approval_policy: never
+codex_profile: default
 codex_model: gpt-5.4
 codex_reasoning_effort: xhigh
 codex_reasoning_summary: concise
@@ -142,6 +143,7 @@ codex_add_dirs:
 `codex_approvals_reviewer` accepts `user`, `auto_review`, or `guardian_subagent`.
 `codex_sandbox_mode` accepts `read-only`, `workspace-write`, or `danger-full-access`.
 `codex_approval_policy` accepts `untrusted`, `on-failure`, `on-request`, or `never`.
+`codex_profile` maps to the current Codex `--profile` selector. Keep app-server permission profiles in `codex_permission_profile`.
 `codex_finish_mode` accepts `close` or `keep`. The default is `close`, which keeps Waybar and `jarvisctl list` aligned with active work rather than idle shells. `close` means the dispatcher finalizes the run on the tracked Codex stop event and closes the namespace unless you explicitly choose `keep`. `codex_finish_tmux` is still accepted as a compatibility alias in older ticket notes.
 
 For the current app-server protocol mapping used by the Obsidian plugin, including goals, memory, permission profiles, environments, remote-control status, feature flags, and escape-hatch config, see [docs/CODEX_APP_SERVER_MAPPING.md](docs/CODEX_APP_SERVER_MAPPING.md).
@@ -190,16 +192,20 @@ Supporting resources:
 Nodes are Jarvis inventory for local, SSH, and Tailscale-reachable machines. They record where work can run, what a machine is good for, and whether new work should be scheduled there.
 
 ```bash
-jarvisctl node register archiechokie --local --role control-plane --role worker --label arch=arm64 --label network=tailscale --max-sessions 3
+jarvisctl node register archiechokie --local --role control-plane --role worker --taint light-device --label arch=arm64 --label network=tailscale --label workload=orchestration --label capacity=low-power --max-sessions 1
 jarvisctl node register archiebald --address 100.115.119.27 --ssh-host archiebald --ssh-user rootster --role worker --label arch=x86_64 --label network=tailscale --max-sessions 6
 jarvisctl get nodes
 jarvisctl node ping archiebald
 jarvisctl node sync-codex-auth archiebald
 jarvisctl node inspect archiebald
 jarvisctl node cleanup archiebald
+jarvisctl node taint archiechokie light-device
+jarvisctl node untaint archiechokie light-device
 jarvisctl node cordon archiebald
 jarvisctl node uncordon archiebald
 ```
+
+Taints are default-deny placement constraints for fragile or special-purpose machines. `light-device` is the guardrail for an orchestration-first node such as `archiechokie`: normal scheduled work will skip it, while deliberate lightweight/orchestration work can opt in with `--toleration light-device` or ticket frontmatter.
 
 Deployments can select a schedulable node:
 
@@ -240,6 +246,7 @@ Useful options:
 * `--sandbox read-only|workspace-write|danger-full-access` controls the remote Codex sandbox.
 * `--timeout-seconds <n>` bounds the whole SSH/Codex visit.
 * `--role <role>` and `--label key=value` constrain scheduler selection when `--node auto` is used.
+* `--toleration <taint>` allows scheduling or explicitly targeting a tainted node.
 * `--retries <n>` retries scheduled work on another eligible node after a failed visit attempt.
 * `--from-current` builds a capsule from the current shell/workspace, live Jarvis sessions, and latest local Codex transcript tail.
 * `--from-node <node>` relays the visit through another registered node so one machine can visit another.
@@ -259,14 +266,15 @@ jarvisctl node reconcile
 jarvisctl node rotate-capsule-key
 jarvisctl node index
 jarvisctl node audit
+jarvisctl node schedule --toleration light-device
 jarvisctl node task --role worker --retries 1 --text "Inspect yourself and report readiness."
-jarvisctl node start-session --task-note /home/rootster/codex/Tickets/name.md --node auto
+jarvisctl node start-session --task-note /home/rootster/codex/Tickets/name.md --node auto --toleration light-device
 jarvisctl node fanout --role worker --max-concurrency 4 --text "Report local Codex readiness in one line."
 jarvisctl node migrate --session <namespace> --to-node auto
 jarvisctl node bootstrap archiebald --ssh-host archiebald --ssh-user rootster --role worker --workspace-root /home/rootster --max-sessions 6
 ```
 
-`node schedule` picks a reachable, uncordoned worker with Codex, Jarvis, auth, vault, and memory facts. `node doctor` checks all registered nodes for orchestration readiness. `node links` checks directed SSH reachability between registered nodes, including relay paths such as `archiebald -> archiechokie`, and prints Tailscale auth URLs when approval is required. `node policy` creates and prints `~/.jarvis/codex/orchestration.yaml`, which controls default role, labels, retry count, timeouts, fanout concurrency, cleanup retention, and remote index timeout. `node reconcile` runs doctor plus cleanup across available nodes. `node rotate-capsule-key` replaces the encrypted visit capsule key and syncs it to reachable remote nodes. `node index` combines live local/remote runtime sessions with local and remote visit indexes. `node audit` prints auth lease create/restore events. `node task` is the one-shot scheduled AI work path with retry/failover semantics. `node start-session` starts a durable remote Codex app-server session selected by the scheduler and records the node on runtime labels so `attach`, `tell`, `interrupt`, and `delete` can route back to it. `node fanout` sends one protected visit prompt to every selected remote node in bounded parallel batches and returns a per-node result table. `node migrate` sends a resume-style capsule for an existing session to another node so that node can reconstruct useful context in its own vault/memory. `node bootstrap` prepares stable non-interactive `jarvisctl` and `codex` wrappers and registers the node; it only copies the current binary when local and remote CPU architectures match, otherwise it requires an existing remote `jarvisctl`.
+`node schedule` picks a reachable, uncordoned worker with Codex, Jarvis, auth, vault, and memory facts, excluding tainted nodes unless every taint is tolerated. `node doctor` checks all registered nodes for orchestration readiness. `node links` checks directed SSH reachability between registered nodes, including relay paths such as `archiebald -> archiechokie`, marks whether each link is required for preflight, and prints Tailscale auth URLs when approval is required. A light orchestration node such as `archiechokie` (`control-plane` or `workload=orchestration` plus `light-device` or `capacity=low-power`) is optional for routine worker-side preflight: reverse SSH into it and relay probes that require first SSHing into it are reported but do not fail readiness. When `node preflight` runs on that orchestrator, outbound control links from it to workers remain required. `node policy` creates and prints `~/.jarvis/codex/orchestration.yaml`, which controls default role, labels, retry count, timeouts, fanout concurrency, cleanup retention, and remote index timeout. `node reconcile` runs doctor plus cleanup across available nodes. `node rotate-capsule-key` replaces the encrypted visit capsule key and syncs it to reachable remote nodes. `node index` combines live local/remote runtime sessions with local and remote visit indexes. `node audit` prints auth lease create/restore events. `node task` is the one-shot scheduled AI work path with retry/failover semantics. `node start-session` starts a durable remote Codex app-server session selected by the scheduler and records the node on runtime labels so `attach`, `tell`, `interrupt`, and `delete` can route back to it. `node fanout` sends one protected visit prompt to every selected remote node in bounded parallel batches and returns a per-node result table. `node migrate` sends a resume-style capsule for an existing session to another node so that node can reconstruct useful context in its own vault/memory. `node bootstrap` prepares stable non-interactive `jarvisctl` and `codex` wrappers and registers the node; it only copies the current binary when local and remote CPU architectures match, otherwise it requires an existing remote `jarvisctl`.
 
 Tickets can opt into remote scheduling with frontmatter:
 
@@ -276,6 +284,8 @@ jarvis_node: auto
 jarvis_node_role: worker
 jarvis_node_labels:
   - network=tailscale
+jarvis_node_tolerations:
+  - light-device
 jarvis_node_retries: 1
 jarvis_mission: cv-triage-1779146687504
 ```
@@ -600,6 +610,12 @@ jarvisctl history --namespace codex-example
 ```
 
 `history` calls app-server `thread/read` with `includeTurns` and returns the persisted thread payload. The plain view is intentionally compact for operator scans; plugin clients should use `--json`.
+
+`search-history` calls Codex app-server `thread/search` from a live Jarvis namespace:
+
+```bash
+jarvisctl search-history --namespace codex-example "operator request" --json
+```
 `auto` keeps the existing behavior and steers the active turn when one is running.
 `queue` starts a follow-up turn without clobbering the current active turn pointer, which covers the queued follow-up workflow added in newer Codex builds.
 

@@ -2,13 +2,15 @@
 
 `jarvisctl` treats Codex app-server as the agent runtime contract. The Obsidian plugin should write durable ticket frontmatter; `jarvisctl` turns that frontmatter into app-server `thread/start`, `thread/resume`, `thread/goal/set`, and `turn/start` parameters.
 
-Checked against Codex CLI `0.132.0` and the generated experimental app-server schema from `codex app-server generate-json-schema --experimental --out <dir>`.
+Checked against Codex CLI `0.134.0` and the generated experimental app-server schema from `codex app-server generate-json-schema --experimental --out <dir>`.
 
 ## Current release signals
 
+- `thread/search` exposes the new Codex local conversation history search over app-server. Jarvis maps this through `jarvisctl search-history --namespace <name> <query>`, and the Obsidian runtime toolbar exposes it as session-scoped Codex history search.
+- `--profile` is the primary CLI profile selector. Ticket `codex_profile` maps to `--profile`; app-server permission profiles stay in `codex_permission_profile` and are sent as `permissions`.
 - `codex remote-control` is now the preferred headless remote entrypoint for remotely controlled app-server runtimes.
 - `codex doctor --json` is now part of the production readiness path. Jarvis keeps the fast node probes lightweight, then runs doctor during full readiness checks to validate auth, app-server daemon state, websocket reachability, update status, feature flags, and install provenance.
-- `codex features list` exposes effective feature state. Current 0.132.0 surfaces stable features such as `apps`, `plugins`, `plugin_hooks`, `browser_use`, `computer_use`, `multi_agent`, `shell_tool`, `unified_exec`, and `workspace_dependencies`; experimental/under-development features should stay explicit in ticket frontmatter instead of becoming hidden defaults.
+- `codex features list` exposes effective feature state. Current 0.134.0 surfaces stable features such as `apps`, `plugins`, `browser_use`, `computer_use`, `goals`, `multi_agent`, `shell_tool`, `unified_exec`, and `workspace_dependencies`; experimental/under-development features should stay explicit in ticket frontmatter instead of becoming hidden defaults.
 - `thread/start`, `thread/resume`, and `turn/start` now expose richer per-thread and per-turn configuration: model, service tier, approvals reviewer, permission profiles, environments, personality, and instruction overrides.
 - Experimental app-server fields require `initialize.capabilities.experimentalApi = true`.
 - `permissions` is a named profile string in `thread/start`, `thread/resume`, and `turn/start`; extra writable roots map to `runtimeWorkspaceRoots`.
@@ -88,5 +90,6 @@ The Obsidian plugin can read `jarvisctl list --json` and use:
 ## Not mapped yet
 
 - Historical thread reads are exposed through `jarvisctl history --namespace <name> --json`. The Obsidian plugin can use this for compact turn history without parsing transcript files.
+- Local conversation history search is exposed through `jarvisctl search-history --namespace <name> <query> --json`, backed by app-server `thread/search`.
 - Approval and elicitation server requests are also surfaced through `jarvisctl operator-request list` and the Obsidian Mission Chain operator-request card. A linked request can be resolved from the dashboard or with `jarvisctl operator-request resolve`, which also responds to the waiting app-server request when the namespace/request id is still live.
 - App/plugin/skill mention inputs are passed through prompt text today. A richer Obsidian composer can add structured `skill`, `mention`, and `localImage` input items later.

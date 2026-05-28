@@ -98,6 +98,8 @@ pub struct TicketFrontmatter {
     #[serde(default)]
     pub jarvis_node_labels: Vec<String>,
     #[serde(default)]
+    pub jarvis_node_tolerations: Vec<String>,
+    #[serde(default)]
     pub jarvis_node_retries: Option<usize>,
     #[serde(default)]
     pub jarvis_mission: Option<String>,

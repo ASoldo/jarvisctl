@@ -58,8 +58,8 @@ use capability::{
 use codex::{CodexLaunchOptions, CodexRuntimeDriver, launch_codex_ticket};
 use codex_app::{
     CodexAppInputMode, attach_codex_app_tcp, codex_app_session_metadata_tcp,
-    interrupt_codex_app_tcp, read_codex_app_thread, serve_codex_app_session,
-    tell_codex_app_with_mode_tcp,
+    interrupt_codex_app_tcp, read_codex_app_thread, search_codex_app_threads,
+    serve_codex_app_session, tell_codex_app_with_mode_tcp,
 };
 use control_plane::{
     ControlPlaneOutput, ControlPlaneResourceKindArg, EvidenceBundleOptions, EvidenceBundleReport,
@@ -97,11 +97,11 @@ use control_plane::{
     retry_cluster_relay_message, retry_relay_message, review_stale_pair_ledgers,
     rotate_capsule_key, run_node_fanout, run_node_sudo, run_node_visit, run_pair_demo_sequence,
     run_recurring_worker_drift_smoke, run_worker_drift_smoke, run_worker_offload, schedule_node,
-    send_relay_message, set_node_cordoned, show_cluster_operator_request, start_node_pair_session,
-    start_node_session, start_pair_demo, supersede_cluster_relay_message, supersede_relay_message,
-    sync_codex_auth_to_node, tell_cluster_runtime_session, tell_runtime_session_on_node,
-    undo_deployment_rollout, validate_worker_models, wait_for_rollout_status_output,
-    worker_drift_smoke_schedule_status,
+    send_relay_message, set_node_cordoned, set_node_taint, show_cluster_operator_request,
+    start_node_pair_session, start_node_session, start_pair_demo, supersede_cluster_relay_message,
+    supersede_relay_message, sync_codex_auth_to_node, tell_cluster_runtime_session,
+    tell_runtime_session_on_node, undo_deployment_rollout, validate_worker_models,
+    wait_for_rollout_status_output, worker_drift_smoke_schedule_status,
 };
 use dispatch::{DispatchOptions, run_dispatch_loop};
 use mission::{
@@ -354,6 +354,10 @@ enum Command {
         /// Scheduler label constraint when --node auto is used
         #[arg(long = "label", alias = "lbl")]
         labels: Vec<String>,
+
+        /// Node taint tolerated when --node auto or a tainted explicit node is used
+        #[arg(long = "toleration", alias = "tol")]
+        tolerations: Vec<String>,
 
         /// Retry a scheduled visit on another eligible node after failure
         #[arg(long, default_value_t = 0)]
@@ -667,6 +671,49 @@ enum Command {
 
         #[arg(long, default_value_t = true)]
         include_turns: bool,
+
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+
+    /// Search persisted Codex app-server thread history from a live namespace
+    SearchHistory {
+        #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
+        backend: SessionBackend,
+
+        #[arg(
+            long,
+            alias = "ns",
+            required_unless_present = "service",
+            conflicts_with = "service"
+        )]
+        namespace: Option<String>,
+
+        #[arg(
+            long,
+            required_unless_present = "namespace",
+            conflicts_with = "namespace"
+        )]
+        service: Option<String>,
+
+        #[arg(
+            short = 'n',
+            long = "resource-namespace",
+            alias = "rns",
+            requires = "service"
+        )]
+        resource_namespace: Option<String>,
+
+        /// Search term passed to Codex thread/search
+        query: String,
+
+        /// Maximum results to return
+        #[arg(long, default_value_t = 12)]
+        limit: u32,
+
+        /// Include archived threads only
+        #[arg(long, default_value_t = false)]
+        archived: bool,
 
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -1890,6 +1937,9 @@ enum NodeCommand {
         #[arg(long = "role", alias = "r")]
         roles: Vec<String>,
 
+        #[arg(long = "taint")]
+        taints: Vec<String>,
+
         #[arg(long = "label", alias = "lbl")]
         labels: Vec<String>,
 
@@ -1914,6 +1964,12 @@ enum NodeCommand {
     /// Mark a node schedulable again
     Uncordon { name: String },
 
+    /// Add a scheduling taint to a node
+    Taint { name: String, taint: String },
+
+    /// Remove a scheduling taint from a node
+    Untaint { name: String, taint: String },
+
     /// Copy this machine's Codex auth/config to a node over SSH
     SyncCodexAuth { name: String },
 
@@ -1924,6 +1980,9 @@ enum NodeCommand {
 
         #[arg(long = "label", alias = "lbl")]
         labels: Vec<String>,
+
+        #[arg(long = "toleration", alias = "tol")]
+        tolerations: Vec<String>,
 
         #[arg(long = "exclude", alias = "x")]
         exclude: Vec<String>,
@@ -2072,6 +2131,9 @@ enum NodeCommand {
         #[arg(long = "label", alias = "lbl")]
         labels: Vec<String>,
 
+        #[arg(long = "toleration", alias = "tol")]
+        tolerations: Vec<String>,
+
         #[arg(long)]
         text: Option<String>,
 
@@ -2114,6 +2176,9 @@ enum NodeCommand {
         #[arg(long = "label", alias = "lbl")]
         labels: Vec<String>,
 
+        #[arg(long = "toleration", alias = "tol")]
+        tolerations: Vec<String>,
+
         #[arg(long, default_value_t = 1)]
         retries: usize,
 
@@ -2146,6 +2211,9 @@ enum NodeCommand {
 
         #[arg(long = "label", alias = "lbl")]
         labels: Vec<String>,
+
+        #[arg(long = "toleration", alias = "tol")]
+        tolerations: Vec<String>,
 
         #[arg(long)]
         retries: Option<usize>,
@@ -2207,6 +2275,9 @@ enum NodeCommand {
         #[arg(long)]
         message: Option<String>,
 
+        #[arg(long = "toleration", alias = "tol")]
+        tolerations: Vec<String>,
+
         #[arg(long, default_value_t = 1)]
         retries: usize,
 
@@ -2231,6 +2302,9 @@ enum NodeCommand {
         #[arg(long = "timeout-seconds", alias = "timeout", default_value_t = 900)]
         timeout_seconds: u64,
 
+        #[arg(long = "toleration", alias = "tol")]
+        tolerations: Vec<String>,
+
         #[arg(long, default_value_t = false)]
         full: bool,
     },
@@ -2250,6 +2324,9 @@ enum NodeCommand {
 
         #[arg(long = "role", alias = "r")]
         roles: Vec<String>,
+
+        #[arg(long = "taint")]
+        taints: Vec<String>,
 
         #[arg(long = "label", alias = "lbl")]
         labels: Vec<String>,
@@ -2655,6 +2732,7 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             from_node,
             role,
             labels,
+            tolerations,
             retries,
             text,
             prompt_file,
@@ -2673,6 +2751,7 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             from_node,
             role,
             labels,
+            tolerations,
             retries,
             text,
             prompt_file,
@@ -2786,6 +2865,23 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
                 resource_namespace.as_deref(),
             )?;
             history(backend, &namespace, include_turns, json)
+        }
+        Command::SearchHistory {
+            backend,
+            namespace,
+            service,
+            resource_namespace,
+            query,
+            limit,
+            archived,
+            json,
+        } => {
+            let namespace = resolve_runtime_namespace(
+                namespace.as_deref(),
+                service.as_deref(),
+                resource_namespace.as_deref(),
+            )?;
+            search_history(backend, &namespace, &query, limit, archived, json)
         }
         Command::Exec {
             backend,
@@ -2994,6 +3090,7 @@ fn visit_node(
     from_node: Option<String>,
     role: Option<String>,
     labels: Vec<String>,
+    tolerations: Vec<String>,
     retries: usize,
     text: Option<String>,
     prompt_file: Option<PathBuf>,
@@ -3048,6 +3145,7 @@ fn visit_node(
         from_node,
         role: role.or(Some(policy.default_role)),
         labels: effective_labels,
+        tolerations,
         prompt,
         working_directory,
         namespace,
@@ -3459,6 +3557,7 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
             ssh_user,
             local,
             roles,
+            taints,
             labels,
             workspace_root,
             max_sessions,
@@ -3469,6 +3568,7 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                 ssh_host,
                 ssh_user,
                 roles,
+                taints,
                 labels: parse_key_value_pairs(&labels)?,
                 workspace_root,
                 max_sessions,
@@ -3501,6 +3601,20 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
             );
             Ok(())
         }
+        NodeCommand::Taint { name, taint } => {
+            println!(
+                "{}",
+                set_node_taint(&name, &taint, true).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
+        NodeCommand::Untaint { name, taint } => {
+            println!(
+                "{}",
+                set_node_taint(&name, &taint, false).map_err(JarvisError::from)?
+            );
+            Ok(())
+        }
         NodeCommand::SyncCodexAuth { name } => {
             println!(
                 "{}",
@@ -3511,6 +3625,7 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
         NodeCommand::Schedule {
             role,
             labels,
+            tolerations,
             exclude,
             require_codex_auth,
             output,
@@ -3518,6 +3633,7 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
             let result = schedule_node(NodeScheduleOptions {
                 role,
                 labels: parse_key_value_pairs(&labels)?,
+                tolerations,
                 exclude,
                 require_codex_auth,
             })
@@ -3709,13 +3825,14 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                         );
                     }
                     println!();
-                    println!("FROM\tTO\tOK\tCLASS");
+                    println!("FROM\tTO\tOK\tREQUIRED\tCLASS");
                     for link in result.links {
                         println!(
-                            "{}\t{}\t{}\t{}",
+                            "{}\t{}\t{}\t{}\t{}",
                             link.from,
                             link.to,
                             link.ok,
+                            link.required,
                             link.failure_class.unwrap_or_else(|| "-".to_string())
                         );
                     }
@@ -3738,16 +3855,20 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                     )
                 }
                 ControlPlaneOutput::Table => {
-                    println!("FROM\tTO\tOK\tEXIT\tCLASS\tAUTH_URL\tDETAIL");
+                    println!(
+                        "FROM\tTO\tOK\tREQUIRED\tEXIT\tCLASS\tAUTH_URL\tOPTIONAL_REASON\tDETAIL"
+                    );
                     for check in result {
                         println!(
-                            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                             check.from,
                             check.to,
                             check.ok,
+                            check.required,
                             check.exit_status,
                             check.failure_class.unwrap_or_else(|| "-".to_string()),
                             check.auth_url.unwrap_or_else(|| "-".to_string()),
+                            check.optional_reason.unwrap_or_else(|| "-".to_string()),
                             check.detail.replace('\n', "\\n")
                         );
                     }
@@ -4026,6 +4147,7 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
             nodes,
             role,
             labels,
+            tolerations,
             text,
             prompt_file,
             timeout_seconds,
@@ -4066,6 +4188,7 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                     effective.extend(parse_key_value_pairs(&labels)?);
                     effective
                 },
+                tolerations,
                 prompt,
                 timeout_seconds: {
                     let policy =
@@ -4121,6 +4244,7 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
             prompt_file,
             role,
             labels,
+            tolerations,
             retries,
             timeout_seconds,
             sandbox,
@@ -4164,6 +4288,7 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                     effective.extend(parse_key_value_pairs(&labels)?);
                     effective
                 },
+                tolerations,
                 retries: {
                     let policy =
                         load_or_create_orchestration_policy().map_err(JarvisError::from)?;
@@ -4209,6 +4334,7 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
             node,
             role,
             labels,
+            tolerations,
             retries,
             task_note,
             namespace,
@@ -4229,6 +4355,7 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                 node,
                 role: role.or(Some(policy.default_role)),
                 labels: effective_labels,
+                tolerations,
                 retries: retries.unwrap_or(policy.retries),
                 task_note,
                 namespace,
@@ -4310,6 +4437,7 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
             second_namespace,
             namespace_prefix,
             message,
+            tolerations,
             retries,
             startup_delay_ms,
             output,
@@ -4324,6 +4452,7 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                 second_namespace,
                 namespace_prefix,
                 message,
+                tolerations,
                 startup_delay_ms,
                 retries,
                 command,
@@ -4370,11 +4499,13 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
             session,
             to_node,
             timeout_seconds,
+            tolerations,
             full,
         } => {
             let target = if to_node == "auto" {
                 schedule_node(NodeScheduleOptions {
                     role: Some("worker".to_string()),
+                    tolerations: tolerations.clone(),
                     require_codex_auth: true,
                     ..NodeScheduleOptions::default()
                 })
@@ -4383,7 +4514,7 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
             } else {
                 to_node
             };
-            let result = migrate_session_to_node(&session, &target, timeout_seconds)
+            let result = migrate_session_to_node(&session, &target, timeout_seconds, tolerations)
                 .map_err(JarvisError::from)?;
             if full {
                 println!(
@@ -4405,6 +4536,7 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
             ssh_host,
             ssh_user,
             roles,
+            taints,
             labels,
             workspace_root,
             max_sessions,
@@ -4416,6 +4548,7 @@ fn node_command(command: NodeCommand) -> Result<(), JarvisError> {
                 ssh_host,
                 ssh_user,
                 roles,
+                taints,
                 labels: parse_key_value_pairs(&labels)?,
                 workspace_root,
                 max_sessions,
@@ -5251,7 +5384,11 @@ fn health_command(output: ControlPlaneOutput) -> Result<(), JarvisError> {
         .iter()
         .filter(|doctor| doctor.schedulable)
         .count();
-    let link_failures = preflight.links.iter().filter(|link| !link.ok).count();
+    let link_failures = preflight
+        .links
+        .iter()
+        .filter(|link| !link.ok && link.required)
+        .count();
     let report = ProductionHealthReport {
         status: if issues.is_empty() {
             "ready"
@@ -5393,7 +5530,11 @@ fn build_production_smoke_report(
                 detail: format!(
                     "nodes={nodes_ready}/{} links_failed={} issues={}",
                     preflight.doctors.len(),
-                    preflight.links.iter().filter(|link| !link.ok).count(),
+                    preflight
+                        .links
+                        .iter()
+                        .filter(|link| !link.ok && link.required)
+                        .count(),
                     preflight.issues.join(";")
                 ),
             });
@@ -5401,6 +5542,7 @@ fn build_production_smoke_report(
             let missing_capability_nodes = preflight
                 .doctors
                 .iter()
+                .filter(|doctor| doctor.available)
                 .filter(|doctor| {
                     doctor
                         .facts
@@ -5420,7 +5562,7 @@ fn build_production_smoke_report(
                 .map(|doctor| doctor.node.clone())
                 .collect::<Vec<_>>();
             checks.push(ProductionSmokeCheck {
-                name: "codex_0133_capabilities".to_string(),
+                name: "codex_0134_capabilities".to_string(),
                 status: if missing_capability_nodes.is_empty() {
                     "pass"
                 } else {
@@ -5428,7 +5570,7 @@ fn build_production_smoke_report(
                 }
                 .to_string(),
                 detail: if missing_capability_nodes.is_empty() {
-                    "all nodes report app-server ws auth, remote-control, exec-server, and multi-agent".to_string()
+                    "all reachable nodes report app-server ws auth, remote-control, exec-server, and multi-agent".to_string()
                 } else {
                     format!("missing required Codex capabilities on {}", missing_capability_nodes.join(","))
                 },
@@ -5511,11 +5653,19 @@ fn build_production_smoke_report(
                 report.id, report.nodes_ready, report.nodes_total, report.dry_run.id
             ),
         }),
-        Err(error) => checks.push(ProductionSmokeCheck {
-            name: "pair_demo_dry_run".to_string(),
-            status: "fail".to_string(),
-            detail: error.to_string(),
-        }),
+        Err(error) => {
+            let detail = error.to_string();
+            checks.push(ProductionSmokeCheck {
+                name: "pair_demo_dry_run".to_string(),
+                status: if detail.contains("no second schedulable node available") {
+                    "skip"
+                } else {
+                    "fail"
+                }
+                .to_string(),
+                detail,
+            });
+        }
     }
 
     match notify_operator_requests(
@@ -7332,6 +7482,50 @@ fn history(
     Ok(())
 }
 
+#[instrument(err)]
+fn search_history(
+    backend: SessionBackend,
+    namespace: &str,
+    query: &str,
+    limit: u32,
+    archived: bool,
+    json: bool,
+) -> Result<(), JarvisError> {
+    let _ = backend;
+    let trimmed_query = query.trim();
+    if trimmed_query.is_empty() {
+        return Err(JarvisError::Other(anyhow::anyhow!(
+            "search-history requires a non-empty query"
+        )));
+    }
+    let metadata = runtime::session_metadata_for_namespace(namespace).map_err(JarvisError::from)?;
+    if metadata.backend != "codex-app" {
+        return Err(JarvisError::Other(anyhow::anyhow!(
+            "search-history is only available for codex-app sessions; '{}' uses '{}'",
+            namespace,
+            metadata.backend
+        )));
+    }
+
+    let response = search_codex_app_threads(
+        namespace,
+        trimmed_query,
+        Some(limit.max(1)),
+        if archived { Some(true) } else { None },
+    )
+    .map_err(JarvisError::from)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&response).map_err(anyhow::Error::from)?
+        );
+        return Ok(());
+    }
+
+    print_thread_search_results(namespace, &response);
+    Ok(())
+}
+
 fn print_thread_history(namespace: &str, value: &serde_json::Value) {
     let thread = value.get("thread").unwrap_or(value);
     let thread_id = thread
@@ -7375,6 +7569,64 @@ fn print_thread_history(namespace: &str, value: &serde_json::Value) {
             .unwrap_or_default();
         let preview = turn_preview(turn).unwrap_or_default();
         println!("{id:10} {status:12} {items_view:10} {items:3} {preview}");
+    }
+}
+
+fn print_thread_search_results(namespace: &str, value: &serde_json::Value) {
+    let results = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    println!("NAMESPACE\tRESULTS\tNEXT");
+    println!(
+        "{}\t{}\t{}",
+        namespace,
+        results.len(),
+        value
+            .get("nextCursor")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    for result in results {
+        let thread = result.get("thread").unwrap_or(&result);
+        let id = thread
+            .get("id")
+            .or_else(|| thread.get("sessionId"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
+        let name = thread
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("-");
+        let cwd = thread
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
+        let snippet = result
+            .get("snippet")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| thread.get("preview").and_then(serde_json::Value::as_str))
+            .map(|value| value.replace(['\n', '\r', '\t'], " "))
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{}\t{}\t{}\t{}",
+            id,
+            name,
+            cwd,
+            truncate_summary(&snippet, 140)
+        );
+    }
+}
+
+fn truncate_summary(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
     }
 }
 

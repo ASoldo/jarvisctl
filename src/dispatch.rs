@@ -333,7 +333,8 @@ fn handle_ready_transition(
     let remote_requested = ticket.frontmatter.jarvis_remote == Some(true)
         || ticket.frontmatter.jarvis_node.is_some()
         || ticket.frontmatter.jarvis_node_role.is_some()
-        || !ticket.frontmatter.jarvis_node_labels.is_empty();
+        || !ticket.frontmatter.jarvis_node_labels.is_empty()
+        || !ticket.frontmatter.jarvis_node_tolerations.is_empty();
 
     if remote_requested {
         let policy = load_or_create_orchestration_policy()?;
@@ -351,6 +352,10 @@ fn handle_ready_transition(
                 .clone()
                 .or(Some(policy.default_role)),
             labels,
+            tolerations: parse_ticket_values(
+                &ticket.frontmatter.jarvis_node_tolerations,
+                "jarvis_node_tolerations",
+            )?,
             retries: ticket
                 .frontmatter
                 .jarvis_node_retries
@@ -540,6 +545,20 @@ fn parse_ticket_labels(labels: &[String]) -> anyhow::Result<BTreeMap<String, Str
         }
         parsed.insert(key.to_string(), value.to_string());
     }
+    Ok(parsed)
+}
+
+fn parse_ticket_values(values: &[String], field: &str) -> anyhow::Result<Vec<String>> {
+    let mut parsed = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(anyhow!("{field} entries must be non-empty"));
+        }
+        parsed.push(value.to_string());
+    }
+    parsed.sort();
+    parsed.dedup();
     Ok(parsed)
 }
 

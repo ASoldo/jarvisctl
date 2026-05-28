@@ -402,6 +402,7 @@ pub fn run_two_node_mission_smoke(
             second_namespace: None,
             namespace_prefix: Some(prefix),
             message: Some("Two-node mission smoke: coordinate, exchange one status message, and record node-local evidence.".to_string()),
+            tolerations: Vec::new(),
             startup_delay_ms: 1500,
             retries: 1,
             command: output_command,

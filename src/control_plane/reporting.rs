@@ -405,6 +405,8 @@ pub(crate) fn resource_summary(manifest: &ResourceManifest) -> anyhow::Result<Re
             name: node.metadata.name.clone(),
             status: if node.spec.cordoned {
                 "cordoned".to_string()
+            } else if !node.spec.taints.is_empty() {
+                "tainted".to_string()
             } else {
                 "schedulable".to_string()
             },
@@ -1196,6 +1198,9 @@ fn node_summary_detail(node: &ResourceEnvelope<NodeSpec>) -> String {
     }
     if let Some(max_sessions) = node.spec.max_sessions {
         parts.push(format!("max={max_sessions}"));
+    }
+    if !node.spec.taints.is_empty() {
+        parts.push(format!("taints={}", node.spec.taints.join(",")));
     }
     parts.join(" ")
 }

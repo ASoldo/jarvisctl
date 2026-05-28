@@ -21,6 +21,8 @@ required_patterns=(
   '"thread/resume"'
   '"turn/start"'
   '"thread/read"'
+  '"thread/search"'
+  '"ThreadSearchParams"'
   '"thread/started"'
   '"turn/started"'
   '"CommandExecutionRequestApprovalParams"'

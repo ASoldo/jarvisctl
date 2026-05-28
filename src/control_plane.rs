@@ -150,6 +150,7 @@ pub struct NodeRegisterOptions {
     pub ssh_host: Option<String>,
     pub ssh_user: Option<String>,
     pub roles: Vec<String>,
+    pub taints: Vec<String>,
     pub labels: BTreeMap<String, String>,
     pub workspace_root: Option<String>,
     pub max_sessions: Option<usize>,
@@ -162,6 +163,7 @@ pub struct NodeVisitOptions {
     pub from_node: Option<String>,
     pub role: Option<String>,
     pub labels: BTreeMap<String, String>,
+    pub tolerations: Vec<String>,
     pub retries: usize,
     pub prompt: String,
     pub working_directory: Option<String>,
@@ -210,6 +212,7 @@ pub struct NodeStartSessionOptions {
     pub node: String,
     pub role: Option<String>,
     pub labels: BTreeMap<String, String>,
+    pub tolerations: Vec<String>,
     pub retries: usize,
     pub task_note: PathBuf,
     pub namespace: Option<String>,
@@ -227,6 +230,7 @@ pub struct NodePairSessionOptions {
     pub second_node: String,
     pub first_task_note: PathBuf,
     pub second_task_note: PathBuf,
+    pub tolerations: Vec<String>,
     pub first_namespace: Option<String>,
     pub second_namespace: Option<String>,
     pub namespace_prefix: Option<String>,
@@ -240,6 +244,7 @@ pub struct NodePairSessionOptions {
 pub struct NodeScheduleOptions {
     pub role: Option<String>,
     pub labels: BTreeMap<String, String>,
+    pub tolerations: Vec<String>,
     pub exclude: Vec<String>,
     pub require_codex_auth: bool,
 }
@@ -249,6 +254,7 @@ pub struct NodeFanoutOptions {
     pub nodes: Vec<String>,
     pub role: Option<String>,
     pub labels: BTreeMap<String, String>,
+    pub tolerations: Vec<String>,
     pub prompt: String,
     pub timeout_seconds: u64,
     pub sandbox_mode: Option<String>,
@@ -705,12 +711,15 @@ pub struct NodeLinkCheck {
     pub from: String,
     pub to: String,
     pub ok: bool,
+    pub required: bool,
     pub exit_status: i32,
     pub detail: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_class: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optional_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -720,6 +729,7 @@ pub struct NodeBootstrapOptions {
     pub ssh_host: String,
     pub ssh_user: Option<String>,
     pub roles: Vec<String>,
+    pub taints: Vec<String>,
     pub labels: BTreeMap<String, String>,
     pub workspace_root: Option<String>,
     pub max_sessions: Option<usize>,
@@ -1772,6 +1782,8 @@ pub struct ServiceResolution {
 }
 
 pub fn register_node(options: NodeRegisterOptions) -> anyhow::Result<Vec<String>> {
+    let roles = normalize_string_list(options.roles, "Node role")?;
+    let taints = normalize_string_list(options.taints, "Node taint")?;
     let mut metadata = ResourceMetadata {
         name: options.name.trim().to_string(),
         namespace: None,
@@ -1795,14 +1807,14 @@ pub fn register_node(options: NodeRegisterOptions) -> anyhow::Result<Vec<String>
         kind: "Node".to_string(),
         metadata,
         spec: NodeSpec {
-            roles: options.roles,
+            roles,
             address: options.address,
             ssh_host: options.ssh_host,
             ssh_user: options.ssh_user,
             workspace_root: options.workspace_root,
             max_sessions: options.max_sessions,
             cordoned: false,
-            taints: Vec::new(),
+            taints,
             capabilities,
         },
     };
@@ -1822,6 +1834,32 @@ pub fn set_node_cordoned(name: &str, cordoned: bool) -> anyhow::Result<String> {
     Ok(format!(
         "{} Node {}",
         if cordoned { "cordoned" } else { "uncordoned" },
+        node.metadata.name
+    ))
+}
+
+pub fn set_node_taint(name: &str, taint: &str, present: bool) -> anyhow::Result<String> {
+    let manifest = load_manifest(ResourceKind::Node, name, None)?;
+    let ResourceManifest::Node(mut node) = manifest else {
+        bail!("resource '{}' is not a Node", name);
+    };
+    let taint = taint.trim();
+    ensure!(!taint.is_empty(), "Node taint must not be empty");
+    if present {
+        if !node.spec.taints.iter().any(|candidate| candidate == taint) {
+            node.spec.taints.push(taint.to_string());
+        }
+        node.spec.taints.sort();
+        node.spec.taints.dedup();
+    } else {
+        node.spec.taints.retain(|candidate| candidate != taint);
+    }
+    validate_node(&node)?;
+    save_manifest(&ResourceManifest::Node(node.clone()))?;
+    Ok(format!(
+        "{} taint '{}' on Node {}",
+        if present { "set" } else { "removed" },
+        taint,
         node.metadata.name
     ))
 }
@@ -1864,6 +1902,7 @@ pub fn run_node_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitResu
             let scheduled = schedule_node(NodeScheduleOptions {
                 role: options.role.clone().or_else(|| Some("worker".to_string())),
                 labels: options.labels.clone(),
+                tolerations: options.tolerations.clone(),
                 exclude: attempted.clone(),
                 require_codex_auth: true,
             })?;
@@ -1890,6 +1929,7 @@ fn run_node_visit_direct(options: NodeVisitOptions) -> anyhow::Result<NodeVisitR
     let ResourceManifest::Node(node) = manifest else {
         bail!("resource '{}' is not a Node", options.node);
     };
+    ensure_node_taints_tolerated(&node, &options.tolerations)?;
     ensure!(
         !node_is_local(&node),
         "visit currently targets remote SSH nodes; '{}' is local",
@@ -2349,7 +2389,10 @@ pub fn schedule_node(options: NodeScheduleOptions) -> anyhow::Result<NodeSchedul
 
     let mut candidates = Vec::new();
     for node in nodes {
-        if node_is_local(&node) || node.spec.cordoned || !node.spec.taints.is_empty() {
+        if node_is_local(&node)
+            || node.spec.cordoned
+            || !node_taints_tolerated(&node, &options.tolerations)
+        {
             continue;
         }
         if options
@@ -2398,6 +2441,9 @@ pub fn schedule_node(options: NodeScheduleOptions) -> anyhow::Result<NodeSchedul
             format!("active_sessions={active_sessions}"),
             format!("max_sessions={max_sessions}"),
         ];
+        if !node.spec.taints.is_empty() {
+            reasons.push(format!("tolerated_taints={}", node.spec.taints.join(",")));
+        }
         if inspect.facts.get("memory").map(String::as_str) == Some("present") {
             score += 5;
             reasons.push("memory=present".to_string());
@@ -2519,27 +2565,37 @@ pub fn doctor_nodes() -> anyhow::Result<Vec<NodeDoctorCheck>> {
 pub fn preflight_nodes() -> anyhow::Result<NodePreflightResult> {
     let doctors = doctor_nodes()?;
     let links = check_node_links(NodeLinksOptions::default())?;
+    let nodes_by_name = load_nodes_by_name()?;
     let mut issues = Vec::new();
 
     for check in &doctors {
         if !check.available {
-            issues.push(format!("node_unavailable={}", check.node));
+            let optional_light_orchestrator = nodes_by_name
+                .get(&check.node)
+                .map(|node| node_is_light_orchestrator(node) && !node_is_local(node))
+                .unwrap_or(false);
+            if !optional_light_orchestrator {
+                issues.push(format!("node_unavailable={}", check.node));
+            }
+            continue;
         }
-        if !check.schedulable {
+        let health_issues = check
+            .issues
+            .iter()
+            .filter(|issue| !is_scheduling_admission_issue(issue))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !health_issues.is_empty() {
             issues.push(format!(
-                "node_unschedulable={}:{}",
+                "node_degraded={}:{}",
                 check.node,
-                if check.issues.is_empty() {
-                    "unknown".to_string()
-                } else {
-                    check.issues.join(",")
-                }
+                health_issues.join(",")
             ));
         }
     }
 
     for link in &links {
-        if !link.ok {
+        if !link.ok && link.required {
             issues.push(format!(
                 "link_failed={}->{}:{}",
                 link.from,
@@ -2562,6 +2618,20 @@ pub fn preflight_nodes() -> anyhow::Result<NodePreflightResult> {
         doctors,
         links,
     })
+}
+
+fn load_nodes_by_name() -> anyhow::Result<BTreeMap<String, ResourceEnvelope<NodeSpec>>> {
+    Ok(load_manifests_by_kind(ResourceKind::Node, None)?
+        .into_iter()
+        .filter_map(|manifest| match manifest {
+            ResourceManifest::Node(node) => Some((node.metadata.name.clone(), node)),
+            _ => None,
+        })
+        .collect())
+}
+
+fn is_scheduling_admission_issue(issue: &str) -> bool {
+    issue == "cordoned" || issue.starts_with("taints=")
 }
 
 fn append_version_consistency_issue(
@@ -2634,6 +2704,8 @@ fn check_node_link(
     source: &ResourceEnvelope<NodeSpec>,
     target: &ResourceEnvelope<NodeSpec>,
 ) -> NodeLinkCheck {
+    let optional_reason = node_link_optional_preflight_reason(source, target);
+    let required = optional_reason.is_none();
     let result = if node_is_local(source) {
         check_direct_ssh_link(target)
     } else {
@@ -2651,10 +2723,12 @@ fn check_node_link(
                 from: source.metadata.name.clone(),
                 to: target.metadata.name.clone(),
                 ok,
+                required,
                 exit_status: status,
                 failure_class: (!ok).then(|| classify_failure(&format!("{stderr}\n{stdout}"))),
                 auth_url: extract_auth_url(&format!("{stderr}\n{stdout}")),
                 detail,
+                optional_reason,
             }
         }
         Err(error) => {
@@ -2663,13 +2737,46 @@ fn check_node_link(
                 from: source.metadata.name.clone(),
                 to: target.metadata.name.clone(),
                 ok: false,
+                required,
                 exit_status: -1,
                 failure_class: Some(classify_failure(&detail)),
                 auth_url: extract_auth_url(&detail),
                 detail,
+                optional_reason,
             }
         }
     }
+}
+
+#[cfg(test)]
+fn node_link_required_for_preflight(
+    source: &ResourceEnvelope<NodeSpec>,
+    target: &ResourceEnvelope<NodeSpec>,
+) -> bool {
+    node_link_optional_preflight_reason(source, target).is_none()
+}
+
+fn node_link_optional_preflight_reason(
+    source: &ResourceEnvelope<NodeSpec>,
+    target: &ResourceEnvelope<NodeSpec>,
+) -> Option<String> {
+    if node_is_light_orchestrator(target) {
+        return Some("target_is_light_orchestrator".to_string());
+    }
+    if node_is_light_orchestrator(source) && !node_is_local(source) {
+        return Some("source_is_remote_light_orchestrator".to_string());
+    }
+    None
+}
+
+fn node_is_light_orchestrator(node: &ResourceEnvelope<NodeSpec>) -> bool {
+    let has_control_role = node.spec.roles.iter().any(|role| role == "control-plane");
+    let has_light_taint = node.spec.taints.iter().any(|taint| taint == "light-device");
+    let labels = &node.metadata.labels;
+    let low_power = labels.get("capacity").map(String::as_str) == Some("low-power");
+    let orchestration = labels.get("workload").map(String::as_str) == Some("orchestration");
+
+    (has_control_role || orchestration) && (has_light_taint || low_power)
 }
 
 fn check_direct_ssh_link(
@@ -2753,7 +2860,11 @@ pub fn run_node_fanout(options: NodeFanoutOptions) -> anyhow::Result<NodeFanoutR
         "fanout prompt must not be empty"
     );
     let mut requested_nodes = if options.nodes.is_empty() {
-        matching_remote_nodes(options.role.as_deref(), &options.labels)?
+        matching_remote_nodes(
+            options.role.as_deref(),
+            &options.labels,
+            &options.tolerations,
+        )?
     } else {
         options.nodes.clone()
     };
@@ -2778,6 +2889,7 @@ pub fn run_node_fanout(options: NodeFanoutOptions) -> anyhow::Result<NodeFanoutR
                     from_node: None,
                     role: None,
                     labels: BTreeMap::new(),
+                    tolerations: options.tolerations.clone(),
                     retries: 0,
                     prompt: options.prompt,
                     working_directory: None,
@@ -2818,13 +2930,15 @@ pub fn run_node_fanout(options: NodeFanoutOptions) -> anyhow::Result<NodeFanoutR
 fn matching_remote_nodes(
     role: Option<&str>,
     labels: &BTreeMap<String, String>,
+    tolerations: &[String],
 ) -> anyhow::Result<Vec<String>> {
     let mut nodes = Vec::new();
     for manifest in load_manifests_by_kind(ResourceKind::Node, None)? {
         let ResourceManifest::Node(node) = manifest else {
             continue;
         };
-        if node_is_local(&node) || node.spec.cordoned || !node.spec.taints.is_empty() {
+        if node_is_local(&node) || node.spec.cordoned || !node_taints_tolerated(&node, tolerations)
+        {
             continue;
         }
         if let Some(role) = role {
@@ -2913,6 +3027,7 @@ pub fn start_node_session(
             schedule_node(NodeScheduleOptions {
                 role: options.role.clone().or_else(|| Some(default_policy_role())),
                 labels: options.labels.clone(),
+                tolerations: options.tolerations.clone(),
                 exclude: attempted.clone(),
                 require_codex_auth: true,
             })?
@@ -2941,6 +3056,7 @@ fn start_node_session_once(
     let ResourceManifest::Node(node) = manifest else {
         bail!("resource '{}' is not a Node", node_name);
     };
+    ensure_node_taints_tolerated(&node, &options.tolerations)?;
     if node_is_local(&node) {
         return start_local_node_session_once(options, &node);
     }
@@ -3333,6 +3449,7 @@ pub fn start_node_pair_session(
         node: options.first_node.clone(),
         role: Some(default_policy_role()),
         labels: BTreeMap::new(),
+        tolerations: options.tolerations.clone(),
         retries: options.retries,
         task_note: options.first_task_note.clone(),
         namespace: Some(first_namespace.clone()),
@@ -3347,6 +3464,7 @@ pub fn start_node_pair_session(
         node: options.second_node.clone(),
         role: Some(default_policy_role()),
         labels: BTreeMap::new(),
+        tolerations: options.tolerations.clone(),
         retries: options.retries,
         task_note: options.second_task_note.clone(),
         namespace: Some(second_namespace.clone()),
@@ -3752,6 +3870,7 @@ pub fn start_pair_demo(options: PairDemoOptions) -> anyhow::Result<PairDemoRepor
             second_namespace: None,
             namespace_prefix: Some(id.clone()),
             message: Some("Live demo: coordinate across nodes, exchange one concise status update, verify local readiness, and record final evidence in the task note.".to_string()),
+            tolerations: Vec::new(),
             startup_delay_ms: options.startup_delay_ms,
             retries: 1,
             command: options.command,
@@ -4509,6 +4628,7 @@ pub fn migrate_session_to_node(
     namespace: &str,
     to_node: &str,
     timeout_seconds: u64,
+    tolerations: Vec<String>,
 ) -> anyhow::Result<NodeVisitResult> {
     let session = load_runtime_session_by_namespace(namespace)?;
     let session_json = serde_json::to_string_pretty(&session)?;
@@ -4520,6 +4640,7 @@ pub fn migrate_session_to_node(
         from_node: None,
         role: None,
         labels: BTreeMap::new(),
+        tolerations,
         retries: 0,
         prompt,
         working_directory: None,
@@ -4626,6 +4747,7 @@ chmod 0755 "$HOME/.cargo/bin/codex"
         ssh_host: Some(options.ssh_host),
         ssh_user: options.ssh_user,
         roles: options.roles,
+        taints: options.taints,
         labels: options.labels,
         workspace_root: options.workspace_root,
         max_sessions: options.max_sessions,
@@ -6093,6 +6215,7 @@ fn run_node_relay_visit(options: NodeVisitOptions) -> anyhow::Result<NodeVisitRe
         let scheduled = schedule_node(NodeScheduleOptions {
             role: options.role.clone().or_else(|| Some("worker".to_string())),
             labels: options.labels.clone(),
+            tolerations: options.tolerations.clone(),
             require_codex_auth: true,
             exclude: options.from_node.clone().into_iter().collect(),
         })?;
@@ -9280,6 +9403,18 @@ fn validate_node(manifest: &ResourceEnvelope<NodeSpec>) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn normalize_string_list(values: Vec<String>, field: &str) -> anyhow::Result<Vec<String>> {
+    let mut normalized = Vec::new();
+    for value in values {
+        let value = value.trim();
+        ensure!(!value.is_empty(), "{field} must not be empty");
+        normalized.push(value.to_string());
+    }
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
 fn validate_deployment(manifest: &ResourceEnvelope<DeploymentSpec>) -> anyhow::Result<()> {
     ensure!(
         manifest.spec.agents > 0,
@@ -10462,6 +10597,33 @@ fn node_effective_labels(node: &ResourceEnvelope<NodeSpec>) -> BTreeMap<String, 
             .or_insert_with(|| value.clone());
     }
     labels
+}
+
+fn node_taints_tolerated(node: &ResourceEnvelope<NodeSpec>, tolerations: &[String]) -> bool {
+    node.spec
+        .taints
+        .iter()
+        .all(|taint| tolerations.iter().any(|toleration| toleration == taint))
+}
+
+fn ensure_node_taints_tolerated(
+    node: &ResourceEnvelope<NodeSpec>,
+    tolerations: &[String],
+) -> anyhow::Result<()> {
+    let missing = node
+        .spec
+        .taints
+        .iter()
+        .filter(|taint| !tolerations.iter().any(|toleration| toleration == *taint))
+        .cloned()
+        .collect::<Vec<_>>();
+    ensure!(
+        missing.is_empty(),
+        "Node '{}' has taints [{}]; add matching toleration(s) to target it",
+        node.metadata.name,
+        missing.join(",")
+    );
+    Ok(())
 }
 
 fn format_selector(selector: &BTreeMap<String, String>) -> String {
@@ -12743,6 +12905,87 @@ spec:
             Some("https://login.tailscale.com/a/l6c9487034871a")
         );
         assert!(extract_auth_url("plain ssh failure").is_none());
+    }
+
+    #[test]
+    fn node_taints_require_matching_tolerations() {
+        let node = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Node".to_string(),
+            metadata: ResourceMetadata {
+                name: "archiechokie".to_string(),
+                namespace: None,
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: NodeSpec {
+                taints: vec!["light-device".to_string()],
+                ..NodeSpec::default()
+            },
+        };
+
+        assert!(!node_taints_tolerated(&node, &[]));
+        assert!(node_taints_tolerated(&node, &["light-device".to_string()]));
+        assert!(ensure_node_taints_tolerated(&node, &[]).is_err());
+        assert!(ensure_node_taints_tolerated(&node, &["light-device".to_string()]).is_ok());
+    }
+
+    #[test]
+    fn light_orchestrator_reverse_links_are_optional_for_preflight() {
+        let worker = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Node".to_string(),
+            metadata: ResourceMetadata {
+                name: "archiebald".to_string(),
+                namespace: None,
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+            },
+            spec: NodeSpec {
+                roles: vec!["worker".to_string()],
+                address: Some("100.115.119.27".to_string()),
+                ..NodeSpec::default()
+            },
+        };
+        let mut light_labels = BTreeMap::new();
+        light_labels.insert("capacity".to_string(), "low-power".to_string());
+        light_labels.insert("workload".to_string(), "orchestration".to_string());
+        let light_orchestrator = ResourceEnvelope {
+            api_version: API_VERSION.to_string(),
+            kind: "Node".to_string(),
+            metadata: ResourceMetadata {
+                name: "archiechokie".to_string(),
+                namespace: None,
+                labels: light_labels,
+                annotations: BTreeMap::new(),
+            },
+            spec: NodeSpec {
+                roles: vec!["control-plane".to_string(), "worker".to_string()],
+                taints: vec!["light-device".to_string()],
+                max_sessions: Some(1),
+                ..NodeSpec::default()
+            },
+        };
+
+        assert!(!node_link_required_for_preflight(
+            &worker,
+            &light_orchestrator
+        ));
+        assert!(node_link_required_for_preflight(
+            &light_orchestrator,
+            &worker
+        ));
+        let mut remote_light_orchestrator = light_orchestrator.clone();
+        remote_light_orchestrator.spec.ssh_host = Some("100.90.229.119".to_string());
+        assert!(!node_link_required_for_preflight(
+            &remote_light_orchestrator,
+            &worker
+        ));
+        assert_eq!(
+            node_link_optional_preflight_reason(&remote_light_orchestrator, &worker).as_deref(),
+            Some("source_is_remote_light_orchestrator")
+        );
+        assert!(node_link_required_for_preflight(&worker, &worker));
     }
 
     #[test]
