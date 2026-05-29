@@ -23,8 +23,11 @@ required_patterns=(
   '"thread/read"'
   '"thread/search"'
   '"ThreadSearchParams"'
+  '"permissionProfile/list"'
+  '"PermissionProfileListParams"'
   '"thread/started"'
   '"turn/started"'
+  '"activePermissionProfile"'
   '"CommandExecutionRequestApprovalParams"'
   '"FileChangeRequestApprovalParams"'
 )

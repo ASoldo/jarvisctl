@@ -522,6 +522,28 @@ pub struct NodeInspectResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct CodexDoctorReport {
+    pub node: String,
+    pub target: String,
+    pub ok: bool,
+    pub overall_status: String,
+    pub codex_version: String,
+    pub generated_at: Option<String>,
+    pub check_count: usize,
+    pub warning_count: usize,
+    pub error_count: usize,
+    pub checks: Vec<CodexDoctorCheck>,
+    pub raw: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CodexDoctorCheck {
+    pub key: String,
+    pub status: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct NodeCleanupResult {
     pub node: String,
     pub target: String,
@@ -2078,6 +2100,91 @@ pub fn inspect_node(name: &str) -> anyhow::Result<NodeInspectResult> {
     })
 }
 
+pub fn run_codex_doctor_for_node(name: Option<&str>) -> anyhow::Result<CodexDoctorReport> {
+    let node_name = match name.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(name) if name != "local" => name.to_string(),
+        _ => local_node_name()?,
+    };
+    let manifest = load_manifest(ResourceKind::Node, &node_name, None)?;
+    let ResourceManifest::Node(node) = manifest else {
+        bail!("resource '{}' is not a Node", node_name);
+    };
+    let target = node_ssh_target(&node.spec).unwrap_or_else(|| "local".to_string());
+    let raw = run_codex_doctor_command(if node_is_local(&node) {
+        None
+    } else {
+        Some(target.as_str())
+    })?;
+    let value: serde_json::Value =
+        serde_json::from_str(&raw).context("failed to parse codex doctor JSON")?;
+    let mut checks = value
+        .get("checks")
+        .and_then(serde_json::Value::as_object)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|(key, value)| CodexDoctorCheck {
+                    key: key.clone(),
+                    status: value
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    summary: value
+                        .get("summary")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    checks.sort_by(|left, right| left.key.cmp(&right.key));
+    let warning_count = checks
+        .iter()
+        .filter(|check| check.status.eq_ignore_ascii_case("warning"))
+        .count();
+    let error_count = checks
+        .iter()
+        .filter(|check| {
+            matches!(
+                check.status.to_ascii_lowercase().as_str(),
+                "error" | "fail" | "failed"
+            )
+        })
+        .count();
+    let overall_status = value
+        .get("overallStatus")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let ok = error_count == 0
+        && !matches!(
+            overall_status.to_ascii_lowercase().as_str(),
+            "error" | "fail" | "failed"
+        );
+    Ok(CodexDoctorReport {
+        node: node.metadata.name,
+        target,
+        ok,
+        overall_status,
+        codex_version: value
+            .get("codexVersion")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string(),
+        generated_at: value
+            .get("generatedAt")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+        check_count: checks.len(),
+        warning_count,
+        error_count,
+        checks,
+        raw: value,
+    })
+}
+
 pub fn heartbeat_node(name: Option<&str>) -> anyhow::Result<NodeHeartbeatReport> {
     let node_name = match name.map(str::trim).filter(|value| !value.is_empty()) {
         Some(name) if name != "local" => name.to_string(),
@@ -2523,6 +2630,7 @@ pub fn doctor_nodes() -> anyhow::Result<Vec<NodeDoctorCheck>> {
                 issues.push("codex_missing".to_string());
             }
             for (key, label) in [
+                ("codex_doctor_json", "doctor_json"),
                 ("codex_app_server_ws_auth", "app_server_ws_auth"),
                 ("codex_remote_control", "remote_control"),
                 ("codex_exec_server", "exec_server"),
@@ -4774,6 +4882,51 @@ pub fn render_node_probe_output(name: &str, output: ControlPlaneOutput) -> anyho
     }
 }
 
+pub fn render_codex_doctor_output(
+    report: &CodexDoctorReport,
+    output: ControlPlaneOutput,
+) -> anyhow::Result<String> {
+    match output {
+        ControlPlaneOutput::Json => {
+            serde_json::to_string_pretty(report).context("failed to encode codex doctor report")
+        }
+        ControlPlaneOutput::Yaml => {
+            serde_yaml::to_string(report).context("failed to encode codex doctor report")
+        }
+        ControlPlaneOutput::Table => {
+            let mut lines = vec![
+                "NODE\tTARGET\tSTATUS\tVERSION\tCHECKS\tWARNINGS\tERRORS".to_string(),
+                format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    report.node,
+                    report.target,
+                    report.overall_status,
+                    report.codex_version,
+                    report.check_count,
+                    report.warning_count,
+                    report.error_count
+                ),
+            ];
+            let notable = report
+                .checks
+                .iter()
+                .filter(|check| !check.status.eq_ignore_ascii_case("ok"))
+                .collect::<Vec<_>>();
+            if !notable.is_empty() {
+                lines.push(String::new());
+                lines.push("CHECK\tSTATUS\tSUMMARY".to_string());
+                for check in notable {
+                    lines.push(format!(
+                        "{}\t{}\t{}",
+                        check.key, check.status, check.summary
+                    ));
+                }
+            }
+            Ok(lines.join("\n"))
+        }
+    }
+}
+
 pub fn run_node_sudo(options: NodeSudoOptions) -> anyhow::Result<NodeSudoReport> {
     ensure!(
         !options.password.is_empty(),
@@ -6824,6 +6977,8 @@ printf 'arch='
 uname -m 2>/dev/null || true
 printf '\ncodex_cli='
 (codex --version 2>/dev/null || command -v codex 2>/dev/null || true) | head -n 1
+printf 'codex_doctor_json='
+if codex doctor --help 2>/dev/null | grep -q -- '--json'; then echo supported; else echo missing; fi
 printf 'codex_app_server_ws_auth='
 if codex app-server --help 2>/dev/null | grep -q -- '--ws-auth'; then echo supported; else echo missing; fi
 printf 'codex_remote_control='
@@ -6884,6 +7039,10 @@ if [ -e "$ssh_proxy_config" ]; then stat -Lc '%U:%G' "$ssh_proxy_config" 2>/dev/
 printf 'codex_auth='
 test -s "$HOME/.codex/auth.json" && echo present || echo missing"#;
     run_shell_probe(target, script, "node inspect")
+}
+
+fn run_codex_doctor_command(target: Option<&str>) -> anyhow::Result<String> {
+    run_shell_probe(target, "codex doctor --json", "codex doctor")
 }
 
 fn run_node_heartbeat_command(target: Option<&str>) -> anyhow::Result<String> {
@@ -12950,6 +13109,7 @@ spec:
         let mut light_labels = BTreeMap::new();
         light_labels.insert("capacity".to_string(), "low-power".to_string());
         light_labels.insert("workload".to_string(), "orchestration".to_string());
+        light_labels.insert("jarvisctl.io/local".to_string(), "true".to_string());
         let light_orchestrator = ResourceEnvelope {
             api_version: API_VERSION.to_string(),
             kind: "Node".to_string(),
@@ -12976,6 +13136,10 @@ spec:
             &worker
         ));
         let mut remote_light_orchestrator = light_orchestrator.clone();
+        remote_light_orchestrator
+            .metadata
+            .labels
+            .remove("jarvisctl.io/local");
         remote_light_orchestrator.spec.ssh_host = Some("100.90.229.119".to_string());
         assert!(!node_link_required_for_preflight(
             &remote_light_orchestrator,

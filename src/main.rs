@@ -58,8 +58,8 @@ use capability::{
 use codex::{CodexLaunchOptions, CodexRuntimeDriver, launch_codex_ticket};
 use codex_app::{
     CodexAppInputMode, attach_codex_app_tcp, codex_app_session_metadata_tcp,
-    interrupt_codex_app_tcp, read_codex_app_thread, search_codex_app_threads,
-    serve_codex_app_session, tell_codex_app_with_mode_tcp,
+    interrupt_codex_app_tcp, list_codex_app_permission_profiles, read_codex_app_thread,
+    search_codex_app_threads, serve_codex_app_session, tell_codex_app_with_mode_tcp,
 };
 use control_plane::{
     ControlPlaneOutput, ControlPlaneResourceKindArg, EvidenceBundleOptions, EvidenceBundleReport,
@@ -82,20 +82,21 @@ use control_plane::{
     orchestration_policy_path, pause_deployment_rollout, preflight_nodes,
     prune_cluster_relay_messages, prune_completed_runtime_sessions, prune_relay_messages,
     prune_worker_runs, read_auth_audit_events, read_worker_run_artifact, reconcile_nodes,
-    register_node, render_describe_output, render_evidence_bundle_output, render_get_output,
-    render_kubernetes_resources, render_node_heartbeat_service_install,
-    render_node_heartbeat_service_status, render_node_probe_output, render_node_sudo_output,
-    render_pair_demo_cleanup_output, render_pair_demo_sequence_output, render_pair_export_output,
-    render_pair_finalize_output, render_pair_ledgers_output, render_pair_stale_review_output,
-    render_relay_message_output, render_relay_messages_output, render_relay_prune_output,
-    render_rollout_history_output, render_rollout_status_output, render_runtime_prune_output,
-    render_worker_drift_smoke_output, render_worker_drift_smoke_schedule_status,
-    render_worker_model_validation_output, render_worker_run_artifact_output,
-    render_worker_run_prune_output, render_worker_runs_output, render_worker_validation_output,
-    resolve_cluster_operator_request, resolve_service_target, resolve_service_target_for_message,
-    respond_cluster_runtime_server_request, restart_deployment_rollout, resume_deployment_rollout,
-    retry_cluster_relay_message, retry_relay_message, review_stale_pair_ledgers,
-    rotate_capsule_key, run_node_fanout, run_node_sudo, run_node_visit, run_pair_demo_sequence,
+    register_node, render_codex_doctor_output, render_describe_output,
+    render_evidence_bundle_output, render_get_output, render_kubernetes_resources,
+    render_node_heartbeat_service_install, render_node_heartbeat_service_status,
+    render_node_probe_output, render_node_sudo_output, render_pair_demo_cleanup_output,
+    render_pair_demo_sequence_output, render_pair_export_output, render_pair_finalize_output,
+    render_pair_ledgers_output, render_pair_stale_review_output, render_relay_message_output,
+    render_relay_messages_output, render_relay_prune_output, render_rollout_history_output,
+    render_rollout_status_output, render_runtime_prune_output, render_worker_drift_smoke_output,
+    render_worker_drift_smoke_schedule_status, render_worker_model_validation_output,
+    render_worker_run_artifact_output, render_worker_run_prune_output, render_worker_runs_output,
+    render_worker_validation_output, resolve_cluster_operator_request, resolve_service_target,
+    resolve_service_target_for_message, respond_cluster_runtime_server_request,
+    restart_deployment_rollout, resume_deployment_rollout, retry_cluster_relay_message,
+    retry_relay_message, review_stale_pair_ledgers, rotate_capsule_key, run_codex_doctor_for_node,
+    run_node_fanout, run_node_sudo, run_node_visit, run_pair_demo_sequence,
     run_recurring_worker_drift_smoke, run_worker_drift_smoke, run_worker_offload, schedule_node,
     send_relay_message, set_node_cordoned, set_node_taint, show_cluster_operator_request,
     start_node_pair_session, start_node_session, start_pair_demo, supersede_cluster_relay_message,
@@ -717,6 +718,59 @@ enum Command {
 
         #[arg(long, default_value_t = false)]
         json: bool,
+    },
+
+    /// List Codex app-server named permission profiles from a live namespace
+    PermissionProfiles {
+        #[arg(long, value_enum, default_value_t = SessionBackend::Native, hide = true)]
+        backend: SessionBackend,
+
+        #[arg(
+            long,
+            alias = "ns",
+            required_unless_present = "service",
+            conflicts_with = "service"
+        )]
+        namespace: Option<String>,
+
+        #[arg(
+            long,
+            required_unless_present = "namespace",
+            conflicts_with = "namespace"
+        )]
+        service: Option<String>,
+
+        #[arg(
+            short = 'n',
+            long = "resource-namespace",
+            alias = "rns",
+            requires = "service"
+        )]
+        resource_namespace: Option<String>,
+
+        /// Optional project directory used by Codex to resolve project config layers
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        cwd: Option<String>,
+
+        /// Maximum profiles to return
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+
+        /// Opaque pagination cursor returned by a previous call
+        #[arg(long)]
+        cursor: Option<String>,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
+    },
+
+    /// Run Codex 0.135 doctor diagnostics on a registered node
+    CodexDoctor {
+        #[arg(long)]
+        node: Option<String>,
+
+        #[arg(long, alias = "out", value_enum, default_value_t = ControlPlaneOutput::Table)]
+        output: ControlPlaneOutput,
     },
 
     /// Attach to a specific agent in a namespace
@@ -2883,6 +2937,31 @@ fn dispatch(cli: Cli) -> Result<(), JarvisError> {
             )?;
             search_history(backend, &namespace, &query, limit, archived, json)
         }
+        Command::PermissionProfiles {
+            backend,
+            namespace,
+            service,
+            resource_namespace,
+            cwd,
+            limit,
+            cursor,
+            output,
+        } => {
+            let namespace = resolve_runtime_namespace(
+                namespace.as_deref(),
+                service.as_deref(),
+                resource_namespace.as_deref(),
+            )?;
+            permission_profiles(
+                backend,
+                &namespace,
+                cwd.as_deref(),
+                limit,
+                cursor.as_deref(),
+                output,
+            )
+        }
+        Command::CodexDoctor { node, output } => codex_doctor(node.as_deref(), output),
         Command::Exec {
             backend,
             namespace,
@@ -5544,11 +5623,12 @@ fn build_production_smoke_report(
                 .iter()
                 .filter(|doctor| doctor.available)
                 .filter(|doctor| {
-                    doctor
-                        .facts
-                        .get("codex_app_server_ws_auth")
-                        .map(String::as_str)
-                        != Some("supported")
+                    doctor.facts.get("codex_doctor_json").map(String::as_str) != Some("supported")
+                        || doctor
+                            .facts
+                            .get("codex_app_server_ws_auth")
+                            .map(String::as_str)
+                            != Some("supported")
                         || doctor.facts.get("codex_remote_control").map(String::as_str)
                             != Some("supported")
                         || doctor.facts.get("codex_exec_server").map(String::as_str)
@@ -5562,7 +5642,7 @@ fn build_production_smoke_report(
                 .map(|doctor| doctor.node.clone())
                 .collect::<Vec<_>>();
             checks.push(ProductionSmokeCheck {
-                name: "codex_0134_capabilities".to_string(),
+                name: "codex_0135_capabilities".to_string(),
                 status: if missing_capability_nodes.is_empty() {
                     "pass"
                 } else {
@@ -5570,9 +5650,42 @@ fn build_production_smoke_report(
                 }
                 .to_string(),
                 detail: if missing_capability_nodes.is_empty() {
-                    "all reachable nodes report app-server ws auth, remote-control, exec-server, and multi-agent".to_string()
+                    "all reachable nodes report doctor JSON, app-server ws auth, remote-control, exec-server, and multi-agent".to_string()
                 } else {
                     format!("missing required Codex capabilities on {}", missing_capability_nodes.join(","))
+                },
+            });
+
+            let mut doctor_failures = Vec::new();
+            let mut doctor_warnings = 0usize;
+            let mut doctor_checked = 0usize;
+            for doctor in preflight.doctors.iter().filter(|doctor| doctor.available) {
+                match run_codex_doctor_for_node(Some(&doctor.node)) {
+                    Ok(report) => {
+                        doctor_checked += 1;
+                        doctor_warnings += report.warning_count;
+                        if !report.ok {
+                            doctor_failures
+                                .push(format!("{}:{}", report.node, report.overall_status));
+                        }
+                    }
+                    Err(error) => doctor_failures.push(format!("{}:{error}", doctor.node)),
+                }
+            }
+            checks.push(ProductionSmokeCheck {
+                name: "codex_0135_doctor".to_string(),
+                status: if doctor_failures.is_empty() {
+                    "pass"
+                } else {
+                    "fail"
+                }
+                .to_string(),
+                detail: if doctor_failures.is_empty() {
+                    format!(
+                        "codex doctor ok on {doctor_checked} reachable node(s); warnings={doctor_warnings}"
+                    )
+                } else {
+                    format!("codex doctor failed on {}", doctor_failures.join(","))
                 },
             });
         }
@@ -7526,6 +7639,53 @@ fn search_history(
     Ok(())
 }
 
+#[instrument(err)]
+fn permission_profiles(
+    backend: SessionBackend,
+    namespace: &str,
+    cwd: Option<&str>,
+    limit: u32,
+    cursor: Option<&str>,
+    output: ControlPlaneOutput,
+) -> Result<(), JarvisError> {
+    let _ = backend;
+    let metadata = runtime::session_metadata_for_namespace(namespace).map_err(JarvisError::from)?;
+    if metadata.backend != "codex-app" {
+        return Err(JarvisError::Other(anyhow::anyhow!(
+            "permission-profiles is only available for codex-app sessions; '{}' uses '{}'",
+            namespace,
+            metadata.backend
+        )));
+    }
+
+    let response = list_codex_app_permission_profiles(namespace, cwd, Some(limit.max(1)), cursor)
+        .map_err(JarvisError::from)?;
+    match output {
+        ControlPlaneOutput::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&response).map_err(anyhow::Error::from)?
+        ),
+        ControlPlaneOutput::Yaml => {
+            println!(
+                "{}",
+                serde_yaml::to_string(&response).map_err(anyhow::Error::from)?
+            )
+        }
+        ControlPlaneOutput::Table => print_permission_profiles(namespace, &response),
+    }
+    Ok(())
+}
+
+#[instrument(err)]
+fn codex_doctor(node: Option<&str>, output: ControlPlaneOutput) -> Result<(), JarvisError> {
+    let report = run_codex_doctor_for_node(node).map_err(JarvisError::from)?;
+    println!(
+        "{}",
+        render_codex_doctor_output(&report, output).map_err(JarvisError::from)?
+    );
+    Ok(())
+}
+
 fn print_thread_history(namespace: &str, value: &serde_json::Value) {
     let thread = value.get("thread").unwrap_or(value);
     let thread_id = thread
@@ -7569,6 +7729,39 @@ fn print_thread_history(namespace: &str, value: &serde_json::Value) {
             .unwrap_or_default();
         let preview = turn_preview(turn).unwrap_or_default();
         println!("{id:10} {status:12} {items_view:10} {items:3} {preview}");
+    }
+}
+
+fn print_permission_profiles(namespace: &str, value: &serde_json::Value) {
+    let profiles = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    println!("NAMESPACE\tPROFILES\tNEXT");
+    println!(
+        "{}\t{}\t{}",
+        namespace,
+        profiles.len(),
+        value
+            .get("nextCursor")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-")
+    );
+    if profiles.is_empty() {
+        return;
+    }
+    println!("\nID\tDESCRIPTION");
+    for profile in profiles {
+        let id = profile
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
+        let description = profile
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
+        println!("{id}\t{description}");
     }
 }
 

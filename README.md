@@ -143,7 +143,7 @@ codex_add_dirs:
 `codex_approvals_reviewer` accepts `user`, `auto_review`, or `guardian_subagent`.
 `codex_sandbox_mode` accepts `read-only`, `workspace-write`, or `danger-full-access`.
 `codex_approval_policy` accepts `untrusted`, `on-failure`, `on-request`, or `never`.
-`codex_profile` maps to the current Codex `--profile` selector. Keep app-server permission profiles in `codex_permission_profile`.
+`codex_profile` maps to the current Codex `--profile` selector. Keep app-server permission profiles in `codex_permission_profile`; discover available named/custom profiles from a live app-server namespace with `jarvisctl permission-profiles --namespace <name>`.
 `codex_finish_mode` accepts `close` or `keep`. The default is `close`, which keeps Waybar and `jarvisctl list` aligned with active work rather than idle shells. `close` means the dispatcher finalizes the run on the tracked Codex stop event and closes the namespace unless you explicitly choose `keep`. `codex_finish_tmux` is still accepted as a compatibility alias in older ticket notes.
 
 For the current app-server protocol mapping used by the Obsidian plugin, including goals, memory, permission profiles, environments, remote-control status, feature flags, and escape-hatch config, see [docs/CODEX_APP_SERVER_MAPPING.md](docs/CODEX_APP_SERVER_MAPPING.md).
@@ -615,6 +615,18 @@ jarvisctl history --namespace codex-example
 
 ```bash
 jarvisctl search-history --namespace codex-example "operator request" --json
+```
+
+`permission-profiles` calls Codex app-server `permissionProfile/list` from a live Jarvis namespace, including custom profiles resolved through the optional project `--cwd`:
+
+```bash
+jarvisctl permission-profiles --namespace codex-example --cwd /home/rootster/work/jarvisctl --output json
+```
+
+`codex-doctor` runs the Codex 0.135 doctor JSON report on a registered node without adding that heavier probe to passive dashboard polling:
+
+```bash
+jarvisctl codex-doctor --node archiebald --output table
 ```
 `auto` keeps the existing behavior and steers the active turn when one is running.
 `queue` starts a follow-up turn without clobbering the current active turn pointer, which covers the queued follow-up workflow added in newer Codex builds.

@@ -135,6 +135,11 @@ enum ClientMessage {
         limit: Option<u32>,
         archived: Option<bool>,
     },
+    ListPermissionProfiles {
+        cwd: Option<String>,
+        limit: Option<u32>,
+        cursor: Option<String>,
+    },
     Attach {
         agent: String,
     },
@@ -159,6 +164,7 @@ enum ServerMessage {
     Metadata(NativeSessionMetadata),
     ThreadHistory(Value),
     ThreadSearch(Value),
+    PermissionProfiles(Value),
     Attached { namespace: String, agent: String },
     Output { data_base64: String },
     Exited { agent: String },
@@ -1328,6 +1334,25 @@ impl CodexAppSession {
         self.call("thread/search", params)
     }
 
+    fn list_permission_profiles(
+        &self,
+        cwd: Option<&str>,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> anyhow::Result<Value> {
+        let mut params = serde_json::Map::new();
+        if let Some(cwd) = cwd.map(str::trim).filter(|value| !value.is_empty()) {
+            params.insert("cwd".to_string(), json!(cwd));
+        }
+        if let Some(limit) = limit {
+            params.insert("limit".to_string(), json!(limit));
+        }
+        if let Some(cursor) = cursor.map(str::trim).filter(|value| !value.is_empty()) {
+            params.insert("cursor".to_string(), json!(cursor));
+        }
+        self.call("permissionProfile/list", Value::Object(params))
+    }
+
     fn send_operator_message(&self, text: &str, mode: CodexAppInputMode) -> anyhow::Result<()> {
         let (thread_id, turn_id, active) = {
             let metadata = self.metadata();
@@ -2093,6 +2118,30 @@ pub fn search_codex_app_threads(
     }
 }
 
+pub fn list_codex_app_permission_profiles(
+    namespace: &str,
+    cwd: Option<&str>,
+    limit: Option<u32>,
+    cursor: Option<&str>,
+) -> anyhow::Result<Value> {
+    match request(
+        namespace,
+        &ClientMessage::ListPermissionProfiles {
+            cwd: cwd.map(ToOwned::to_owned),
+            limit,
+            cursor: cursor.map(ToOwned::to_owned),
+        },
+    )? {
+        ServerMessage::PermissionProfiles(value) => Ok(value),
+        ServerMessage::Error { message } => Err(anyhow!(message)),
+        other => Err(anyhow!(
+            "unexpected permission profile response from codex app session '{}': {:?}",
+            namespace,
+            other
+        )),
+    }
+}
+
 pub fn attach_codex_app(namespace: &str) -> anyhow::Result<()> {
     let socket_path = socket_path_for(namespace)?;
     let mut stream = UnixStream::connect(&socket_path)
@@ -2155,7 +2204,8 @@ pub fn attach_codex_app(namespace: &str) -> anyhow::Result<()> {
                 ServerMessage::Ok
                 | ServerMessage::Metadata(..)
                 | ServerMessage::ThreadHistory(..)
-                | ServerMessage::ThreadSearch(..) => {}
+                | ServerMessage::ThreadSearch(..)
+                | ServerMessage::PermissionProfiles(..) => {}
             }
         }
     });
@@ -2244,6 +2294,11 @@ fn handle_client_message(
             limit,
             archived,
         )?)),
+        ClientMessage::ListPermissionProfiles { cwd, limit, cursor } => {
+            Ok(ServerMessage::PermissionProfiles(
+                session.list_permission_profiles(cwd.as_deref(), limit, cursor.as_deref())?,
+            ))
+        }
         ClientMessage::Attach { .. } => {
             bail!("attach is not supported over the filesystem control queue")
         }
@@ -2433,7 +2488,8 @@ pub fn attach_codex_app_tcp(host: &str, port: u16, namespace: &str) -> anyhow::R
                 ServerMessage::Ok
                 | ServerMessage::Metadata(..)
                 | ServerMessage::ThreadHistory(..)
-                | ServerMessage::ThreadSearch(..) => {}
+                | ServerMessage::ThreadSearch(..)
+                | ServerMessage::PermissionProfiles(..) => {}
             }
         }
     });

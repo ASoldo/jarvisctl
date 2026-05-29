@@ -2,15 +2,16 @@
 
 `jarvisctl` treats Codex app-server as the agent runtime contract. The Obsidian plugin should write durable ticket frontmatter; `jarvisctl` turns that frontmatter into app-server `thread/start`, `thread/resume`, `thread/goal/set`, and `turn/start` parameters.
 
-Checked against Codex CLI `0.134.0` and the generated experimental app-server schema from `codex app-server generate-json-schema --experimental --out <dir>`.
+Checked against Codex CLI `0.135.0` and the generated experimental app-server schema from `codex app-server generate-json-schema --experimental --out <dir>`.
 
 ## Current release signals
 
 - `thread/search` exposes the new Codex local conversation history search over app-server. Jarvis maps this through `jarvisctl search-history --namespace <name> <query>`, and the Obsidian runtime toolbar exposes it as session-scoped Codex history search.
-- `--profile` is the primary CLI profile selector. Ticket `codex_profile` maps to `--profile`; app-server permission profiles stay in `codex_permission_profile` and are sent as `permissions`.
+- `permissionProfile/list` exposes named permission profiles, including custom profiles from project config. Jarvis maps this through `jarvisctl permission-profiles --namespace <name>`; the Obsidian runtime toolbar can list the active session's available profile ids before writing `codex_permission_profile`.
+- `--profile` is the primary CLI config profile selector. Ticket `codex_profile` maps to `--profile`; app-server permission profiles stay in `codex_permission_profile` and are sent as `permissions`.
 - `codex remote-control` is now the preferred headless remote entrypoint for remotely controlled app-server runtimes.
-- `codex doctor --json` is now part of the production readiness path. Jarvis keeps the fast node probes lightweight, then runs doctor during full readiness checks to validate auth, app-server daemon state, websocket reachability, update status, feature flags, and install provenance.
-- `codex features list` exposes effective feature state. Current 0.134.0 surfaces stable features such as `apps`, `plugins`, `browser_use`, `computer_use`, `goals`, `multi_agent`, `shell_tool`, `unified_exec`, and `workspace_dependencies`; experimental/under-development features should stay explicit in ticket frontmatter instead of becoming hidden defaults.
+- `codex doctor --json` is richer in 0.135.0. Jarvis keeps passive node polling lightweight by checking only that doctor JSON is supported, then runs full doctor reports on demand with `jarvisctl codex-doctor --node <name>` and in production smoke to validate auth, runtime search, state database integrity, app-server daemon state, websocket reachability, update status, and install provenance.
+- `codex features list` exposes effective feature state. Current 0.135.0 surfaces stable features such as `apps`, `plugins`, `browser_use`, `computer_use`, `goals`, `multi_agent`, `shell_tool`, `unified_exec`, and `workspace_dependencies`; experimental/under-development features should stay explicit in ticket frontmatter instead of becoming hidden defaults.
 - `thread/start`, `thread/resume`, and `turn/start` now expose richer per-thread and per-turn configuration: model, service tier, approvals reviewer, permission profiles, environments, personality, and instruction overrides.
 - Experimental app-server fields require `initialize.capabilities.experimentalApi = true`.
 - `permissions` is a named profile string in `thread/start`, `thread/resume`, and `turn/start`; extra writable roots map to `runtimeWorkspaceRoots`.
@@ -91,5 +92,6 @@ The Obsidian plugin can read `jarvisctl list --json` and use:
 
 - Historical thread reads are exposed through `jarvisctl history --namespace <name> --json`. The Obsidian plugin can use this for compact turn history without parsing transcript files.
 - Local conversation history search is exposed through `jarvisctl search-history --namespace <name> <query> --json`, backed by app-server `thread/search`.
+- Named permission profile discovery is exposed through `jarvisctl permission-profiles --namespace <name> --output json`, backed by app-server `permissionProfile/list`.
 - Approval and elicitation server requests are also surfaced through `jarvisctl operator-request list` and the Obsidian Mission Chain operator-request card. A linked request can be resolved from the dashboard or with `jarvisctl operator-request resolve`, which also responds to the waiting app-server request when the namespace/request id is still live.
 - App/plugin/skill mention inputs are passed through prompt text today. A richer Obsidian composer can add structured `skill`, `mention`, and `localImage` input items later.
