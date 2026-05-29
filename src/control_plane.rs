@@ -7042,7 +7042,7 @@ test -s "$HOME/.codex/auth.json" && echo present || echo missing"#;
 }
 
 fn run_codex_doctor_command(target: Option<&str>) -> anyhow::Result<String> {
-    run_shell_probe(target, "codex doctor --json", "codex doctor")
+    run_shell_probe_stdout_on_failure(target, "codex doctor --json", "codex doctor")
 }
 
 fn run_node_heartbeat_command(target: Option<&str>) -> anyhow::Result<String> {
@@ -7060,7 +7060,46 @@ printf 'heartbeat_path=%s\n' "$path"
 }
 
 fn run_shell_probe(target: Option<&str>, script: &str, label: &str) -> anyhow::Result<String> {
-    let output = if let Some(target) = target {
+    let output = run_shell_probe_output(target, script, label)?;
+    ensure!(
+        output.status.success(),
+        "{label} exited with status {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn run_shell_probe_stdout_on_failure(
+    target: Option<&str>,
+    script: &str,
+    label: &str,
+) -> anyhow::Result<String> {
+    let output = run_shell_probe_output(target, script, label)?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    if output.status.success() {
+        return Ok(stdout);
+    }
+
+    let trimmed_stdout = stdout.trim_start();
+    if trimmed_stdout.starts_with('{') || trimmed_stdout.starts_with('[') {
+        return Ok(stdout);
+    }
+
+    bail!(
+        "{label} exited with status {}: stderr={} stdout={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim(),
+        stdout.trim()
+    )
+}
+
+fn run_shell_probe_output(
+    target: Option<&str>,
+    script: &str,
+    label: &str,
+) -> anyhow::Result<std::process::Output> {
+    Ok(if let Some(target) = target {
         let remote_command =
             shell_words::join(["sh".to_string(), "-lc".to_string(), script.to_string()]);
         let timeout_seconds = node_probe_timeout_seconds();
@@ -7087,14 +7126,7 @@ fn run_shell_probe(target: Option<&str>, script: &str, label: &str) -> anyhow::R
             .args(["-lc", script])
             .output()
             .with_context(|| format!("failed to run local {label}"))?
-    };
-    ensure!(
-        output.status.success(),
-        "{label} exited with status {}: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    })
 }
 
 fn node_probe_timeout_seconds() -> u64 {
